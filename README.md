@@ -8,10 +8,10 @@ MiMo TUI is a Rust terminal client specialised for Xiaomi MiMo models. It uses a
 - OpenAI-compatible tool loop with workspace-bound file, search, git, web, patch, project-summary, diagnostics/test, and shell tools.
 - Approval prompt for shell execution and file writes, plus shared background shell jobs across turns.
 - `ask`, `doctor`, `models`, and `sessions` CLI commands outside the TUI.
-- Searchable help overlay, slash-command registry, slash-menu completion, command palette, multiline input editor, and bounded transcript scrolling.
+- Searchable help overlay, slash-command registry, slash-menu completion, command palette, multiline input editor, bounded transcript scrolling, and dedicated diagnostics/task/snapshot browsers.
 - Draft stash/history recovery (`Ctrl+S`, `Alt+R`), last-message pager (`Ctrl+L`), and interactive model/session pickers.
 - Local session save/load/export with persisted plan checklist and attached workspace context.
-- Interactive `/config`, `/status`, `/models`, `/retry`, `/mode`, `/plan`, `/task`, `/jobs`, `/diff`, `/undo`, `/restore`, `/note`, `/memory`, `/recall`, `/compact`, and `/context` commands.
+- Interactive `/config`, `/status`, `/models`, `/retry`, `/mode`, `/plan`, `/task`, `/jobs`, `/diff`, `/undo`, `/restore`, `/note`, `/memory`, `/recall`, `/compact`, `/review`, `/lsp`, `/skills`, `/skill`, `/mcp`, and `/context` commands.
 - Configurable MiMo API key, base URL, model, temperature, and system prompt, with doctor output that shows the winning config source for each value.
 - Defaults for `https://api.xiaomimimo.com/v1` and `mimo-v2-flash`, with bundled model suggestions for `mimo-v2-flash`, `mimo-v2.5`, and `mimo-v2.5-pro`.
 - `/models` tries to refresh the picker from the MiMo `/models` API and falls back to the bundled suggestions when the catalog cannot be loaded.
@@ -89,6 +89,10 @@ Supported environment variables:
 - `/diff` / `/undo` / `/restore [snapshot-id]`: inspect the current workspace diff and restore tracked file-tool snapshots
 - `/note <text>` / `/memory [show|path|clear|help]`: manage persistent user memory
 - `/recall <query>` / `/compact`: search memory + transcript or compact older messages into a summary
+- `/review [workspace|staged|path <path>]`: build a lightweight review context from git state, diff summary, and cached diagnostics
+- `/lsp [status|run|show|clear|on|off]`: manage cached diagnostics and optional auto-refresh after file-tool edits
+- `/skills` / `/skill [name|install <path-or-url>|show <name>|uninstall <name>]`: manage local reusable prompt skills
+- `/mcp [list|show <name>|add stdio <name> <command> [args...]|add http <name> <url>|enable <name>|disable <name>|remove <name>]`: manage local MCP server definitions
 - `/context`: inject a read-only workspace summary into the conversation
 - `Tab`: complete a slash command from the slash menu
 - `@path` then `Tab`: attach a file or directory to the next prompt
@@ -165,6 +169,18 @@ Set `/model auto` to let MiMo-TUI choose a concrete MiMo model per turn. Short r
 
 Use `/task add <prompt>` to launch a durable background task that is stored under the local config directory. `/task list` and `/task show <id>` inspect saved tasks, `/task cancel <id>` aborts a running one, and `/jobs` continues to manage any shell processes that those tasks started.
 
+The command palette also opens dedicated browsers for cached diagnostics, background tasks, and workspace restore snapshots so you can inspect them without pushing more system messages into the transcript.
+
+## Diagnostics and review
+
+Use `/lsp run` to capture a local diagnostics snapshot with `cargo check --message-format short`, `/lsp show` to open the cached report in a pager, and `/lsp on` to auto-refresh diagnostics after successful `write_file`, `edit_file`, or `apply_patch` tool mutations. `/review` combines git status, diff summary, and the latest cached diagnostics into a ready-to-use review context.
+
+## Skills and MCP definitions
+
+Use `/skill install <path-or-url>` to copy a reusable prompt skill into `~/.config/mimo-tui/skills/`, `/skill <name>` to toggle it for the current session, `/skill show <name>` to inspect it, and `/skills` to list installed plus active skills. Active skills are injected into new requests and saved inside session snapshots.
+
+Use `/mcp ...` to maintain a local catalog of MCP server definitions under `~/.config/mimo-tui/mcp-servers.json`. This adds persistent discovery plus palette integration for future tool/runtime wiring: stdio and HTTP endpoints can be added, listed, enabled, disabled, and removed directly from the TUI.
+
 ## Architecture snapshot
 
 - `src/main.rs`: CLI entrypoint and `ask` / `doctor` / `models` / `sessions` dispatcher
@@ -183,6 +199,9 @@ Use `/task add <prompt>` to launch a durable background task that is stored unde
 - `src/tui/keybindings.rs`: user-facing keybinding catalog and footer hint
 - `src/tui/input.rs`: multiline draft editor
 - `src/tui/attachments.rs`: `@path` attachment parsing and request-context injection
+- `src/tui/diagnostics_store.rs`: cached diagnostics snapshots used by `/lsp` and `/review`
+- `src/tui/skill_store.rs`: local install/load/uninstall helpers for reusable prompt skills
+- `src/tui/mcp_store.rs`: persistent local MCP server definitions
 - `src/tui/session_store.rs`: local session persistence/export
 - `src/tui/project_context.rs`: read-only workspace summarization
 - `src/tui/tooling.rs`: approval runtime and recent tool/job state

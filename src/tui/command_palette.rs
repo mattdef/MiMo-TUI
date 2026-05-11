@@ -1,13 +1,17 @@
-use super::{commands, state::AppMode};
+use super::{commands, mcp_store::McpServerConfig, skill_store::InstalledSkill, state::AppMode};
 
 #[derive(Debug, Clone)]
 pub enum PaletteAction {
     InsertCommand(String),
+    ExecuteCommand(String),
     OpenHelp,
     OpenModels,
     OpenSessions,
     ShowStatus,
     ShowLastMessage,
+    ShowDiagnostics,
+    BrowseTasks,
+    BrowseSnapshots,
     BrowseDraftHistory,
     BrowseDraftStash,
     SwitchMode(AppMode),
@@ -20,7 +24,13 @@ pub struct PaletteEntry {
     pub action: PaletteAction,
 }
 
-pub fn filtered_entries(filter: &str, mode: AppMode) -> Vec<PaletteEntry> {
+pub fn filtered_entries(
+    filter: &str,
+    mode: AppMode,
+    installed_skills: &[InstalledSkill],
+    active_skills: &[String],
+    mcp_servers: &[McpServerConfig],
+) -> Vec<PaletteEntry> {
     let mut entries = vec![
         PaletteEntry {
             label: "Open help".to_string(),
@@ -46,6 +56,21 @@ pub fn filtered_entries(filter: &str, mode: AppMode) -> Vec<PaletteEntry> {
             label: "Show last message".to_string(),
             hint: "Open the latest message in a pager".to_string(),
             action: PaletteAction::ShowLastMessage,
+        },
+        PaletteEntry {
+            label: "Show diagnostics".to_string(),
+            hint: "Open the cached diagnostics report".to_string(),
+            action: PaletteAction::ShowDiagnostics,
+        },
+        PaletteEntry {
+            label: "Browse background tasks".to_string(),
+            hint: "Inspect durable MiMo tasks in a dedicated overlay".to_string(),
+            action: PaletteAction::BrowseTasks,
+        },
+        PaletteEntry {
+            label: "Browse workspace snapshots".to_string(),
+            hint: "Inspect tracked restore snapshots in a dedicated overlay".to_string(),
+            action: PaletteAction::BrowseSnapshots,
         },
         PaletteEntry {
             label: "Browse cleared drafts".to_string(),
@@ -96,6 +121,46 @@ pub fn filtered_entries(filter: &str, mode: AppMode) -> Vec<PaletteEntry> {
                 format!("/{}", command.name)
             },
         ),
+    }));
+
+    if !installed_skills.is_empty() {
+        entries.push(PaletteEntry {
+            label: "List installed skills".to_string(),
+            hint: "Show installed and active local skills".to_string(),
+            action: PaletteAction::ExecuteCommand("/skills".to_string()),
+        });
+    }
+    entries.extend(installed_skills.iter().map(|skill| PaletteEntry {
+        label: format!(
+            "{} skill {}",
+            if active_skills.iter().any(|active| active == &skill.name) {
+                "Deactivate"
+            } else {
+                "Activate"
+            },
+            skill.name
+        ),
+        hint: skill.description.clone(),
+        action: PaletteAction::ExecuteCommand(format!("/skill {}", skill.name)),
+    }));
+
+    entries.push(PaletteEntry {
+        label: "List MCP servers".to_string(),
+        hint: "Inspect configured local MCP definitions".to_string(),
+        action: PaletteAction::ExecuteCommand("/mcp list".to_string()),
+    });
+    entries.extend(mcp_servers.iter().map(|server| PaletteEntry {
+        label: format!(
+            "{} MCP {}",
+            if server.enabled {
+                "Inspect"
+            } else {
+                "Inspect disabled"
+            },
+            server.name
+        ),
+        hint: format!("{} {}", server.transport, server.summary()),
+        action: PaletteAction::ExecuteCommand(format!("/mcp show {}", server.name)),
     }));
 
     let filter = filter.trim().to_ascii_lowercase();

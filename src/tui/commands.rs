@@ -35,6 +35,11 @@ pub enum SlashCommand {
     Memory(MemoryCommand),
     Recall { query: String },
     Compact,
+    Review(ReviewCommand),
+    Lsp(LspCommand),
+    Skills,
+    Skill(SkillCommand),
+    Mcp(McpCommand),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -81,6 +86,49 @@ pub enum TaskCommand {
     List,
     Show(String),
     Cancel(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewCommand {
+    Workspace,
+    Staged,
+    Path(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LspCommand {
+    Status,
+    Run,
+    Show,
+    Clear,
+    On,
+    Off,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillCommand {
+    Toggle(String),
+    Install(String),
+    Show(String),
+    Uninstall(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpCommand {
+    List,
+    Show(String),
+    AddStdio {
+        name: String,
+        command: String,
+        args: Vec<String>,
+    },
+    AddHttp {
+        name: String,
+        url: String,
+    },
+    Enable(String),
+    Disable(String),
+    Remove(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,6 +291,36 @@ pub const COMMANDS: &[CommandInfo] = &[
         usage: "/compact",
         description: "Compact older transcript messages into a local summary.",
     },
+    CommandInfo {
+        name: "review",
+        aliases: &[],
+        usage: "/review [workspace|staged|path <path>]",
+        description: "Show a lightweight review context from git diff plus cached diagnostics.",
+    },
+    CommandInfo {
+        name: "lsp",
+        aliases: &[],
+        usage: "/lsp [status|run|show|clear|on|off]",
+        description: "Manage cached diagnostics and automatic refresh after file-tool edits.",
+    },
+    CommandInfo {
+        name: "skills",
+        aliases: &[],
+        usage: "/skills",
+        description: "List installed local skills and show which ones are active.",
+    },
+    CommandInfo {
+        name: "skill",
+        aliases: &[],
+        usage: "/skill [name|install <path-or-url>|show <name>|uninstall <name>]",
+        description: "Toggle, install, inspect, or uninstall a local skill.",
+    },
+    CommandInfo {
+        name: "mcp",
+        aliases: &[],
+        usage: "/mcp [list|show <name>|add stdio <name> <command> [args...]|add http <name> <url>|enable <name>|disable <name>|remove <name>]",
+        description: "Manage local MCP server definitions for future tool integrations.",
+    },
 ];
 
 pub fn parse_slash_command(input: &str) -> Result<SlashCommand, CommandParseError> {
@@ -287,6 +365,11 @@ pub fn parse_slash_command(input: &str) -> Result<SlashCommand, CommandParseErro
         "memory" => parse_memory_command(args),
         "recall" => parse_recall_command(args),
         "compact" => require_no_args(args, SlashCommand::Compact, "/compact"),
+        "review" => parse_review_command(args),
+        "lsp" => parse_lsp_command(args),
+        "skills" => require_no_args(args, SlashCommand::Skills, "/skills"),
+        "skill" => parse_skill_command(args),
+        "mcp" => parse_mcp_command(args),
         _ => Err(CommandParseError::UnknownCommand(name.to_string())),
     }
 }
@@ -521,6 +604,129 @@ fn parse_recall_command(args: &str) -> Result<SlashCommand, CommandParseError> {
     })
 }
 
+fn parse_review_command(args: &str) -> Result<SlashCommand, CommandParseError> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("workspace") {
+        return Ok(SlashCommand::Review(ReviewCommand::Workspace));
+    }
+    if trimmed.eq_ignore_ascii_case("staged") {
+        return Ok(SlashCommand::Review(ReviewCommand::Staged));
+    }
+
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let action = parts.next().unwrap_or_default().to_ascii_lowercase();
+    let value = parts.next().unwrap_or_default().trim();
+    match action.as_str() {
+        "path" if !value.is_empty() => {
+            Ok(SlashCommand::Review(ReviewCommand::Path(value.to_string())))
+        }
+        _ => Err(CommandParseError::Usage(
+            "/review [workspace|staged|path <path>]",
+        )),
+    }
+}
+
+fn parse_lsp_command(args: &str) -> Result<SlashCommand, CommandParseError> {
+    let command = match args.trim().to_ascii_lowercase().as_str() {
+        "" | "status" => LspCommand::Status,
+        "run" => LspCommand::Run,
+        "show" => LspCommand::Show,
+        "clear" => LspCommand::Clear,
+        "on" => LspCommand::On,
+        "off" => LspCommand::Off,
+        _ => {
+            return Err(CommandParseError::Usage(
+                "/lsp [status|run|show|clear|on|off]",
+            ));
+        }
+    };
+    Ok(SlashCommand::Lsp(command))
+}
+
+fn parse_skill_command(args: &str) -> Result<SlashCommand, CommandParseError> {
+    let trimmed = args.trim();
+    let Some(value) = non_empty(trimmed) else {
+        return Err(CommandParseError::Usage(
+            "/skill [name|install <path-or-url>|show <name>|uninstall <name>]",
+        ));
+    };
+    let mut parts = value.splitn(2, char::is_whitespace);
+    let action = parts.next().unwrap_or_default().to_ascii_lowercase();
+    let remainder = parts.next().unwrap_or_default().trim();
+    let command = match action.as_str() {
+        "install" if !remainder.is_empty() => SkillCommand::Install(remainder.to_string()),
+        "show" if !remainder.is_empty() => SkillCommand::Show(remainder.to_string()),
+        "uninstall" if !remainder.is_empty() => SkillCommand::Uninstall(remainder.to_string()),
+        _ => SkillCommand::Toggle(value.to_string()),
+    };
+    Ok(SlashCommand::Skill(command))
+}
+
+fn parse_mcp_command(args: &str) -> Result<SlashCommand, CommandParseError> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("list") {
+        return Ok(SlashCommand::Mcp(McpCommand::List));
+    }
+
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let action = parts.next().unwrap_or_default().to_ascii_lowercase();
+    let remainder = parts.next().unwrap_or_default().trim();
+    let command = match action.as_str() {
+        "show" if !remainder.is_empty() => McpCommand::Show(remainder.to_string()),
+        "enable" if !remainder.is_empty() => McpCommand::Enable(remainder.to_string()),
+        "disable" if !remainder.is_empty() => McpCommand::Disable(remainder.to_string()),
+        "remove" if !remainder.is_empty() => McpCommand::Remove(remainder.to_string()),
+        "add" => parse_mcp_add_command(remainder)?,
+        _ => {
+            return Err(CommandParseError::Usage(
+                "/mcp [list|show <name>|add stdio <name> <command> [args...]|add http <name> <url>|enable <name>|disable <name>|remove <name>]",
+            ));
+        }
+    };
+    Ok(SlashCommand::Mcp(command))
+}
+
+fn parse_mcp_add_command(args: &str) -> Result<McpCommand, CommandParseError> {
+    let mut parts = args.split_whitespace();
+    let transport = parts.next().unwrap_or_default().to_ascii_lowercase();
+    let name = parts.next().unwrap_or_default();
+    if name.is_empty() {
+        return Err(CommandParseError::Usage(
+            "/mcp [list|show <name>|add stdio <name> <command> [args...]|add http <name> <url>|enable <name>|disable <name>|remove <name>]",
+        ));
+    }
+    match transport.as_str() {
+        "stdio" => {
+            let command = parts.next().unwrap_or_default();
+            if command.is_empty() {
+                return Err(CommandParseError::Usage(
+                    "/mcp [list|show <name>|add stdio <name> <command> [args...]|add http <name> <url>|enable <name>|disable <name>|remove <name>]",
+                ));
+            }
+            Ok(McpCommand::AddStdio {
+                name: name.to_string(),
+                command: command.to_string(),
+                args: parts.map(ToOwned::to_owned).collect(),
+            })
+        }
+        "http" => {
+            let url = parts.next().unwrap_or_default();
+            if url.is_empty() {
+                return Err(CommandParseError::Usage(
+                    "/mcp [list|show <name>|add stdio <name> <command> [args...]|add http <name> <url>|enable <name>|disable <name>|remove <name>]",
+                ));
+            }
+            Ok(McpCommand::AddHttp {
+                name: name.to_string(),
+                url: url.to_string(),
+            })
+        }
+        _ => Err(CommandParseError::Usage(
+            "/mcp [list|show <name>|add stdio <name> <command> [args...]|add http <name> <url>|enable <name>|disable <name>|remove <name>]",
+        )),
+    }
+}
+
 fn command_parts(input: &str) -> Option<(&str, &str)> {
     let command = input.trim().strip_prefix('/')?;
     let command = command.trim_start();
@@ -556,8 +762,9 @@ fn parse_index(value: &str) -> Result<usize, CommandParseError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandParseError, ConfigCommand, JobsCommand, MemoryCommand, ModeName, PlanCommand,
-        SlashCommand, TaskCommand, parse_slash_command,
+        CommandParseError, ConfigCommand, JobsCommand, LspCommand, McpCommand, MemoryCommand,
+        ModeName, PlanCommand, ReviewCommand, SkillCommand, SlashCommand, TaskCommand,
+        parse_slash_command,
     };
 
     #[test]
@@ -614,6 +821,51 @@ mod tests {
             Ok(SlashCommand::Restore {
                 id: Some("snapshot-2".to_string())
             })
+        );
+        assert_eq!(parse_slash_command("/skills"), Ok(SlashCommand::Skills));
+        assert_eq!(
+            parse_slash_command("/skill install ./skills/review.md"),
+            Ok(SlashCommand::Skill(SkillCommand::Install(
+                "./skills/review.md".to_string()
+            )))
+        );
+        assert_eq!(
+            parse_slash_command("/skill review"),
+            Ok(SlashCommand::Skill(SkillCommand::Toggle(
+                "review".to_string()
+            )))
+        );
+        assert_eq!(
+            parse_slash_command("/mcp add stdio repo-lsp rust-analyzer --stdio"),
+            Ok(SlashCommand::Mcp(McpCommand::AddStdio {
+                name: "repo-lsp".to_string(),
+                command: "rust-analyzer".to_string(),
+                args: vec!["--stdio".to_string()],
+            }))
+        );
+        assert_eq!(
+            parse_slash_command("/mcp enable repo-lsp"),
+            Ok(SlashCommand::Mcp(McpCommand::Enable(
+                "repo-lsp".to_string()
+            )))
+        );
+        assert_eq!(
+            parse_slash_command("/review staged"),
+            Ok(SlashCommand::Review(ReviewCommand::Staged))
+        );
+        assert_eq!(
+            parse_slash_command("/review path src/main.rs"),
+            Ok(SlashCommand::Review(ReviewCommand::Path(
+                "src/main.rs".to_string()
+            )))
+        );
+        assert_eq!(
+            parse_slash_command("/lsp"),
+            Ok(SlashCommand::Lsp(LspCommand::Status))
+        );
+        assert_eq!(
+            parse_slash_command("/lsp on"),
+            Ok(SlashCommand::Lsp(LspCommand::On))
         );
     }
 

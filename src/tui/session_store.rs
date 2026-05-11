@@ -19,6 +19,10 @@ pub struct SavedSession {
     pub model: String,
     pub mode: AppMode,
     #[serde(default)]
+    pub active_skills: Vec<String>,
+    #[serde(default)]
+    pub lsp_auto_run: bool,
+    #[serde(default)]
     pub plan_items: Vec<PlanItem>,
     #[serde(default)]
     pub attachments: Vec<FileAttachment>,
@@ -40,6 +44,8 @@ pub fn save_session(
     config: &AppConfig,
     model: &str,
     mode: AppMode,
+    active_skills: &[String],
+    lsp_auto_run: bool,
     plan_items: &[PlanItem],
     attachments: &[FileAttachment],
     messages: &[ChatMessage],
@@ -55,6 +61,8 @@ pub fn save_session(
         title: derive_title(messages),
         model: model.to_string(),
         mode,
+        active_skills: active_skills.to_vec(),
+        lsp_auto_run,
         plan_items: plan_items.to_vec(),
         attachments: attachments.to_vec(),
         messages: messages.to_vec(),
@@ -80,6 +88,8 @@ pub fn export_markdown(
     config: &AppConfig,
     model: &str,
     mode: AppMode,
+    active_skills: &[String],
+    lsp_auto_run: bool,
     plan_items: &[PlanItem],
     attachments: &[FileAttachment],
     messages: &[ChatMessage],
@@ -104,6 +114,16 @@ pub fn export_markdown(
             output.push_str(&format!("  - [{}] {}\n", marker, item.text));
         }
     }
+    if !active_skills.is_empty() {
+        output.push_str("- Active skills:\n");
+        for skill in active_skills {
+            output.push_str(&format!("  - {skill}\n"));
+        }
+    }
+    output.push_str(&format!(
+        "- Auto diagnostics: {}\n",
+        if lsp_auto_run { "on" } else { "off" }
+    ));
     output.push('\n');
     for message in messages {
         let role = match message.role {

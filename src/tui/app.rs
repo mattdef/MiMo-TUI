@@ -28,12 +28,13 @@ use crate::{
 use super::{
     attachments, command_palette,
     commands::{
-        self, CommandParseError, ConfigCommand, JobsCommand, MemoryCommand, ModeName, PlanCommand,
-        SlashCommand, TaskCommand,
+        self, CommandParseError, ConfigCommand, JobsCommand, LspCommand, McpCommand, MemoryCommand,
+        ModeName, PlanCommand, ReviewCommand, SkillCommand, SlashCommand, TaskCommand,
     },
+    diagnostics_store,
     input::InputBuffer,
-    keybindings, markdown, memory_store, project_context, session_picker, session_store,
-    slash_menu,
+    keybindings, markdown, mcp_store, memory_store, project_context, session_picker, session_store,
+    skill_store, slash_menu,
     state::{AppMode, FileAttachment, PlanItem},
     task_store,
     tooling::{ApprovalMode, ToolRequest, ToolRuntime, ToolStatus},
@@ -44,6 +45,7 @@ pub enum AppEvent {
     Finished(Result<(), String>),
     ModelsLoaded(Result<Vec<String>, String>),
     Status(String),
+    DiagnosticsFinished(Result<diagnostics_store::DiagnosticsSnapshot, String>),
     ApprovalRequested(ToolRequest, oneshot::Sender<bool>),
     ToolStarted(ToolRequest),
     ToolFinished(ToolRequest),
@@ -140,6 +142,31 @@ struct MessagePagerState {
     scroll: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InspectorBrowserKind {
+    Tasks,
+    Snapshots,
+}
+
+#[derive(Debug)]
+struct InspectorBrowserState {
+    open: bool,
+    kind: InspectorBrowserKind,
+    selected: usize,
+    scroll: u16,
+}
+
+impl Default for InspectorBrowserState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            kind: InspectorBrowserKind::Tasks,
+            selected: 0,
+            scroll: 0,
+        }
+    }
+}
+
 pub struct App {
     config: AppConfig,
     messages: Vec<ChatMessage>,
@@ -158,6 +185,7 @@ pub struct App {
     command_palette: CommandPaletteState,
     draft_browser: DraftBrowserState,
     message_pager: MessagePagerState,
+    inspector_browser: InspectorBrowserState,
     discovered_models: Vec<String>,
     last_prompt: Option<String>,
     mode: AppMode,
@@ -166,12 +194,17 @@ pub struct App {
     draft_history: Vec<String>,
     draft_stash: Vec<String>,
     attachments: Vec<FileAttachment>,
+    active_skills: Vec<String>,
+    diagnostics: Option<diagnostics_store::DiagnosticsSnapshot>,
+    diagnostics_auto_run: bool,
     plan_items: Vec<PlanItem>,
     tool_runtime: ToolRuntime,
     approval_mode_shared: Arc<Mutex<ApprovalMode>>,
     slash_menu_selected: usize,
+    event_tx: Option<UnboundedSender<AppEvent>>,
     tasks: Vec<task_store::SavedTask>,
     task_handles: BTreeMap<String, JoinHandle<()>>,
+    diagnostics_task: Option<JoinHandle<()>>,
 }
 
 impl App {
@@ -192,6 +225,7 @@ impl App {
         let mode = AppMode::Agent;
         let approval_mode_shared = Arc::new(Mutex::new(mode_approval_mode(mode)));
         let tasks = task_store::load_tasks(&config).unwrap_or_default();
+        let diagnostics = diagnostics_store::load_snapshot(&config).unwrap_or_default();
         let _ = task_store::save_tasks(&config, &tasks);
         let status = if config.api_key.is_some() {
             "Ready".to_string()
@@ -217,6 +251,7 @@ impl App {
             command_palette: CommandPaletteState::default(),
             draft_browser: DraftBrowserState::default(),
             message_pager: MessagePagerState::default(),
+            inspector_browser: InspectorBrowserState::default(),
             discovered_models: Vec::new(),
             last_prompt: None,
             mode,
@@ -225,6 +260,9 @@ impl App {
             draft_history: Vec::new(),
             draft_stash: Vec::new(),
             attachments: Vec::new(),
+            active_skills: Vec::new(),
+            diagnostics,
+            diagnostics_auto_run: false,
             plan_items: Vec::new(),
             tool_runtime: ToolRuntime {
                 approval_mode: mode_approval_mode(mode),
@@ -232,8 +270,10 @@ impl App {
             },
             approval_mode_shared,
             slash_menu_selected: 0,
+            event_tx: None,
             tasks,
             task_handles: BTreeMap::new(),
+            diagnostics_task: None,
         }
     }
 
@@ -266,6 +306,8 @@ impl App {
             self.render_command_palette_overlay(frame, area);
         } else if self.draft_browser.open {
             self.render_draft_browser_overlay(frame, area);
+        } else if self.inspector_browser.open {
+            self.render_inspector_browser_overlay(frame, area);
         } else if self.session_picker.open {
             self.render_session_picker_overlay(frame, area);
         } else if self.model_picker.open {
@@ -282,6 +324,7 @@ impl App {
         event: Event,
         event_tx: UnboundedSender<AppEvent>,
     ) -> Result<bool> {
+        self.event_tx = Some(event_tx.clone());
         match event {
             Event::Key(key) => {
                 if self.tool_runtime.pending_approval.is_some() {
@@ -295,6 +338,9 @@ impl App {
                 }
                 if self.draft_browser.open {
                     return Ok(self.handle_draft_browser_key(key));
+                }
+                if self.inspector_browser.open {
+                    return self.handle_inspector_browser_key(key);
                 }
                 if self.session_picker.open {
                     return self.handle_session_picker_key(key);
@@ -470,6 +516,18 @@ impl App {
             AppEvent::Status(status) => {
                 self.status = status;
             }
+            AppEvent::DiagnosticsFinished(result) => {
+                self.diagnostics_task = None;
+                match result {
+                    Ok(snapshot) => {
+                        self.status = snapshot.summary.clone();
+                        self.diagnostics = Some(snapshot);
+                    }
+                    Err(error) => {
+                        self.status = format!("Diagnostics failed: {error}");
+                    }
+                }
+            }
             AppEvent::ApprovalRequested(request, responder) => {
                 self.tool_runtime.begin_approval(request.clone(), responder);
                 self.status = format!("Approval required: {}", request.summary);
@@ -485,8 +543,20 @@ impl App {
                     ToolStatus::Denied => format!("Tool denied: {}", request.summary),
                     ToolStatus::PendingApproval | ToolStatus::Running => request.summary.clone(),
                 };
+                let should_refresh =
+                    self.diagnostics_auto_run && should_refresh_diagnostics(&request);
+                let refresh_name = request.name.clone();
                 self.tool_runtime.finish(request);
                 self.status = status;
+                if should_refresh
+                    && let Err(error) =
+                        self.start_diagnostics_refresh(format!("after {refresh_name}"))
+                {
+                    self.status = format!(
+                        "{} (auto diagnostics failed to start: {error})",
+                        self.status
+                    );
+                }
             }
             AppEvent::TaskStarted { id, routed_model } => {
                 if let Some(task) = self.find_task_mut(&id) {
@@ -909,8 +979,7 @@ impl App {
         );
 
         self.render_filter_box(frame, inner[0], &self.command_palette.filter, "Filter");
-        let entries =
-            command_palette::filtered_entries(self.command_palette.filter.trim(), self.mode);
+        let entries = self.command_palette_entries();
         self.command_palette.scroll = adjust_selection_scroll(
             self.command_palette.selected,
             self.command_palette.scroll,
@@ -995,6 +1064,65 @@ impl App {
         frame.render_widget(
             Paragraph::new("Up/Down move | Enter restore | Esc cancel")
                 .style(Style::default().fg(Color::DarkGray)),
+            inner[1],
+        );
+    }
+
+    fn render_inspector_browser_overlay(&mut self, frame: &mut Frame, area: Rect) {
+        let popup = centered_rect(area, 74, 58);
+        let inner = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(3), Constraint::Length(2)])
+            .split(popup);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Block::default()
+                .title(self.inspector_browser_title())
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+            popup,
+        );
+
+        self.inspector_browser.scroll = adjust_selection_scroll(
+            self.inspector_browser.selected,
+            self.inspector_browser.scroll,
+            inner[0].height.saturating_sub(2).max(1) as usize,
+        );
+        let lines = self
+            .inspector_browser_items()
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let prefix = if index == self.inspector_browser.selected {
+                    "> "
+                } else {
+                    "  "
+                };
+                let style = if index == self.inspector_browser.selected {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                Line::styled(format!("{prefix}{item}"), style)
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(Block::default().title("Entries").borders(Borders::ALL))
+                .wrap(Wrap { trim: false })
+                .scroll((self.inspector_browser.scroll, 0)),
+            inner[0],
+        );
+        let footer = match self.inspector_browser.kind {
+            InspectorBrowserKind::Tasks => "Up/Down move | Enter inspect | Esc cancel",
+            InspectorBrowserKind::Snapshots => {
+                "Up/Down move | Enter inspect | r restore selected | Esc cancel"
+            }
+        };
+        frame.render_widget(
+            Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
             inner[1],
         );
     }
@@ -1155,16 +1283,16 @@ impl App {
                 let last = command_palette::filtered_entries(
                     self.command_palette.filter.trim(),
                     self.mode,
+                    &self.installed_skills(),
+                    &self.active_skills,
+                    &self.mcp_servers(),
                 )
                 .len()
                 .saturating_sub(1);
                 self.command_palette.selected = (self.command_palette.selected + 1).min(last);
             }
             KeyCode::Enter => {
-                let entries = command_palette::filtered_entries(
-                    self.command_palette.filter.trim(),
-                    self.mode,
-                );
+                let entries = self.command_palette_entries();
                 let Some(entry) = entries.get(self.command_palette.selected).cloned() else {
                     return Ok(false);
                 };
@@ -1199,6 +1327,32 @@ impl App {
             _ => {}
         }
         false
+    }
+
+    fn handle_inspector_browser_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if closes_overlay(key) {
+            self.inspector_browser = InspectorBrowserState::default();
+            self.status = "Inspector closed".to_string();
+            return Ok(false);
+        }
+
+        match key.code {
+            KeyCode::Up => {
+                self.inspector_browser.selected = self.inspector_browser.selected.saturating_sub(1)
+            }
+            KeyCode::Down => {
+                let last = self.inspector_browser_items().len().saturating_sub(1);
+                self.inspector_browser.selected = (self.inspector_browser.selected + 1).min(last);
+            }
+            KeyCode::Enter => self.inspect_selected_browser_entry()?,
+            KeyCode::Char('r' | 'R')
+                if self.inspector_browser.kind == InspectorBrowserKind::Snapshots =>
+            {
+                self.restore_selected_snapshot_from_browser()?;
+            }
+            _ => {}
+        }
+        Ok(false)
     }
 
     fn handle_session_picker_key(&mut self, key: KeyEvent) -> Result<bool> {
@@ -1465,6 +1619,7 @@ impl App {
         command_line: &str,
         event_tx: UnboundedSender<AppEvent>,
     ) -> Result<bool> {
+        self.event_tx = Some(event_tx.clone());
         self.input.clear();
         match commands::parse_slash_command(command_line) {
             Ok(command) => self.execute_command(command, event_tx),
@@ -1513,6 +1668,8 @@ impl App {
                     &self.config,
                     &self.config.model,
                     self.mode,
+                    &self.active_skills,
+                    self.diagnostics_auto_run,
                     &self.plan_items,
                     &self.attachments,
                     &self.messages,
@@ -1540,6 +1697,8 @@ impl App {
                     &self.config,
                     &self.config.model,
                     self.mode,
+                    &self.active_skills,
+                    self.diagnostics_auto_run,
                     &self.plan_items,
                     &self.attachments,
                     &self.messages,
@@ -1625,6 +1784,27 @@ impl App {
             }
             SlashCommand::Compact => {
                 self.compact_conversation();
+                Ok(false)
+            }
+            SlashCommand::Review(command) => {
+                self.handle_review_command(command)?;
+                Ok(false)
+            }
+            SlashCommand::Lsp(command) => {
+                self.handle_lsp_command(command)?;
+                Ok(false)
+            }
+            SlashCommand::Skills => {
+                self.push_system_message(self.skills_summary()?);
+                self.status = "Installed skills shown".to_string();
+                Ok(false)
+            }
+            SlashCommand::Skill(command) => {
+                self.handle_skill_command(command)?;
+                Ok(false)
+            }
+            SlashCommand::Mcp(command) => {
+                self.handle_mcp_command(command)?;
                 Ok(false)
             }
         }
@@ -1757,6 +1937,339 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn handle_lsp_command(&mut self, command: LspCommand) -> Result<()> {
+        match command {
+            LspCommand::Status => {
+                self.push_system_message(self.diagnostics_status_message());
+                self.status = "Diagnostics status shown".to_string();
+            }
+            LspCommand::Run => {
+                self.start_diagnostics_refresh("manual run".to_string())?;
+            }
+            LspCommand::Show => {
+                self.open_text_pager("Diagnostics", self.diagnostics_detail_message());
+                self.status = "Diagnostics opened".to_string();
+            }
+            LspCommand::Clear => {
+                let path = diagnostics_store::clear_snapshot(&self.config)?;
+                self.diagnostics = None;
+                self.status = format!("Cleared diagnostics snapshot {}", path.display());
+            }
+            LspCommand::On => {
+                self.diagnostics_auto_run = true;
+                self.status = "Auto diagnostics enabled".to_string();
+            }
+            LspCommand::Off => {
+                self.diagnostics_auto_run = false;
+                self.status = "Auto diagnostics disabled".to_string();
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_review_command(&mut self, command: ReviewCommand) -> Result<()> {
+        self.push_system_message(self.review_context(command)?);
+        self.status = "Review context shown".to_string();
+        Ok(())
+    }
+
+    fn start_diagnostics_refresh(&mut self, trigger: String) -> Result<()> {
+        if self.diagnostics_task.is_some() {
+            self.status = "Diagnostics are already running".to_string();
+            return Ok(());
+        }
+        let Some(event_tx) = self.event_tx.clone() else {
+            bail!("event channel is unavailable");
+        };
+        let workspace_root = self.tool_context.workspace_root.clone();
+        let config = self.config.clone();
+        self.status = format!("Running diagnostics ({trigger})...");
+        self.diagnostics_task = Some(tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let snapshot = capture_workspace_diagnostics(&workspace_root)?;
+                diagnostics_store::save_snapshot(&config, &snapshot)?;
+                Ok::<_, anyhow::Error>(snapshot)
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result.map_err(|error| error.to_string()));
+            let _ = event_tx.send(AppEvent::DiagnosticsFinished(result));
+        }));
+        Ok(())
+    }
+
+    fn diagnostics_status_message(&self) -> String {
+        let path = diagnostics_store::diagnostics_path(&self.config);
+        let mut output = format!(
+            "Diagnostics status\n\nAuto run : {}\nRunning  : {}\nPath     : {}\n",
+            if self.diagnostics_auto_run {
+                "on"
+            } else {
+                "off"
+            },
+            if self.diagnostics_task.is_some() {
+                "yes"
+            } else {
+                "no"
+            },
+            path.display()
+        );
+        match &self.diagnostics {
+            Some(snapshot) => {
+                output.push_str(&format!(
+                    "\nLast run : {}\nStatus   : {}\nSummary  : {}\nErrors   : {}\nWarnings : {}",
+                    snapshot.updated_at_epoch,
+                    snapshot.status,
+                    snapshot.summary,
+                    snapshot.error_count,
+                    snapshot.warning_count
+                ));
+            }
+            None => output.push_str("\nNo cached diagnostics yet."),
+        }
+        output
+    }
+
+    fn diagnostics_detail_message(&self) -> String {
+        let mut output = String::from("Diagnostics\n\n");
+        match &self.diagnostics {
+            Some(snapshot) => {
+                output.push_str(&format!(
+                    "Command : {}\nStatus  : {}\nSummary : {}\nErrors  : {}\nWarnings: {}\nUpdated : {}\n\n{}",
+                    snapshot.command,
+                    snapshot.status,
+                    snapshot.summary,
+                    snapshot.error_count,
+                    snapshot.warning_count,
+                    snapshot.updated_at_epoch,
+                    snapshot.output
+                ));
+            }
+            None => output.push_str("No cached diagnostics yet. Run /lsp run first."),
+        }
+        output
+    }
+
+    fn review_context(&self, command: ReviewCommand) -> Result<String> {
+        let git_status = run_workspace_command(
+            &self.tool_context.workspace_root,
+            "git",
+            &["--no-pager", "status", "--short", "--branch"],
+        )?;
+        let (scope, args) = match command {
+            ReviewCommand::Workspace => (
+                "workspace".to_string(),
+                vec![
+                    "--no-pager".to_string(),
+                    "diff".to_string(),
+                    "--stat".to_string(),
+                    "--summary".to_string(),
+                ],
+            ),
+            ReviewCommand::Staged => (
+                "staged".to_string(),
+                vec![
+                    "--no-pager".to_string(),
+                    "diff".to_string(),
+                    "--cached".to_string(),
+                    "--stat".to_string(),
+                    "--summary".to_string(),
+                ],
+            ),
+            ReviewCommand::Path(path) => {
+                let resolved = self.tool_context.resolve_path(&path)?;
+                (
+                    path,
+                    vec![
+                        "--no-pager".to_string(),
+                        "diff".to_string(),
+                        "--stat".to_string(),
+                        "--summary".to_string(),
+                        "--".to_string(),
+                        relative_path_display(&self.tool_context.workspace_root, &resolved),
+                    ],
+                )
+            }
+        };
+        let diff_args = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let diff = run_workspace_command(&self.tool_context.workspace_root, "git", &diff_args)?;
+        let mut output = format!(
+            "Review context\n\nScope: {scope}\n\nGit status\n\n{}\n\nDiff summary\n\n{}",
+            git_status.trim(),
+            if diff.trim().is_empty() {
+                "No diff for this scope."
+            } else {
+                diff.trim()
+            }
+        );
+        output.push_str("\n\nDiagnostics\n\n");
+        match &self.diagnostics {
+            Some(snapshot) => {
+                output.push_str(&format!(
+                    "{}\n\n{}",
+                    snapshot.summary,
+                    first_non_empty_lines(&snapshot.output, 24)
+                ));
+            }
+            None => output.push_str("No cached diagnostics. Run /lsp run."),
+        }
+        Ok(output)
+    }
+
+    fn handle_skill_command(&mut self, command: SkillCommand) -> Result<()> {
+        match command {
+            SkillCommand::Toggle(name) => {
+                let skill = skill_store::load_skill(&self.config, &name)?;
+                if let Some(index) = self
+                    .active_skills
+                    .iter()
+                    .position(|active| active == &skill.name)
+                {
+                    self.active_skills.remove(index);
+                    self.status = format!("Deactivated skill {}", skill.name);
+                } else {
+                    self.active_skills.push(skill.name.clone());
+                    self.active_skills.sort();
+                    self.active_skills.dedup();
+                    self.status = format!("Activated skill {}", skill.name);
+                }
+            }
+            SkillCommand::Install(spec) => {
+                let skill = skill_store::install_skill(&self.config, &spec)?;
+                self.status = format!("Installed skill {} at {}", skill.name, skill.path.display());
+            }
+            SkillCommand::Show(name) => {
+                let skill = skill_store::load_skill(&self.config, &name)?;
+                self.push_system_message(format!(
+                    "Skill {}\n\nPath: {}\nDescription: {}\n\n{}",
+                    skill.name,
+                    skill.path.display(),
+                    skill.description,
+                    skill.content
+                ));
+                self.status = format!("Skill {} shown", skill.name);
+            }
+            SkillCommand::Uninstall(name) => {
+                let normalized = skill_store::normalize_skill_name(&name);
+                let path = skill_store::uninstall_skill(&self.config, &normalized)?;
+                self.active_skills.retain(|skill| skill != &normalized);
+                self.status = format!("Removed skill {} from {}", normalized, path.display());
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_mcp_command(&mut self, command: McpCommand) -> Result<()> {
+        match command {
+            McpCommand::List => {
+                self.push_system_message(self.mcp_summary());
+                self.status = "MCP servers shown".to_string();
+            }
+            McpCommand::Show(name) => {
+                let server = mcp_store::find_server(&self.config, &name)?;
+                self.push_system_message(format!(
+                    "MCP server {}\n\nEnabled   : {}\nTransport : {}\nEndpoint  : {}",
+                    server.name,
+                    if server.enabled { "yes" } else { "no" },
+                    server.transport,
+                    server.summary()
+                ));
+                self.status = format!("MCP server {} shown", server.name);
+            }
+            McpCommand::AddStdio {
+                name,
+                command,
+                args,
+            } => {
+                let server = mcp_store::add_stdio_server(&self.config, &name, &command, args)?;
+                self.status = format!("Saved MCP server {} ({})", server.name, server.summary());
+            }
+            McpCommand::AddHttp { name, url } => {
+                let server = mcp_store::add_http_server(&self.config, &name, &url)?;
+                self.status = format!("Saved MCP server {} ({})", server.name, server.summary());
+            }
+            McpCommand::Enable(name) => {
+                let server = mcp_store::set_enabled(&self.config, &name, true)?;
+                self.status = format!("Enabled MCP server {}", server.name);
+            }
+            McpCommand::Disable(name) => {
+                let server = mcp_store::set_enabled(&self.config, &name, false)?;
+                self.status = format!("Disabled MCP server {}", server.name);
+            }
+            McpCommand::Remove(name) => {
+                let server = mcp_store::remove_server(&self.config, &name)?;
+                self.status = format!("Removed MCP server {}", server.name);
+            }
+        }
+        Ok(())
+    }
+
+    fn installed_skills(&self) -> Vec<skill_store::InstalledSkill> {
+        skill_store::list_installed_skills(&self.config).unwrap_or_default()
+    }
+
+    fn skills_summary(&self) -> Result<String> {
+        let skills = skill_store::list_installed_skills(&self.config)?;
+        let mut output = format!(
+            "Skills\n\nDirectory: {}\n",
+            skill_store::skills_path(&self.config).display()
+        );
+        if skills.is_empty() {
+            output.push_str("\nNo installed skills.\n");
+        } else {
+            output.push('\n');
+            for skill in skills {
+                let active = if self.active_skills.iter().any(|name| name == &skill.name) {
+                    "active"
+                } else {
+                    "idle"
+                };
+                output.push_str(&format!(
+                    "- {} | {} | {}\n",
+                    skill.name, active, skill.description
+                ));
+            }
+        }
+        output.push_str(
+            "\nCommands:\n/skill install <path-or-url>\n/skill <name>\n/skill show <name>\n/skill uninstall <name>",
+        );
+        Ok(output.trim_end().to_string())
+    }
+
+    fn mcp_servers(&self) -> Vec<mcp_store::McpServerConfig> {
+        mcp_store::load_servers(&self.config).unwrap_or_default()
+    }
+
+    fn mcp_summary(&self) -> String {
+        let servers = self.mcp_servers();
+        let mut output = format!(
+            "MCP servers\n\nFile: {}\n",
+            mcp_store::mcp_servers_path(&self.config).display()
+        );
+        if servers.is_empty() {
+            output.push_str("\nNo configured MCP servers.\n");
+        } else {
+            output.push('\n');
+            for server in servers {
+                output.push_str(&format!(
+                    "- {} | {} | {} | {}\n",
+                    server.name,
+                    if server.enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    },
+                    server.transport,
+                    server.summary()
+                ));
+            }
+        }
+        output.push_str(
+            "\nCommands:\n/mcp list\n/mcp show <name>\n/mcp add stdio <name> <command> [args...]\n/mcp add http <name> <url>\n/mcp enable <name>\n/mcp disable <name>\n/mcp remove <name>",
+        );
+        output.trim_end().to_string()
     }
 
     fn handle_jobs_command(&mut self, command: JobsCommand) -> Result<()> {
@@ -2097,12 +2610,20 @@ impl App {
 
     fn base_request_messages(&self, mode: AppMode) -> Result<Vec<ChatMessage>> {
         let memory_notes = memory_store::load_notes(&self.config)?;
-        let mut messages = Vec::with_capacity(memory_notes.len() + 4);
+        let mut messages = Vec::with_capacity(memory_notes.len() + self.active_skills.len() + 4);
         messages.push(ChatMessage::system(self.config.system_prompt.clone()));
         if mode == AppMode::Plan {
             messages.push(ChatMessage::system(
                 "You are in planning mode. Analyze the project, propose concrete implementation steps, and do not claim that files were modified or commands were executed unless the user explicitly switches to agent or yolo mode.".to_string(),
             ));
+        }
+        for skill_name in &self.active_skills {
+            if let Ok(skill) = skill_store::load_skill(&self.config, skill_name) {
+                messages.push(ChatMessage::system(format!(
+                    "Active skill: {}\n\n{}",
+                    skill.name, skill.content
+                )));
+            }
         }
         if !memory_notes.is_empty() {
             let mut memory = String::from("User memory\n\n");
@@ -2227,6 +2748,16 @@ impl App {
         self.status = "Command palette opened".to_string();
     }
 
+    fn command_palette_entries(&self) -> Vec<command_palette::PaletteEntry> {
+        command_palette::filtered_entries(
+            self.command_palette.filter.trim(),
+            self.mode,
+            &self.installed_skills(),
+            &self.active_skills,
+            &self.mcp_servers(),
+        )
+    }
+
     fn open_draft_browser(&mut self, kind: DraftBrowserKind) {
         let items = match kind {
             DraftBrowserKind::History => &self.draft_history,
@@ -2249,6 +2780,25 @@ impl App {
         };
     }
 
+    fn open_inspector_browser(&mut self, kind: InspectorBrowserKind) -> Result<()> {
+        if self.inspector_browser_items_for(kind).is_empty() {
+            self.status = match kind {
+                InspectorBrowserKind::Tasks => "No background tasks yet".to_string(),
+                InspectorBrowserKind::Snapshots => "No workspace snapshots yet".to_string(),
+            };
+            return Ok(());
+        }
+        self.inspector_browser.open = true;
+        self.inspector_browser.kind = kind;
+        self.inspector_browser.selected = 0;
+        self.inspector_browser.scroll = 0;
+        self.status = match kind {
+            InspectorBrowserKind::Tasks => "Task browser opened".to_string(),
+            InspectorBrowserKind::Snapshots => "Snapshot browser opened".to_string(),
+        };
+        Ok(())
+    }
+
     fn open_last_message_pager(&mut self) {
         let Some(message) = self.messages.last() else {
             self.status = "No message to open in the pager".to_string();
@@ -2260,11 +2810,15 @@ impl App {
             Role::Assistant => "MiMo",
             Role::Tool => "Tool",
         };
-        self.message_pager.open = true;
-        self.message_pager.title = format!("Last message — {role}");
-        self.message_pager.lines = markdown::render_markdown_lines(&message.content);
-        self.message_pager.scroll = 0;
+        self.open_text_pager(format!("Last message — {role}"), message.content.clone());
         self.status = "Opened last message pager".to_string();
+    }
+
+    fn open_text_pager(&mut self, title: impl Into<String>, content: impl Into<String>) {
+        self.message_pager.open = true;
+        self.message_pager.title = title.into();
+        self.message_pager.lines = markdown::render_markdown_lines(&content.into());
+        self.message_pager.scroll = 0;
     }
 
     fn apply_selected_model(&mut self) -> Result<()> {
@@ -2303,6 +2857,8 @@ impl App {
         self.messages = session.messages;
         self.set_mode(session.mode);
         self.config.model = session.model;
+        self.active_skills = session.active_skills;
+        self.diagnostics_auto_run = session.lsp_auto_run;
         self.plan_items = session.plan_items;
         self.attachments = session.attachments;
         self.assistant_index = None;
@@ -2327,6 +2883,53 @@ impl App {
         self.status = "Draft restored".to_string();
     }
 
+    fn inspect_selected_browser_entry(&mut self) -> Result<()> {
+        match self.inspector_browser.kind {
+            InspectorBrowserKind::Tasks => {
+                let Some(task) = self.tasks.get(self.inspector_browser.selected).cloned() else {
+                    self.inspector_browser = InspectorBrowserState::default();
+                    return Ok(());
+                };
+                self.open_text_pager(
+                    format!("Task {}", task.id),
+                    format!(
+                        "Background task details\n\n{}",
+                        to_string_pretty(&task).context("failed to encode background task")?
+                    ),
+                );
+                self.status = format!("Opened task {}", task.id);
+            }
+            InspectorBrowserKind::Snapshots => {
+                let snapshots = self.tool_context.list_workspace_snapshots()?;
+                let Some(snapshot) = snapshots.get(self.inspector_browser.selected).cloned() else {
+                    self.inspector_browser = InspectorBrowserState::default();
+                    return Ok(());
+                };
+                let mut details = format!(
+                    "Workspace snapshot {}\n\nSummary: {}\nCreated: {}\n\nFiles\n",
+                    snapshot.id, snapshot.summary, snapshot.created_at_epoch
+                );
+                for file in snapshot.files {
+                    details.push_str(&format!("- {}\n", file.path));
+                }
+                self.open_text_pager(format!("Snapshot {}", snapshot.id), details.trim_end());
+                self.status = format!("Opened snapshot {}", snapshot.id);
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_selected_snapshot_from_browser(&mut self) -> Result<()> {
+        let snapshots = self.tool_context.list_workspace_snapshots()?;
+        let Some(snapshot) = snapshots.get(self.inspector_browser.selected).cloned() else {
+            self.inspector_browser = InspectorBrowserState::default();
+            return Ok(());
+        };
+        self.restore_snapshot(Some(&snapshot.id))?;
+        self.inspector_browser = InspectorBrowserState::default();
+        Ok(())
+    }
+
     fn apply_palette_action(
         &mut self,
         action: command_palette::PaletteAction,
@@ -2337,6 +2940,9 @@ impl App {
                 self.input.set_text(command.clone());
                 self.status = format!("Inserted {command}");
             }
+            command_palette::PaletteAction::ExecuteCommand(command) => {
+                self.handle_slash_command(&command, event_tx)?;
+            }
             command_palette::PaletteAction::OpenHelp => self.open_help(None),
             command_palette::PaletteAction::OpenModels => self.open_model_picker(event_tx),
             command_palette::PaletteAction::OpenSessions => self.open_session_picker()?,
@@ -2345,6 +2951,16 @@ impl App {
                 self.status = "Status summary shown".to_string();
             }
             command_palette::PaletteAction::ShowLastMessage => self.open_last_message_pager(),
+            command_palette::PaletteAction::ShowDiagnostics => {
+                self.open_text_pager("Diagnostics", self.diagnostics_detail_message());
+                self.status = "Diagnostics opened".to_string();
+            }
+            command_palette::PaletteAction::BrowseTasks => {
+                self.open_inspector_browser(InspectorBrowserKind::Tasks)?
+            }
+            command_palette::PaletteAction::BrowseSnapshots => {
+                self.open_inspector_browser(InspectorBrowserKind::Snapshots)?
+            }
             command_palette::PaletteAction::BrowseDraftHistory => {
                 self.open_draft_browser(DraftBrowserKind::History)
             }
@@ -2483,8 +3099,16 @@ impl App {
         let memory_notes = memory_store::load_notes(&self.config)
             .map(|notes| notes.len())
             .unwrap_or_default();
+        let installed_skills = self.installed_skills().len();
+        let mcp_servers = self.mcp_servers();
+        let enabled_mcp = mcp_servers.iter().filter(|server| server.enabled).count();
+        let diagnostics_status = self
+            .diagnostics
+            .as_ref()
+            .map(|snapshot| snapshot.status.to_string())
+            .unwrap_or_else(|| "none".to_string());
         format!(
-            "Configuration\n\nConfig file : {}\nBase URL    : {}\nModel       : {}\nTemperature : {}\nAPI key     : {}\nMode        : {}\nApprovals   : {}\nAttachments : {}\nPlan items  : {}\nMemory notes: {}\nTasks file  : {}\nTasks saved : {}",
+            "Configuration\n\nConfig file      : {}\nBase URL         : {}\nModel            : {}\nTemperature      : {}\nAPI key          : {}\nMode             : {}\nApprovals        : {}\nAttachments      : {}\nPlan items       : {}\nMemory notes     : {}\nSkills dir       : {}\nSkills active    : {}\nSkills installed : {}\nMCP file         : {}\nMCP enabled      : {}\nMCP servers      : {}\nDiagnostics file : {}\nDiagnostics auto : {}\nDiagnostics state: {}\nTasks file       : {}\nTasks saved      : {}",
             self.config.config_path.display(),
             self.config.base_url,
             self.config.model,
@@ -2495,6 +3119,19 @@ impl App {
             self.attachments.len(),
             self.plan_items.len(),
             memory_notes,
+            skill_store::skills_path(&self.config).display(),
+            self.active_skills.len(),
+            installed_skills,
+            mcp_store::mcp_servers_path(&self.config).display(),
+            enabled_mcp,
+            mcp_servers.len(),
+            diagnostics_store::diagnostics_path(&self.config).display(),
+            if self.diagnostics_auto_run {
+                "on"
+            } else {
+                "off"
+            },
+            diagnostics_status,
             task_store::tasks_path(&self.config).display(),
             self.tasks.len(),
         )
@@ -2503,13 +3140,21 @@ impl App {
     fn status_summary(&self) -> Result<String> {
         let session_count = session_store::list_sessions(&self.config)?.len();
         let memory_notes = memory_store::load_notes(&self.config)?.len();
+        let installed_skills = self.installed_skills().len();
+        let mcp_servers = self.mcp_servers();
+        let enabled_mcp = mcp_servers.iter().filter(|server| server.enabled).count();
+        let diagnostics_status = self
+            .diagnostics
+            .as_ref()
+            .map(|snapshot| snapshot.status.to_string())
+            .unwrap_or_else(|| "none".to_string());
         let request_chars = self
             .request_messages()?
             .iter()
             .map(|message| message.content.chars().count())
             .sum::<usize>();
         Ok(format!(
-            "Status\n\nWorkspace    : {}\nMode         : {}\nApprovals    : {}\nModel        : {}\nStreaming    : {}\nMessages     : {}\nSaved files  : {}\nAPI key      : {}\nAttachments  : {}\nDraft stash  : {}\nPlan items   : {}\nMemory notes : {}\nRequest chars: {}\nShell jobs   : {}\nTasks        : {}\nTools        : {}",
+            "Status\n\nWorkspace         : {}\nMode              : {}\nApprovals         : {}\nModel             : {}\nStreaming         : {}\nMessages          : {}\nSaved files       : {}\nAPI key           : {}\nAttachments       : {}\nDraft stash       : {}\nPlan items        : {}\nMemory notes      : {}\nSkills active     : {}\nSkills installed  : {}\nMCP enabled       : {}\nMCP servers       : {}\nDiagnostics auto  : {}\nDiagnostics state : {}\nRequest chars     : {}\nShell jobs        : {}\nTasks             : {}\nTools             : {}",
             self.tool_context.workspace_root.display(),
             self.mode,
             approval_mode_label(self.tool_runtime.approval_mode),
@@ -2522,6 +3167,16 @@ impl App {
             self.draft_stash.len(),
             self.plan_items.len(),
             memory_notes,
+            self.active_skills.len(),
+            installed_skills,
+            enabled_mcp,
+            mcp_servers.len(),
+            if self.diagnostics_auto_run {
+                "on"
+            } else {
+                "off"
+            },
+            diagnostics_status,
             request_chars,
             self.active_shell_jobs(),
             self.tasks.len(),
@@ -2649,6 +3304,46 @@ impl App {
         match self.draft_browser.kind {
             DraftBrowserKind::History => "Draft history",
             DraftBrowserKind::Stash => "Draft stash",
+        }
+    }
+
+    fn inspector_browser_items(&self) -> Vec<String> {
+        self.inspector_browser_items_for(self.inspector_browser.kind)
+    }
+
+    fn inspector_browser_items_for(&self, kind: InspectorBrowserKind) -> Vec<String> {
+        match kind {
+            InspectorBrowserKind::Tasks => self
+                .tasks
+                .iter()
+                .map(|task| {
+                    format!(
+                        "{} | {:?} | mode={} | {}",
+                        task.id, task.status, task.mode, task.prompt
+                    )
+                })
+                .collect(),
+            InspectorBrowserKind::Snapshots => self
+                .tool_context
+                .list_workspace_snapshots()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|snapshot| {
+                    format!(
+                        "{} | {} file(s) | {}",
+                        snapshot.id,
+                        snapshot.files.len(),
+                        snapshot.summary
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn inspector_browser_title(&self) -> &'static str {
+        match self.inspector_browser.kind {
+            InspectorBrowserKind::Tasks => "Background tasks",
+            InspectorBrowserKind::Snapshots => "Workspace snapshots",
         }
     }
 
@@ -3003,6 +3698,130 @@ fn current_workspace_diff(workspace_root: &std::path::Path) -> Result<String> {
     Ok(output)
 }
 
+fn capture_workspace_diagnostics(
+    workspace_root: &std::path::Path,
+) -> Result<diagnostics_store::DiagnosticsSnapshot> {
+    if !workspace_root.join("Cargo.toml").exists() {
+        bail!(
+            "no default diagnostics command is available in {}",
+            workspace_root.display()
+        );
+    }
+    let output = Command::new("cargo")
+        .current_dir(workspace_root)
+        .args(["check", "--message-format", "short"])
+        .output()
+        .context("failed to run cargo check")?;
+    let mut combined = String::new();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stdout.trim().is_empty() {
+        combined.push_str(stdout.trim());
+    }
+    if !stderr.trim().is_empty() {
+        if !combined.is_empty() {
+            combined.push_str("\n\n");
+        }
+        combined.push_str(stderr.trim());
+    }
+    let output_text = truncate_for_summary_output(&combined, 24_000);
+    let error_count = output_text
+        .lines()
+        .filter(|line| line.contains("error"))
+        .count();
+    let warning_count = output_text
+        .lines()
+        .filter(|line| line.contains("warning"))
+        .count();
+    let status = if output.status.success() {
+        diagnostics_store::DiagnosticsStatus::Passed
+    } else {
+        diagnostics_store::DiagnosticsStatus::Failed
+    };
+    let summary = match status {
+        diagnostics_store::DiagnosticsStatus::Passed => {
+            if warning_count == 0 {
+                "Diagnostics passed".to_string()
+            } else {
+                format!("Diagnostics passed with {warning_count} warning(s)")
+            }
+        }
+        diagnostics_store::DiagnosticsStatus::Failed => {
+            format!("Diagnostics failed with {error_count} error(s) and {warning_count} warning(s)")
+        }
+    };
+    Ok(diagnostics_store::DiagnosticsSnapshot {
+        updated_at_epoch: diagnostics_store::now_epoch(),
+        command: "cargo check --message-format short".to_string(),
+        status,
+        summary,
+        output: if output_text.trim().is_empty() {
+            "No diagnostics output.".to_string()
+        } else {
+            output_text
+        },
+        error_count,
+        warning_count,
+    })
+}
+
+fn truncate_for_summary_output(content: &str, limit: usize) -> String {
+    let mut shortened = content.chars().take(limit).collect::<String>();
+    if content.chars().count() > limit {
+        shortened.push_str("\n\n... output truncated ...");
+    }
+    shortened
+}
+
+fn first_non_empty_lines(content: &str, max_lines: usize) -> String {
+    let lines = content
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .take(max_lines)
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        "No diagnostics output.".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
+fn run_workspace_command(
+    workspace_root: &std::path::Path,
+    program: &str,
+    args: &[&str],
+) -> Result<String> {
+    let output = Command::new(program)
+        .current_dir(workspace_root)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run {program} {}", args.join(" ")))?;
+    if !output.status.success() {
+        bail!(
+            "{} {} exited with status {}",
+            program,
+            args.join(" "),
+            output.status
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn relative_path_display(workspace_root: &std::path::Path, path: &std::path::Path) -> String {
+    path.strip_prefix(workspace_root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+fn should_refresh_diagnostics(request: &ToolRequest) -> bool {
+    matches!(
+        request.name.as_str(),
+        "write_file" | "edit_file" | "apply_patch"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -3192,6 +4011,46 @@ mod tests {
         app.handle_plan_command(PlanCommand::Done(1));
         assert_eq!(app.plan_items.len(), 1);
         assert!(app.plan_items[0].done);
+    }
+
+    #[test]
+    fn lsp_commands_toggle_auto_diagnostics() {
+        let mut app = test_app();
+        let (event_tx, _event_rx) = unbounded_channel();
+
+        app.handle_slash_command("/lsp on", event_tx.clone())
+            .expect("lsp on should execute");
+        assert!(app.diagnostics_auto_run);
+
+        app.handle_slash_command("/lsp off", event_tx)
+            .expect("lsp off should execute");
+        assert!(!app.diagnostics_auto_run);
+    }
+
+    #[test]
+    fn task_browser_opens_when_tasks_exist() {
+        let mut app = test_app();
+        app.tasks.push(task_store::SavedTask {
+            id: "task-1".to_string(),
+            prompt: "Review the diff".to_string(),
+            model: "mimo-v2-flash".to_string(),
+            routed_model: None,
+            mode: AppMode::Agent,
+            status: task_store::TaskStatus::Queued,
+            created_at_epoch: 1,
+            updated_at_epoch: 1,
+            started_at_epoch: None,
+            finished_at_epoch: None,
+            assistant_output: String::new(),
+            activity_log: Vec::new(),
+            error: None,
+        });
+
+        app.open_inspector_browser(InspectorBrowserKind::Tasks)
+            .expect("task browser should open");
+
+        assert!(app.inspector_browser.open);
+        assert_eq!(app.inspector_browser.kind, InspectorBrowserKind::Tasks);
     }
 
     #[test]
