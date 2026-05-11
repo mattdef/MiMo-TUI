@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 
 use crate::spec::CancellationFlag;
 
-use super::{ApprovalRequirement, ToolContext, ToolKind, ToolResult, ToolSpec};
+use super::{ApprovalRequirement, ToolContext, ToolKind, ToolResult, ToolSpec, required_str};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ShellStatus {
@@ -255,20 +255,8 @@ impl ShellManager {
             if let Some(status) = child.try_wait().context("failed to poll child process")? {
                 let _ = stdout_thread.join();
                 let _ = stderr_thread.join();
-                let stdout = String::from_utf8_lossy(
-                    &stdout_buffer
-                        .lock()
-                        .map(|data| data.clone())
-                        .unwrap_or_default(),
-                )
-                .to_string();
-                let stderr = String::from_utf8_lossy(
-                    &stderr_buffer
-                        .lock()
-                        .map(|data| data.clone())
-                        .unwrap_or_default(),
-                )
-                .to_string();
+                let stdout = collect_locked_output(&stdout_buffer);
+                let stderr = collect_locked_output(&stderr_buffer);
                 return Ok(ShellResult {
                     task_id: None,
                     status: if status.success() {
@@ -289,20 +277,8 @@ impl ShellManager {
                 let status = child.wait().ok();
                 let _ = stdout_thread.join();
                 let _ = stderr_thread.join();
-                let stdout = String::from_utf8_lossy(
-                    &stdout_buffer
-                        .lock()
-                        .map(|data| data.clone())
-                        .unwrap_or_default(),
-                )
-                .to_string();
-                let stderr = String::from_utf8_lossy(
-                    &stderr_buffer
-                        .lock()
-                        .map(|data| data.clone())
-                        .unwrap_or_default(),
-                )
-                .to_string();
+                let stdout = collect_locked_output(&stdout_buffer);
+                let stderr = collect_locked_output(&stderr_buffer);
                 return Ok(ShellResult {
                     task_id: None,
                     status: ShellStatus::TimedOut,
@@ -322,20 +298,8 @@ impl ShellManager {
                 let status = child.wait().ok();
                 let _ = stdout_thread.join();
                 let _ = stderr_thread.join();
-                let stdout = String::from_utf8_lossy(
-                    &stdout_buffer
-                        .lock()
-                        .map(|data| data.clone())
-                        .unwrap_or_default(),
-                )
-                .to_string();
-                let stderr = String::from_utf8_lossy(
-                    &stderr_buffer
-                        .lock()
-                        .map(|data| data.clone())
-                        .unwrap_or_default(),
-                )
-                .to_string();
+                let stdout = collect_locked_output(&stdout_buffer);
+                let stderr = collect_locked_output(&stderr_buffer);
                 return Ok(ShellResult {
                     task_id: None,
                     status: ShellStatus::Killed,
@@ -658,7 +622,7 @@ impl ToolSpec for ShellWaitTool {
     }
 
     fn approval_requirement(&self) -> ApprovalRequirement {
-        ApprovalRequirement::Prompt
+        ApprovalRequirement::Auto
     }
 }
 
@@ -726,7 +690,7 @@ impl ToolSpec for ShellInteractTool {
     }
 
     fn approval_requirement(&self) -> ApprovalRequirement {
-        ApprovalRequirement::Auto
+        ApprovalRequirement::Prompt
     }
 }
 
@@ -783,14 +747,6 @@ impl ToolSpec for ShellCancelTool {
             shell_result_summary(&result, task_id),
         ))
     }
-}
-
-fn required_str<'a>(input: &'a Value, key: &str) -> Result<&'a str> {
-    input
-        .get(key)
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .with_context(|| format!("missing required field '{key}'"))
 }
 
 fn shell_result_summary(result: &ShellResult, label: &str) -> String {
@@ -866,10 +822,10 @@ fn render_shell_wait_result(result: &ShellResult) -> String {
 }
 
 fn trimmed_output(text: &str) -> String {
-    truncate_chars(text, 12_000)
+    truncate_output(text, 12_000)
 }
 
-fn truncate_chars(text: &str, max_chars: usize) -> String {
+fn truncate_output(text: &str, max_chars: usize) -> String {
     let count = text.chars().count();
     if count <= max_chars {
         return text.to_string();
@@ -905,6 +861,16 @@ type SpawnedProcess = (
     thread::JoinHandle<()>,
     Option<ChildStdin>,
 );
+
+fn collect_locked_output(buffer: &Arc<Mutex<Vec<u8>>>) -> String {
+    String::from_utf8_lossy(
+        &buffer
+            .lock()
+            .map(|data| data.clone())
+            .unwrap_or_default(),
+    )
+    .to_string()
+}
 
 fn spawn_command(command: &str, working_dir: &Path) -> Result<SpawnedProcess> {
     let mut cmd = shell_command(command);
@@ -951,7 +917,7 @@ fn shell_command(command: &str) -> Command {
     {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let mut cmd = Command::new(shell);
-        cmd.arg("-lc").arg(command);
+        cmd.arg("-c").arg(command);
         cmd
     }
 }

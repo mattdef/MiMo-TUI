@@ -808,9 +808,9 @@ dependencies = [
  "mimo-agent",
  "mimo-client",
  "mimo-config",
- "mimo-core",
  "mimo-protocol",
  "mimo-state",
+ "mimo-tools",
  "mimo-tui",
  "tokio",
 ]
@@ -834,17 +834,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dirs",
+ "mimo-protocol",
  "reqwest",
  "serde",
  "toml",
-]
-
-[[package]]
-name = "mimo-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "mimo-tools",
 ]
 
 [[package]]
@@ -892,7 +885,6 @@ dependencies = [
  "mimo-agent",
  "mimo-client",
  "mimo-config",
- "mimo-core",
  "mimo-protocol",
  "mimo-state",
  "mimo-tools",

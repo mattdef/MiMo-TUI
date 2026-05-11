@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
-use mimo_config::{AUTO_MODEL, AppConfig};
-use mimo_protocol::{ApiTool, ChatMessage, Role, ToolCall, ToolFunction};
+use mimo_config::{AUTO_MODEL, AppConfig, auto_route_model};
+use mimo_protocol::{ApiTool, ChatMessage, ToolCall, ToolFunction};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -223,50 +223,6 @@ fn model_ids_from_response(response: ModelListResponse) -> Vec<String> {
         .collect()
 }
 
-fn auto_route_model(messages: &[ChatMessage]) -> &'static str {
-    let latest_user = messages
-        .iter()
-        .rev()
-        .find(|message| message.role == Role::User)
-        .map(|message| message.content.as_str())
-        .unwrap_or_default();
-    let transcript_chars = messages
-        .iter()
-        .map(|message| message.content.len())
-        .sum::<usize>();
-    let latest_lower = latest_user.to_ascii_lowercase();
-    let complex_keywords = [
-        "architecture",
-        "debug",
-        "error",
-        "failure",
-        "fix",
-        "implement",
-        "investigate",
-        "migrate",
-        "plan",
-        "refactor",
-        "review",
-        "security",
-        "test",
-        "trace",
-    ];
-    let is_complex = latest_user.len() > 600
-        || transcript_chars > 4_000
-        || latest_user.matches('\n').count() > 8
-        || latest_user.contains("```")
-        || complex_keywords
-            .iter()
-            .any(|keyword| latest_lower.contains(keyword));
-    if is_complex {
-        "mimo-v2.5-pro"
-    } else if latest_user.len() > 200 || transcript_chars > 1_500 {
-        "mimo-v2.5"
-    } else {
-        "mimo-v2-flash"
-    }
-}
-
 fn handle_sse_line<F>(
     line: &str,
     content: &mut String,
@@ -347,8 +303,9 @@ fn merge_tool_call_deltas(tool_calls: &mut Vec<ToolCall>, deltas: Vec<ToolCallDe
 mod tests {
     use super::{
         ModelListResponse, ToolCall, ToolCallDelta, ToolFunction, ToolFunctionDelta,
-        auto_route_model, handle_sse_line, merge_tool_call_deltas, model_ids_from_response,
+        handle_sse_line, merge_tool_call_deltas, model_ids_from_response,
     };
+    use mimo_config::auto_route_model;
     use mimo_protocol::ChatMessage;
 
     #[test]

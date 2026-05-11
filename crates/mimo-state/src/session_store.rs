@@ -57,7 +57,10 @@ pub fn save_session(
     };
     ensure_parent_dir(&path)?;
     let session = SavedSession {
-        saved_at_epoch: unix_timestamp(),
+        saved_at_epoch: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
         title: derive_title(messages),
         model: model.to_string(),
         mode,
@@ -186,7 +189,11 @@ fn latest_session_path(config: &AppConfig) -> Result<PathBuf> {
 }
 
 fn default_session_path(config: &AppConfig, prefix: &str, extension: &str) -> PathBuf {
-    sessions_dir(config).join(format!("{prefix}-{}.{}", unix_timestamp(), extension))
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    sessions_dir(config).join(format!("{prefix}-{ts}.{extension}"))
 }
 
 fn sessions_dir(config: &AppConfig) -> PathBuf {
@@ -211,13 +218,6 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     Ok(())
-}
-
-fn unix_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 fn derive_title(messages: &[ChatMessage]) -> String {

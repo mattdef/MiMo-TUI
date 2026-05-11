@@ -140,6 +140,7 @@ impl AppConfig {
     }
 
     pub fn set_base_url(&mut self, base_url: String) -> Result<()> {
+        let base_url = base_url.trim_end_matches('/').to_string();
         update_file_config(&self.config_path, |file_config| {
             file_config.base_url = Some(base_url.clone());
         })?;
@@ -265,6 +266,50 @@ fn pick_temperature<const N: usize>(
         }
     }
     (None, ConfigValueSource::Default)
+}
+
+pub fn auto_route_model(messages: &[mimo_protocol::ChatMessage]) -> &'static str {
+    let latest_user = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == mimo_protocol::Role::User)
+        .map(|message| message.content.as_str())
+        .unwrap_or_default();
+    let transcript_chars = messages
+        .iter()
+        .map(|message| message.content.len())
+        .sum::<usize>();
+    let latest_lower = latest_user.to_ascii_lowercase();
+    let complex_keywords = [
+        "architecture",
+        "debug",
+        "error",
+        "failure",
+        "fix",
+        "implement",
+        "investigate",
+        "migrate",
+        "plan",
+        "refactor",
+        "review",
+        "security",
+        "test",
+        "trace",
+    ];
+    let is_complex = latest_user.len() > 600
+        || transcript_chars > 4_000
+        || latest_user.matches('\n').count() > 8
+        || latest_user.contains("```")
+        || complex_keywords
+            .iter()
+            .any(|keyword| latest_lower.contains(keyword));
+    if is_complex {
+        "mimo-v2.5-pro"
+    } else if latest_user.len() > 200 || transcript_chars > 1_500 {
+        "mimo-v2.5"
+    } else {
+        "mimo-v2-flash"
+    }
 }
 
 #[cfg(test)]

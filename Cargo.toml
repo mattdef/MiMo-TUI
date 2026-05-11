@@ -4,7 +4,6 @@ members = [
     "crates/mimo-cli",
     "crates/mimo-client",
     "crates/mimo-config",
-    "crates/mimo-core",
     "crates/mimo-protocol",
     "crates/mimo-state",
     "crates/mimo-tools",

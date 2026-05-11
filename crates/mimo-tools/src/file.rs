@@ -1,9 +1,12 @@
-use std::{fs, path::Path};
+use std::fs;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use super::{ApprovalRequirement, FileSnapshot, ToolContext, ToolKind, ToolResult, ToolSpec};
+use super::{
+    ApprovalRequirement, FileSnapshot, ToolContext, ToolKind, ToolResult, ToolSpec,
+    relative_display, required_str,
+};
 
 pub struct ReadFileTool;
 pub struct ListDirTool;
@@ -289,20 +292,6 @@ impl ToolSpec for EditFileTool {
             format!("Edited {} ({count} replacements)", display),
         ))
     }
-}
-
-fn required_str<'a>(input: &'a Value, key: &str) -> Result<&'a str> {
-    input
-        .get(key)
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .with_context(|| format!("missing required field '{key}'"))
-}
-
-fn relative_display(workspace_root: &Path, path: &Path) -> String {
-    path.strip_prefix(workspace_root)
-        .map(|relative| relative.display().to_string())
-        .unwrap_or_else(|_| path.display().to_string())
 }
 
 fn render_diff(path: &str, before: &str, after: &str) -> String {

@@ -55,22 +55,27 @@ where
             }
 
             on_status(AgentStatus::ToolStarted(invocation.clone()))?;
-            let output = match registry
+            let result = registry
                 .execute(&invocation, context)
-                .with_context(|| format!("tool '{}' failed", invocation.name))
-            {
-                Ok(output) => output,
+                .with_context(|| format!("tool '{}' failed", invocation.name));
+            match result {
+                Ok(output) => {
+                    let summary = output.summary.clone();
+                    messages.push(ChatMessage::tool(call.id, output.content));
+                    on_status(AgentStatus::ToolSucceeded(invocation, summary))?;
+                }
                 Err(error) => {
+                    let error_message = error.to_string();
                     on_status(AgentStatus::ToolFailed(
                         invocation.clone(),
-                        error.to_string(),
+                        error_message.clone(),
                     ))?;
-                    return Err(error);
+                    messages.push(ChatMessage::tool(
+                        call.id,
+                        format!("Tool error: {error_message}"),
+                    ));
                 }
-            };
-            let summary = output.summary.clone();
-            messages.push(ChatMessage::tool(call.id, output.content));
-            on_status(AgentStatus::ToolSucceeded(invocation, summary))?;
+            }
         }
     }
 }

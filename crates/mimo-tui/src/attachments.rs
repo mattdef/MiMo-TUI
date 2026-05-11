@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Result, bail};
-use mimo_core::project_context;
+use mimo_tools::summarize_directory;
 use mimo_protocol::ChatMessage;
 use mimo_state::FileAttachment;
 use mimo_tui_core::input::InputBuffer;
@@ -83,7 +83,7 @@ pub fn attachment_preview(attachments: &[FileAttachment]) -> String {
 
 fn summarize_attachment(path: &Path) -> Result<String> {
     if path.is_dir() {
-        return project_context::summarize_path(path, 2, 30);
+        return summarize_directory(path, 2, 30);
     }
 
     let contents = fs::read_to_string(path)?;

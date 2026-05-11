@@ -11,7 +11,6 @@ use mimo_client::MimoClient;
 use mimo_config::{
     AUTO_MODEL, AppConfig, known_mimo_models, normalize_base_url, normalize_model_name,
 };
-use mimo_core::bootstrap::{create_default_tool_context, create_default_tool_registry};
 use mimo_protocol::{ChatMessage, Role};
 use mimo_state::{
     AppMode, FileAttachment, PlanItem, diagnostics_store, mcp_store, memory_store, session_store,
@@ -19,7 +18,7 @@ use mimo_state::{
 };
 use mimo_tools::{
     ApprovalRequirement, ShellResult, ShellStatus, ToolContext, ToolInvocation, ToolKind,
-    ToolRegistry,
+    ToolRegistry, ToolRegistryBuilder, default_workspace_root,
 };
 use mimo_tui_core::{
     commands::{
@@ -218,8 +217,8 @@ pub struct App {
 
 impl App {
     pub fn new(config: AppConfig) -> Self {
-        let tool_context = create_default_tool_context();
-        let tool_registry = create_default_tool_registry();
+        let tool_context = ToolContext::new(default_workspace_root());
+        let tool_registry = ToolRegistryBuilder::new().build_all();
         let mode = AppMode::Agent;
         let approval_mode_shared = Arc::new(Mutex::new(mode_approval_mode(mode)));
         let tasks = task_store::load_tasks(&config).unwrap_or_default();
@@ -1752,7 +1751,7 @@ impl App {
                 Ok(false)
             }
             SlashCommand::Context => {
-                let summary = mimo_core::project_context::summarize_current_directory(2, 60)?;
+                let summary = mimo_tools::summarize_workspace(2, 60)?;
                 self.messages.push(ChatMessage::system(summary));
                 self.scroll_to_bottom();
                 self.status = "Project context added to the conversation".to_string();

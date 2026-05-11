@@ -3,6 +3,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::LazyLock,
     time::Duration,
 };
 
@@ -10,7 +11,17 @@ use anyhow::{Context, Result, anyhow, bail};
 use reqwest::{Url, blocking::Client};
 use serde_json::{Value, json};
 
-use super::{ApprovalRequirement, FileSnapshot, ToolContext, ToolKind, ToolResult, ToolSpec};
+use super::{
+    ApprovalRequirement, FileSnapshot, ToolContext, ToolKind, ToolResult, ToolSpec,
+    relative_display, required_str, truncate_chars,
+};
+
+static HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| {
+    Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .expect("failed to build shared HTTP client")
+});
 
 const MAX_TEXT_FILE_BYTES: u64 = 256 * 1024;
 
@@ -144,11 +155,16 @@ impl ToolSpec for SearchTextTool {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let max_results = bounded_usize(&input, "max_results", 50, 200);
+        let query_normalized = if case_sensitive {
+            query.to_string()
+        } else {
+            query.to_ascii_lowercase()
+        };
         let mut matches = Vec::new();
         search_text_recursive(
             &root,
             &context.workspace_root,
-            query,
+            &query_normalized,
             case_sensitive,
             max_results,
             &mut matches,
@@ -407,11 +423,7 @@ impl ToolSpec for WebFetchTool {
             bail!("only http(s) URLs are supported");
         }
         let max_chars = bounded_usize(&input, "max_chars", 12_000, 50_000);
-        let client = Client::builder()
-            .timeout(Duration::from_secs(20))
-            .build()
-            .context("failed to create HTTP client")?;
-        let response = client
+        let response = HTTP_CLIENT
             .get(parsed.clone())
             .send()
             .with_context(|| format!("failed to fetch {parsed}"))?;
@@ -470,12 +482,6 @@ impl ToolSpec for ApplyPatchTool {
     fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult> {
         let patch = required_str(&input, "patch")?;
         let snapshot_files = patch_snapshot_files(context, patch)?;
-        run_command_with_stdin(
-            context.workspace_root.as_path(),
-            "git",
-            &["apply", "--check", "--whitespace=nowarn", "-"],
-            patch,
-        )?;
         let preview = run_command_with_stdin(
             context.workspace_root.as_path(),
             "git",
@@ -488,7 +494,8 @@ impl ToolSpec for ApplyPatchTool {
             "git",
             &["apply", "--whitespace=nowarn", "-"],
             patch,
-        )?;
+        )
+        .context("git apply failed; check that the patch applies cleanly to the current state of the repository")?;
         let _ = context.record_workspace_snapshot("apply_patch", snapshot_files)?;
         Ok(ToolResult::new(preview, "Applied patch"))
     }
@@ -750,8 +757,7 @@ fn search_text_recursive(
             let found = if case_sensitive {
                 line.contains(query)
             } else {
-                line.to_ascii_lowercase()
-                    .contains(&query.to_ascii_lowercase())
+                line.to_ascii_lowercase().contains(query)
             };
             if found {
                 matches.push(json!({
@@ -881,14 +887,6 @@ fn run_command_with_stdin(cwd: &Path, program: &str, args: &[&str], stdin: &str)
     Ok(combined.trim().to_string())
 }
 
-fn required_str<'a>(input: &'a Value, key: &str) -> Result<&'a str> {
-    input
-        .get(key)
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .with_context(|| format!("missing required field '{key}'"))
-}
-
 fn bounded_usize(input: &Value, field: &str, default: usize, upper_bound: usize) -> usize {
     input
         .get(field)
@@ -896,21 +894,6 @@ fn bounded_usize(input: &Value, field: &str, default: usize, upper_bound: usize)
         .map(|value| value as usize)
         .unwrap_or(default)
         .clamp(1, upper_bound)
-}
-
-fn relative_display(workspace_root: &Path, path: &Path) -> String {
-    path.strip_prefix(workspace_root)
-        .map(|relative| relative.display().to_string())
-        .unwrap_or_else(|_| path.display().to_string())
-}
-
-fn truncate_chars(value: &str, limit: usize) -> String {
-    let truncated = value.chars().take(limit).collect::<String>();
-    if value.chars().count() > limit {
-        format!("{truncated}...")
-    } else {
-        truncated
-    }
 }
 
 fn summarize_path(path: &Path, max_depth: usize, max_entries: usize) -> Result<String> {

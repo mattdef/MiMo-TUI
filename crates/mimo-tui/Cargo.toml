@@ -11,7 +11,6 @@ libc.workspace = true
 mimo-agent = { path = "../mimo-agent" }
 mimo-client = { path = "../mimo-client" }
 mimo-config = { path = "../mimo-config" }
-mimo-core = { path = "../mimo-core" }
 mimo-protocol = { path = "../mimo-protocol" }
 mimo-state = { path = "../mimo-state" }
 mimo-tools = { path = "../mimo-tools" }

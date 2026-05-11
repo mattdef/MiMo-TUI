@@ -1,14 +1,11 @@
-use std::{
-    env,
-    io::{self, Write},
-};
+use std::io::{self, Write};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use mimo_agent::run_agent_turn;
 use mimo_client::MimoClient;
 use mimo_config::{AppConfig, ConfigOverrides, known_mimo_models};
-use mimo_core::bootstrap::{create_default_tool_registry, create_tool_context};
+use mimo_tools::{ToolContext, ToolRegistryBuilder, default_workspace_root};
 use mimo_protocol::ChatMessage;
 use mimo_state::session_store;
 
@@ -78,9 +75,9 @@ async fn ask(config: AppConfig, prompt: String) -> Result<()> {
         ChatMessage::system(config.system_prompt.clone()),
         ChatMessage::user(prompt),
     ];
-    let workspace = env::current_dir()?;
-    let tool_context = create_tool_context(workspace);
-    let tool_registry = create_default_tool_registry();
+    let workspace = default_workspace_root();
+    let tool_context = ToolContext::new(workspace);
+    let tool_registry = ToolRegistryBuilder::new().build_all();
 
     run_agent_turn(
         &client,

@@ -124,6 +124,19 @@ impl ToolRegistryBuilder {
         self.with_tool(Arc::new(RunTestsTool))
     }
 
+    pub fn build_all(self) -> ToolRegistry {
+        self.with_file_tools()
+            .with_search_tools()
+            .with_git_tools()
+            .with_web_tools()
+            .with_project_tools()
+            .with_patch_tools()
+            .with_diagnostics_tool()
+            .with_test_runner_tool()
+            .with_shell_tools()
+            .build()
+    }
+
     pub fn build(self) -> ToolRegistry {
         let api_tools = self
             .tools
