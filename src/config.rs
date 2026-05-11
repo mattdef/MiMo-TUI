@@ -1,4 +1,4 @@
-use std::{env, fs, path::PathBuf};
+use std::{env, fmt, fs, path::PathBuf};
 
 use anyhow::{Context, Result};
 use reqwest::Url;
@@ -20,6 +20,25 @@ pub struct ConfigOverrides {
     pub temperature: Option<f32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigValueSource {
+    Cli,
+    Env,
+    File,
+    Default,
+}
+
+impl fmt::Display for ConfigValueSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cli => formatter.write_str("cli"),
+            Self::Env => formatter.write_str("env"),
+            Self::File => formatter.write_str("config file"),
+            Self::Default => formatter.write_str("default"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub api_key: Option<String>,
@@ -28,6 +47,11 @@ pub struct AppConfig {
     pub temperature: f32,
     pub system_prompt: String,
     pub config_path: PathBuf,
+    pub api_key_source: ConfigValueSource,
+    pub base_url_source: ConfigValueSource,
+    pub model_source: ConfigValueSource,
+    pub temperature_source: ConfigValueSource,
+    pub system_prompt_source: ConfigValueSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -49,37 +73,39 @@ impl AppConfig {
         let config_path = config_path();
         let file_config = read_file_config(&config_path)?;
 
-        let api_key = first_non_empty([
-            overrides.api_key,
-            env::var("MIMO_API_KEY").ok(),
-            file_config.api_key,
+        let (api_key, api_key_source) = pick_string([
+            (ConfigValueSource::Cli, overrides.api_key),
+            (ConfigValueSource::Env, env::var("MIMO_API_KEY").ok()),
+            (ConfigValueSource::File, file_config.api_key),
         ]);
 
-        let base_url = first_non_empty([
-            overrides.base_url,
-            env::var("MIMO_BASE_URL").ok(),
-            file_config.base_url,
-        ])
-        .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
-        .trim_end_matches('/')
-        .to_string();
+        let (base_url, base_url_source) = pick_string([
+            (ConfigValueSource::Cli, overrides.base_url),
+            (ConfigValueSource::Env, env::var("MIMO_BASE_URL").ok()),
+            (ConfigValueSource::File, file_config.base_url),
+        ]);
+        let base_url = base_url
+            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
+            .trim_end_matches('/')
+            .to_string();
 
-        let model = first_non_empty([
-            overrides.model,
-            env::var("MIMO_MODEL").ok(),
-            file_config.model,
-        ])
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let (model, model_source) = pick_string([
+            (ConfigValueSource::Cli, overrides.model),
+            (ConfigValueSource::Env, env::var("MIMO_MODEL").ok()),
+            (ConfigValueSource::File, file_config.model),
+        ]);
+        let model = model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
 
-        let temperature = overrides
-            .temperature
-            .or(env_f32("MIMO_TEMPERATURE")?)
-            .or(file_config.temperature)
-            .unwrap_or(DEFAULT_TEMPERATURE);
+        let (temperature, temperature_source) = pick_temperature([
+            (ConfigValueSource::Cli, overrides.temperature),
+            (ConfigValueSource::Env, env_f32("MIMO_TEMPERATURE")?),
+            (ConfigValueSource::File, file_config.temperature),
+        ]);
+        let temperature = temperature.unwrap_or(DEFAULT_TEMPERATURE);
 
-        let system_prompt = file_config
-            .system_prompt
-            .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
+        let (system_prompt, system_prompt_source) =
+            pick_string([(ConfigValueSource::File, file_config.system_prompt)]);
+        let system_prompt = system_prompt.unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
 
         Ok(Self {
             api_key,
@@ -88,6 +114,11 @@ impl AppConfig {
             temperature,
             system_prompt,
             config_path,
+            api_key_source,
+            base_url_source,
+            model_source,
+            temperature_source,
+            system_prompt_source,
         })
     }
 
@@ -209,12 +240,29 @@ fn env_f32(name: &str) -> Result<Option<f32>> {
         .with_context(|| format!("{name} must be a floating point number"))
 }
 
-fn first_non_empty(values: impl IntoIterator<Item = Option<String>>) -> Option<String> {
-    values
-        .into_iter()
-        .flatten()
-        .map(|value| value.trim().to_string())
-        .find(|value| !value.is_empty())
+fn pick_string<const N: usize>(
+    values: [(ConfigValueSource, Option<String>); N],
+) -> (Option<String>, ConfigValueSource) {
+    for (source, value) in values {
+        if let Some(value) = value {
+            let trimmed = value.trim().to_string();
+            if !trimmed.is_empty() {
+                return (Some(trimmed), source);
+            }
+        }
+    }
+    (None, ConfigValueSource::Default)
+}
+
+fn pick_temperature<const N: usize>(
+    values: [(ConfigValueSource, Option<f32>); N],
+) -> (Option<f32>, ConfigValueSource) {
+    for (source, value) in values {
+        if let Some(value) = value {
+            return (Some(value), source);
+        }
+    }
+    (None, ConfigValueSource::Default)
 }
 
 #[cfg(test)]

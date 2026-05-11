@@ -90,6 +90,30 @@ impl InputBuffer {
         self.cursor = self.current_line_end();
     }
 
+    pub fn replace_char_range(&mut self, start: usize, end: usize, replacement: &str) {
+        let start = start.min(self.char_len());
+        let end = end.min(self.char_len()).max(start);
+        let start_byte = self.byte_index(start);
+        let end_byte = self.byte_index(end);
+        self.text.replace_range(start_byte..end_byte, replacement);
+        self.cursor = start + replacement.chars().count();
+    }
+
+    pub fn current_token_bounds(&self) -> (usize, usize) {
+        let chars = self.text.chars().collect::<Vec<_>>();
+        let mut start = self.cursor.min(chars.len());
+        while start > 0 && !chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+
+        let mut end = self.cursor.min(chars.len());
+        while end < chars.len() && !chars[end].is_whitespace() {
+            end += 1;
+        }
+
+        (start, end)
+    }
+
     pub fn line_count(&self) -> usize {
         self.text.lines().count().max(1)
     }
@@ -163,5 +187,12 @@ mod tests {
         assert_eq!(buffer.cursor_line_col(), (1, 0));
         buffer.move_to_line_end();
         assert_eq!(buffer.cursor_line_col(), (1, 3));
+    }
+
+    #[test]
+    fn replaces_char_ranges() {
+        let mut buffer = InputBuffer::from("alpha beta");
+        buffer.replace_char_range(6, 10, "gamma");
+        assert_eq!(buffer.as_str(), "alpha gamma");
     }
 }

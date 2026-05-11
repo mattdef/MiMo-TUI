@@ -1,0 +1,2187 @@
+use std::env;
+
+use anyhow::{Context, Result};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use ratatui::{
+    Frame,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+};
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::task::JoinHandle;
+
+use crate::{
+    client::{ChatMessage, MimoClient, Role},
+    config::{AppConfig, known_mimo_models, normalize_base_url, normalize_model_name},
+};
+
+use super::{
+    attachments, command_palette,
+    commands::{self, CommandParseError, ConfigCommand, ModeName, PlanCommand, SlashCommand},
+    input::InputBuffer,
+    keybindings, markdown, project_context, session_picker, session_store, slash_menu,
+    state::{AppMode, FileAttachment, PlanItem},
+    tooling::ToolRuntime,
+};
+
+#[derive(Debug)]
+pub enum AppEvent {
+    Delta(String),
+    Finished(Result<(), String>),
+    ModelsLoaded(Result<Vec<String>, String>),
+}
+
+impl From<ModeName> for AppMode {
+    fn from(value: ModeName) -> Self {
+        match value {
+            ModeName::Chat => Self::Chat,
+            ModeName::Plan => Self::Plan,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct HelpState {
+    open: bool,
+    filter: InputBuffer,
+    scroll: u16,
+}
+
+#[derive(Debug, Default)]
+struct ModelPickerState {
+    open: bool,
+    models: Vec<String>,
+    selected: usize,
+    scroll: u16,
+    loading: bool,
+}
+
+#[derive(Debug, Default)]
+struct SessionPickerState {
+    open: bool,
+    entries: Vec<session_store::SessionEntry>,
+    selected: usize,
+    scroll: u16,
+}
+
+#[derive(Debug, Default)]
+struct CommandPaletteState {
+    open: bool,
+    filter: InputBuffer,
+    selected: usize,
+    scroll: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DraftBrowserKind {
+    History,
+    Stash,
+}
+
+#[derive(Debug)]
+struct DraftBrowserState {
+    open: bool,
+    kind: DraftBrowserKind,
+    selected: usize,
+    scroll: u16,
+}
+
+impl Default for DraftBrowserState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            kind: DraftBrowserKind::History,
+            selected: 0,
+            scroll: 0,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct MessagePagerState {
+    open: bool,
+    title: String,
+    lines: Vec<Line<'static>>,
+    scroll: u16,
+}
+
+#[derive(Debug)]
+pub struct App {
+    config: AppConfig,
+    messages: Vec<ChatMessage>,
+    input: InputBuffer,
+    status: String,
+    streaming: bool,
+    assistant_index: Option<usize>,
+    scroll: u16,
+    conversation_view_height: u16,
+    input_scroll: u16,
+    help: HelpState,
+    model_picker: ModelPickerState,
+    session_picker: SessionPickerState,
+    command_palette: CommandPaletteState,
+    draft_browser: DraftBrowserState,
+    message_pager: MessagePagerState,
+    discovered_models: Vec<String>,
+    last_prompt: Option<String>,
+    mode: AppMode,
+    stream_task: Option<JoinHandle<()>>,
+    model_load_task: Option<JoinHandle<()>>,
+    draft_history: Vec<String>,
+    draft_stash: Vec<String>,
+    attachments: Vec<FileAttachment>,
+    plan_items: Vec<PlanItem>,
+    tool_runtime: ToolRuntime,
+    slash_menu_selected: usize,
+}
+
+impl App {
+    pub fn new(config: AppConfig) -> Self {
+        let status = if config.api_key.is_some() {
+            "Ready".to_string()
+        } else {
+            "Missing API key: use /config api-key <key> or edit config.toml".to_string()
+        };
+
+        Self {
+            config,
+            messages: Vec::new(),
+            input: InputBuffer::new(),
+            status,
+            streaming: false,
+            assistant_index: None,
+            scroll: 0,
+            conversation_view_height: 1,
+            input_scroll: 0,
+            help: HelpState::default(),
+            model_picker: ModelPickerState::default(),
+            session_picker: SessionPickerState::default(),
+            command_palette: CommandPaletteState::default(),
+            draft_browser: DraftBrowserState::default(),
+            message_pager: MessagePagerState::default(),
+            discovered_models: Vec::new(),
+            last_prompt: None,
+            mode: AppMode::Chat,
+            stream_task: None,
+            model_load_task: None,
+            draft_history: Vec::new(),
+            draft_stash: Vec::new(),
+            attachments: Vec::new(),
+            plan_items: Vec::new(),
+            tool_runtime: ToolRuntime::default(),
+            slash_menu_selected: 0,
+        }
+    }
+
+    pub fn render(&mut self, frame: &mut Frame) {
+        let area = frame.area();
+        let input_height = self.input_height(area.height);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(4),
+                Constraint::Length(input_height),
+                Constraint::Length(1),
+            ])
+            .split(area);
+
+        self.conversation_view_height = chunks[1].height.saturating_sub(2).max(1);
+        self.clamp_scroll();
+
+        self.render_header(frame, chunks[0]);
+        self.render_main_panel(frame, chunks[1]);
+        self.render_input(frame, chunks[2]);
+        self.render_footer(frame, chunks[3]);
+
+        if self.help.open {
+            self.render_help_overlay(frame, area);
+        } else if self.command_palette.open {
+            self.render_command_palette_overlay(frame, area);
+        } else if self.draft_browser.open {
+            self.render_draft_browser_overlay(frame, area);
+        } else if self.session_picker.open {
+            self.render_session_picker_overlay(frame, area);
+        } else if self.model_picker.open {
+            self.render_model_picker_overlay(frame, area);
+        } else if self.message_pager.open {
+            self.render_message_pager_overlay(frame, area);
+        } else if self.slash_menu_visible() {
+            self.render_slash_menu_overlay(frame, area);
+        }
+    }
+
+    pub fn handle_terminal_event(
+        &mut self,
+        event: Event,
+        event_tx: UnboundedSender<AppEvent>,
+    ) -> Result<bool> {
+        match event {
+            Event::Key(key) => {
+                if self.help.open {
+                    return Ok(self.handle_help_key(key));
+                }
+                if self.command_palette.open {
+                    return self.handle_command_palette_key(key, event_tx);
+                }
+                if self.draft_browser.open {
+                    return Ok(self.handle_draft_browser_key(key));
+                }
+                if self.session_picker.open {
+                    return self.handle_session_picker_key(key);
+                }
+                if self.model_picker.open {
+                    return self.handle_model_picker_key(key);
+                }
+                if self.message_pager.open {
+                    return Ok(self.handle_message_pager_key(key));
+                }
+
+                if opens_help(key, self.input.is_empty()) {
+                    self.open_help(None);
+                    return Ok(false);
+                }
+                if opens_palette(key) {
+                    self.open_command_palette();
+                    return Ok(false);
+                }
+                if opens_session_picker(key) {
+                    self.open_session_picker()?;
+                    return Ok(false);
+                }
+                if opens_draft_history(key) {
+                    self.open_draft_browser(DraftBrowserKind::History);
+                    return Ok(false);
+                }
+                if stashes_draft(key) {
+                    self.stash_current_draft();
+                    return Ok(false);
+                }
+                if opens_last_message_pager(key) {
+                    self.open_last_message_pager();
+                    return Ok(false);
+                }
+
+                if matches!(key.code, KeyCode::Esc) {
+                    self.handle_escape_key();
+                    return Ok(false);
+                }
+
+                if is_quit_key(key, self.input.is_empty()) {
+                    return Ok(true);
+                }
+
+                match key.code {
+                    KeyCode::Enter if inserts_newline(key) => self.input.insert_char('\n'),
+                    KeyCode::Enter => {
+                        if self.submit(event_tx)? {
+                            return Ok(true);
+                        }
+                    }
+                    KeyCode::Tab => {
+                        if self.handle_tab_key()? {
+                            return Ok(false);
+                        }
+                    }
+                    KeyCode::Backspace if self.input.is_empty() && !self.attachments.is_empty() => {
+                        if let Some(attachment) =
+                            attachments::pop_last_attachment(&mut self.attachments)
+                        {
+                            self.status = format!("Removed attachment: {}", attachment.path);
+                        }
+                    }
+                    KeyCode::Backspace => self.input.backspace(),
+                    KeyCode::Delete => self.input.delete(),
+                    KeyCode::Left => self.input.move_left(),
+                    KeyCode::Right => self.input.move_right(),
+                    KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.scroll = 0
+                    }
+                    KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.scroll_to_bottom()
+                    }
+                    KeyCode::Home => self.input.move_to_line_start(),
+                    KeyCode::End => self.input.move_to_line_end(),
+                    KeyCode::PageUp => self.scroll_page_up(),
+                    KeyCode::PageDown => self.scroll_page_down(),
+                    KeyCode::Up if self.slash_menu_visible() => {
+                        self.slash_menu_selected = self.slash_menu_selected.saturating_sub(1);
+                    }
+                    KeyCode::Down if self.slash_menu_visible() => {
+                        let last = self.slash_menu_entries().len().saturating_sub(1);
+                        self.slash_menu_selected = (self.slash_menu_selected + 1).min(last);
+                    }
+                    KeyCode::Up => self.scroll_by(-1),
+                    KeyCode::Down => self.scroll_by(1),
+                    KeyCode::Char('a' | 'A') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.input.move_to_line_start();
+                    }
+                    KeyCode::Char('e' | 'E') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.input.move_to_line_end();
+                    }
+                    KeyCode::Char('j' | 'J') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.input.insert_char('\n');
+                    }
+                    KeyCode::Char('u' | 'U') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.clear_current_draft();
+                    }
+                    KeyCode::Char('\u{15}') => self.clear_current_draft(),
+                    KeyCode::Char(c)
+                        if !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key.modifiers.contains(KeyModifiers::ALT) =>
+                    {
+                        self.input.insert_char(c);
+                        self.clamp_slash_menu_selection();
+                    }
+                    _ => {}
+                }
+            }
+            Event::Paste(text) => {
+                self.input.insert_str(&text);
+                self.clamp_slash_menu_selection();
+            }
+            _ => {}
+        }
+
+        Ok(false)
+    }
+
+    pub fn handle_app_event(&mut self, event: AppEvent) {
+        match event {
+            AppEvent::Delta(delta) => {
+                if let Some(index) = self.assistant_index
+                    && let Some(message) = self.messages.get_mut(index)
+                {
+                    message.content.push_str(&delta);
+                }
+                self.scroll_to_bottom();
+            }
+            AppEvent::Finished(Ok(())) => {
+                self.stream_task = None;
+                self.streaming = false;
+                self.assistant_index = None;
+                self.status = "Ready".to_string();
+                self.scroll_to_bottom();
+            }
+            AppEvent::Finished(Err(error)) => {
+                self.stream_task = None;
+                self.streaming = false;
+                if let Some(index) = self.assistant_index
+                    && let Some(message) = self.messages.get_mut(index)
+                    && message.content.is_empty()
+                {
+                    message.content = format!("Request failed: {error}");
+                }
+                self.assistant_index = None;
+                self.status = error;
+                self.scroll_to_bottom();
+            }
+            AppEvent::ModelsLoaded(Ok(models)) => {
+                self.model_load_task = None;
+                self.model_picker.loading = false;
+                self.discovered_models = normalize_remote_models(models);
+                self.refresh_model_picker_catalog();
+                let count = self.discovered_models.len();
+                self.status = if count == 0 {
+                    "MiMo returned an empty model catalog; using local suggestions".to_string()
+                } else {
+                    format!("Loaded {count} models from MiMo API")
+                };
+            }
+            AppEvent::ModelsLoaded(Err(error)) => {
+                self.model_load_task = None;
+                self.model_picker.loading = false;
+                self.refresh_model_picker_catalog();
+                self.status = format!("Model refresh failed; using local suggestions ({error})");
+            }
+        }
+    }
+
+    fn render_header(&self, frame: &mut Frame, area: Rect) {
+        let status_style = if self.streaming {
+            Style::default().fg(Color::Yellow)
+        } else if self.config.api_key.is_none() {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default().fg(Color::Green)
+        };
+
+        let line = Line::from(vec![
+            Span::styled(
+                "MiMo TUI",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" | mode: "),
+            Span::styled(self.mode.to_string(), Style::default().fg(Color::Blue)),
+            Span::raw(" | model: "),
+            Span::styled(&self.config.model, Style::default().fg(Color::Magenta)),
+            Span::raw(" | attachments: "),
+            Span::styled(
+                self.attachments.len().to_string(),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::raw(" | "),
+            Span::styled(&self.status, status_style),
+        ]);
+
+        frame.render_widget(
+            Paragraph::new(line).block(Block::default().borders(Borders::ALL)),
+            area,
+        );
+    }
+
+    fn render_main_panel(&self, frame: &mut Frame, area: Rect) {
+        if self.mode == AppMode::Plan {
+            let panels = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+                .split(area);
+            self.render_conversation(frame, panels[0]);
+            self.render_plan_panel(frame, panels[1]);
+        } else {
+            self.render_conversation(frame, area);
+        }
+    }
+
+    fn render_conversation(&self, frame: &mut Frame, area: Rect) {
+        let text = if self.messages.is_empty() {
+            Text::from(vec![
+                Line::styled(
+                    "Welcome to MiMo TUI.",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Line::raw("Type a prompt and press Enter to stream a response from MiMo."),
+                Line::raw("Use /help or F1 to discover commands and keybindings."),
+                Line::raw("Use /config api-key <key> to save credentials from inside the TUI."),
+            ])
+        } else {
+            Text::from(self.message_lines())
+        };
+
+        frame.render_widget(
+            Paragraph::new(text)
+                .block(Block::default().title("Conversation").borders(Borders::ALL))
+                .wrap(Wrap { trim: false })
+                .scroll((self.scroll, 0)),
+            area,
+        );
+    }
+
+    fn render_plan_panel(&self, frame: &mut Frame, area: Rect) {
+        let mut lines = vec![
+            Line::styled(
+                "Plan checklist",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::raw(""),
+        ];
+        if self.plan_items.is_empty() {
+            lines.push(Line::raw("Use /plan add <text> to track planned steps."));
+            lines.push(Line::raw("Use /plan done <n> to mark a step complete."));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "Plan mode stays read-only until you switch back to chat mode.",
+                Style::default().fg(Color::DarkGray),
+            ));
+        } else {
+            for (index, item) in self.plan_items.iter().enumerate() {
+                let marker = if item.done { "[x]" } else { "[ ]" };
+                let style = if item.done {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::styled(
+                    format!("{}. {} {}", index + 1, marker, item.text),
+                    style,
+                ));
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                format!("Tools: {}", self.tool_runtime.summary()),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(Block::default().title("Plan").borders(Borders::ALL))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+
+    fn render_input(&mut self, frame: &mut Frame, area: Rect) {
+        let attachment_height = if self.attachments.is_empty() { 0 } else { 3 };
+        if attachment_height > 0 {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Min(3)])
+                .split(area);
+            frame.render_widget(
+                Paragraph::new(attachments::attachment_preview(&self.attachments))
+                    .block(
+                        Block::default()
+                            .title("Attached context")
+                            .borders(Borders::ALL),
+                    )
+                    .wrap(Wrap { trim: false }),
+                chunks[0],
+            );
+            self.render_draft_box(frame, chunks[1]);
+        } else {
+            self.render_draft_box(frame, area);
+        }
+    }
+
+    fn render_draft_box(&mut self, frame: &mut Frame, area: Rect) {
+        let title = if self.streaming {
+            "Prompt (waiting for MiMo)"
+        } else {
+            "Prompt"
+        };
+        let visible_lines = area.height.saturating_sub(2).max(1) as usize;
+        let (cursor_line, cursor_col) = self.input.cursor_line_col();
+        let max_scroll = self
+            .input
+            .line_count()
+            .saturating_sub(visible_lines)
+            .try_into()
+            .unwrap_or(u16::MAX);
+        if cursor_line < self.input_scroll as usize {
+            self.input_scroll = cursor_line as u16;
+        } else if cursor_line >= self.input_scroll as usize + visible_lines {
+            self.input_scroll = (cursor_line + 1 - visible_lines) as u16;
+        }
+        self.input_scroll = self.input_scroll.min(max_scroll);
+
+        frame.render_widget(
+            Paragraph::new(self.input.as_str())
+                .block(Block::default().title(title).borders(Borders::ALL))
+                .scroll((self.input_scroll, 0)),
+            area,
+        );
+
+        if !self.help.open
+            && !self.model_picker.open
+            && !self.session_picker.open
+            && !self.command_palette.open
+            && !self.draft_browser.open
+            && !self.message_pager.open
+        {
+            let visible_line = cursor_line.saturating_sub(self.input_scroll as usize);
+            let cursor_x =
+                area.x + 1 + cursor_col.min(area.width.saturating_sub(2) as usize) as u16;
+            let cursor_y = area.y + 1 + visible_line.min(visible_lines.saturating_sub(1)) as u16;
+            frame.set_cursor_position((cursor_x, cursor_y));
+        }
+    }
+
+    fn render_footer(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(
+            Paragraph::new(keybindings::footer_hint()).style(Style::default().fg(Color::DarkGray)),
+            area,
+        );
+    }
+
+    fn render_help_overlay(&mut self, frame: &mut Frame, area: Rect) {
+        let popup = centered_rect(area, 85, 80);
+        let inner = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(3)])
+            .split(popup);
+
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Block::default()
+                .title("Help")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+            popup,
+        );
+
+        self.render_filter_box(frame, inner[0], &self.help.filter, "Search");
+
+        let lines = commands::help_overlay_lines(self.help.filter.trim());
+        self.help.scroll = clamp_scroll(lines.len(), inner[1].height, self.help.scroll);
+        frame.render_widget(
+            Paragraph::new(Text::from(
+                lines.into_iter().map(Line::raw).collect::<Vec<_>>(),
+            ))
+            .block(
+                Block::default()
+                    .title("Commands and keybindings")
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: false })
+            .scroll((self.help.scroll, 0)),
+            inner[1],
+        );
+
+        set_filter_cursor(frame, inner[0], &self.help.filter);
+    }
+
+    fn render_model_picker_overlay(&mut self, frame: &mut Frame, area: Rect) {
+        let popup = centered_rect(area, 70, 60);
+        let inner = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(3), Constraint::Length(2)])
+            .split(popup);
+
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Block::default()
+                .title("MiMo models")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Magenta)),
+            popup,
+        );
+
+        let body_height = inner[0].height.saturating_sub(2).max(1) as usize;
+        self.model_picker.scroll = adjust_selection_scroll(
+            self.model_picker.selected,
+            self.model_picker.scroll,
+            body_height,
+        );
+        let lines = self
+            .model_picker
+            .models
+            .iter()
+            .enumerate()
+            .map(|(index, model)| {
+                let prefix = if index == self.model_picker.selected {
+                    "> "
+                } else {
+                    "  "
+                };
+                let style = if model == &self.config.model {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default()
+                };
+                Line::styled(format!("{prefix}{model}"), style)
+            })
+            .collect::<Vec<_>>();
+
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(
+                    Block::default()
+                        .title("Select a model")
+                        .borders(Borders::ALL),
+                )
+                .scroll((self.model_picker.scroll, 0)),
+            inner[0],
+        );
+        frame.render_widget(
+            Paragraph::new(if self.model_picker.loading {
+                "Up/Down move | Enter apply | Esc cancel | Loading latest models..."
+            } else {
+                "Up/Down move | Enter apply | Esc cancel"
+            })
+            .style(Style::default().fg(Color::DarkGray)),
+            inner[1],
+        );
+    }
+
+    fn render_session_picker_overlay(&mut self, frame: &mut Frame, area: Rect) {
+        let popup = centered_rect(area, 80, 60);
+        let inner = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(3), Constraint::Length(2)])
+            .split(popup);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Block::default()
+                .title("Saved sessions")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Green)),
+            popup,
+        );
+
+        let lines = session_picker::session_lines(
+            &self.session_picker.entries,
+            self.session_picker.selected,
+        );
+        self.session_picker.scroll =
+            clamp_scroll(lines.len(), inner[0].height, self.session_picker.scroll);
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(
+                    Block::default()
+                        .title("Resume a session")
+                        .borders(Borders::ALL),
+                )
+                .wrap(Wrap { trim: false })
+                .scroll((self.session_picker.scroll, 0)),
+            inner[0],
+        );
+        frame.render_widget(
+            Paragraph::new("Up/Down move | Enter load | Esc cancel")
+                .style(Style::default().fg(Color::DarkGray)),
+            inner[1],
+        );
+    }
+
+    fn render_command_palette_overlay(&mut self, frame: &mut Frame, area: Rect) {
+        let popup = centered_rect(area, 80, 70);
+        let inner = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(3)])
+            .split(popup);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Block::default()
+                .title("Command palette")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+            popup,
+        );
+
+        self.render_filter_box(frame, inner[0], &self.command_palette.filter, "Filter");
+        let entries =
+            command_palette::filtered_entries(self.command_palette.filter.trim(), self.mode);
+        self.command_palette.scroll = adjust_selection_scroll(
+            self.command_palette.selected,
+            self.command_palette.scroll,
+            inner[1].height.saturating_sub(2).max(1) as usize,
+        );
+        let lines = entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let prefix = if index == self.command_palette.selected {
+                    "> "
+                } else {
+                    "  "
+                };
+                let style = if index == self.command_palette.selected {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                Line::styled(format!("{prefix}{:<28} {}", entry.label, entry.hint), style)
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(Block::default().title("Actions").borders(Borders::ALL))
+                .wrap(Wrap { trim: false })
+                .scroll((self.command_palette.scroll, 0)),
+            inner[1],
+        );
+        set_filter_cursor(frame, inner[0], &self.command_palette.filter);
+    }
+
+    fn render_draft_browser_overlay(&mut self, frame: &mut Frame, area: Rect) {
+        let popup = centered_rect(area, 70, 55);
+        let inner = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(3), Constraint::Length(2)])
+            .split(popup);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Block::default()
+                .title(self.draft_browser_title())
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Magenta)),
+            popup,
+        );
+
+        self.draft_browser.scroll = adjust_selection_scroll(
+            self.draft_browser.selected,
+            self.draft_browser.scroll,
+            inner[0].height.saturating_sub(2).max(1) as usize,
+        );
+        let lines = self
+            .draft_browser_items()
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let prefix = if index == self.draft_browser.selected {
+                    "> "
+                } else {
+                    "  "
+                };
+                let style = if index == self.draft_browser.selected {
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                Line::styled(format!("{prefix}{item}"), style)
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(Block::default().title("Drafts").borders(Borders::ALL))
+                .wrap(Wrap { trim: false })
+                .scroll((self.draft_browser.scroll, 0)),
+            inner[0],
+        );
+        frame.render_widget(
+            Paragraph::new("Up/Down move | Enter restore | Esc cancel")
+                .style(Style::default().fg(Color::DarkGray)),
+            inner[1],
+        );
+    }
+
+    fn render_message_pager_overlay(&mut self, frame: &mut Frame, area: Rect) {
+        let popup = centered_rect(area, 80, 75);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(Text::from(self.message_pager.lines.clone()))
+                .block(
+                    Block::default()
+                        .title(self.message_pager.title.as_str())
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Cyan)),
+                )
+                .wrap(Wrap { trim: false })
+                .scroll((self.message_pager.scroll, 0)),
+            popup,
+        );
+    }
+
+    fn render_slash_menu_overlay(&mut self, frame: &mut Frame, area: Rect) {
+        let popup = centered_rect(area, 72, 34);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Block::default()
+                .title("Commands")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Blue)),
+            popup,
+        );
+        let entries = self.slash_menu_entries();
+        let lines = entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let prefix = if index == self.slash_menu_selected {
+                    "> "
+                } else {
+                    "  "
+                };
+                let style = if index == self.slash_menu_selected {
+                    Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                Line::styled(
+                    format!(
+                        "{prefix}{:<16} {}",
+                        entry.command.usage, entry.command.description
+                    ),
+                    style,
+                )
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(Block::default().title("Slash menu").borders(Borders::ALL))
+                .wrap(Wrap { trim: false }),
+            popup,
+        );
+    }
+
+    fn render_filter_box(&self, frame: &mut Frame, area: Rect, input: &InputBuffer, title: &str) {
+        let filter_visible_lines = area.height.saturating_sub(2).max(1) as usize;
+        let (filter_line, _) = input.cursor_line_col();
+        let filter_scroll =
+            filter_line.saturating_sub(filter_visible_lines.saturating_sub(1)) as u16;
+
+        frame.render_widget(
+            Paragraph::new(input.as_str())
+                .block(Block::default().title(title).borders(Borders::ALL))
+                .scroll((filter_scroll, 0)),
+            area,
+        );
+    }
+
+    fn handle_help_key(&mut self, key: KeyEvent) -> bool {
+        if closes_overlay(key) {
+            self.help = HelpState::default();
+            return false;
+        }
+
+        match key.code {
+            KeyCode::Up => self.help.scroll = self.help.scroll.saturating_sub(1),
+            KeyCode::Down => self.help.scroll = self.help.scroll.saturating_add(1),
+            KeyCode::PageUp => self.help.scroll = self.help.scroll.saturating_sub(10),
+            KeyCode::PageDown => self.help.scroll = self.help.scroll.saturating_add(10),
+            KeyCode::Home => self.help.scroll = 0,
+            KeyCode::End => self.help.scroll = u16::MAX,
+            _ => {
+                if handle_text_input(&mut self.help.filter, key) {
+                    self.help.scroll = 0;
+                }
+            }
+        }
+        false
+    }
+
+    fn handle_command_palette_key(
+        &mut self,
+        key: KeyEvent,
+        event_tx: UnboundedSender<AppEvent>,
+    ) -> Result<bool> {
+        if closes_overlay(key) {
+            self.command_palette = CommandPaletteState::default();
+            return Ok(false);
+        }
+
+        match key.code {
+            KeyCode::Up => {
+                self.command_palette.selected = self.command_palette.selected.saturating_sub(1)
+            }
+            KeyCode::Down => {
+                let last = command_palette::filtered_entries(
+                    self.command_palette.filter.trim(),
+                    self.mode,
+                )
+                .len()
+                .saturating_sub(1);
+                self.command_palette.selected = (self.command_palette.selected + 1).min(last);
+            }
+            KeyCode::Enter => {
+                let entries = command_palette::filtered_entries(
+                    self.command_palette.filter.trim(),
+                    self.mode,
+                );
+                let Some(entry) = entries.get(self.command_palette.selected).cloned() else {
+                    return Ok(false);
+                };
+                self.command_palette = CommandPaletteState::default();
+                self.apply_palette_action(entry.action, event_tx)?;
+            }
+            _ => {
+                if handle_text_input(&mut self.command_palette.filter, key) {
+                    self.command_palette.selected = 0;
+                    self.command_palette.scroll = 0;
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn handle_draft_browser_key(&mut self, key: KeyEvent) -> bool {
+        if closes_overlay(key) {
+            self.draft_browser = DraftBrowserState::default();
+            return false;
+        }
+
+        match key.code {
+            KeyCode::Up => {
+                self.draft_browser.selected = self.draft_browser.selected.saturating_sub(1)
+            }
+            KeyCode::Down => {
+                let last = self.draft_browser_items().len().saturating_sub(1);
+                self.draft_browser.selected = (self.draft_browser.selected + 1).min(last);
+            }
+            KeyCode::Enter => self.apply_selected_draft(),
+            _ => {}
+        }
+        false
+    }
+
+    fn handle_session_picker_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if closes_overlay(key) {
+            self.session_picker = SessionPickerState::default();
+            self.status = "Session picker closed".to_string();
+            return Ok(false);
+        }
+
+        match key.code {
+            KeyCode::Up => {
+                self.session_picker.selected = self.session_picker.selected.saturating_sub(1)
+            }
+            KeyCode::Down => {
+                let last = self.session_picker.entries.len().saturating_sub(1);
+                self.session_picker.selected = (self.session_picker.selected + 1).min(last);
+            }
+            KeyCode::Home => self.session_picker.selected = 0,
+            KeyCode::End => {
+                self.session_picker.selected = self.session_picker.entries.len().saturating_sub(1)
+            }
+            KeyCode::Enter => self.apply_selected_session()?,
+            _ => {}
+        }
+
+        Ok(false)
+    }
+
+    fn handle_model_picker_key(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc => self.close_model_picker(),
+            KeyCode::Up => {
+                self.model_picker.selected = self.model_picker.selected.saturating_sub(1)
+            }
+            KeyCode::Down => {
+                let last = self.model_picker.models.len().saturating_sub(1);
+                self.model_picker.selected = (self.model_picker.selected + 1).min(last);
+            }
+            KeyCode::Home => self.model_picker.selected = 0,
+            KeyCode::End => {
+                self.model_picker.selected = self.model_picker.models.len().saturating_sub(1)
+            }
+            KeyCode::PageUp => {
+                self.model_picker.selected = self.model_picker.selected.saturating_sub(5)
+            }
+            KeyCode::PageDown => {
+                let last = self.model_picker.models.len().saturating_sub(1);
+                self.model_picker.selected = (self.model_picker.selected + 5).min(last);
+            }
+            KeyCode::Enter => self.apply_selected_model()?,
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn handle_message_pager_key(&mut self, key: KeyEvent) -> bool {
+        if closes_overlay(key) || matches!(key.code, KeyCode::Char('l')) {
+            self.message_pager = MessagePagerState::default();
+            return false;
+        }
+
+        match key.code {
+            KeyCode::Up => self.message_pager.scroll = self.message_pager.scroll.saturating_sub(1),
+            KeyCode::Down => {
+                self.message_pager.scroll = self.message_pager.scroll.saturating_add(1)
+            }
+            KeyCode::PageUp => {
+                self.message_pager.scroll = self.message_pager.scroll.saturating_sub(10)
+            }
+            KeyCode::PageDown => {
+                self.message_pager.scroll = self.message_pager.scroll.saturating_add(10)
+            }
+            KeyCode::Home => self.message_pager.scroll = 0,
+            KeyCode::End => self.message_pager.scroll = u16::MAX,
+            _ => {}
+        }
+        false
+    }
+
+    fn handle_tab_key(&mut self) -> Result<bool> {
+        if self.slash_menu_visible() {
+            let entries = self.slash_menu_entries();
+            if let Some(entry) = entries.get(self.slash_menu_selected) {
+                self.input.set_text(entry.insertion_text());
+                self.status = format!("Command selected: /{}", entry.command.name);
+                self.slash_menu_selected = 0;
+                return Ok(true);
+            }
+            if let Some(completed) = slash_menu::autocomplete_input(self.input.trim()) {
+                self.input.set_text(completed.clone());
+                self.status = format!("Command completed: {}", completed.trim_end());
+                self.slash_menu_selected = 0;
+                return Ok(true);
+            }
+        }
+
+        if let Some(status) =
+            attachments::try_attach_from_input(&mut self.input, &mut self.attachments)?
+        {
+            self.status = status;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    fn submit(&mut self, event_tx: UnboundedSender<AppEvent>) -> Result<bool> {
+        let prompt = self.input.trim().to_string();
+        if prompt.starts_with('/') {
+            return self.handle_slash_command(&prompt, event_tx);
+        }
+
+        if self.streaming {
+            self.status = "MiMo is already responding".to_string();
+            return Ok(false);
+        }
+
+        if prompt.is_empty() {
+            self.status = "Type a prompt before sending".to_string();
+            return Ok(false);
+        }
+
+        self.send_prompt(prompt, event_tx)?;
+        Ok(false)
+    }
+
+    fn send_prompt(&mut self, prompt: String, event_tx: UnboundedSender<AppEvent>) -> Result<()> {
+        let client = match MimoClient::new(&self.config) {
+            Ok(client) => client,
+            Err(error) => {
+                self.status = error.to_string();
+                return Ok(());
+            }
+        };
+
+        let request_messages = self.request_messages()?;
+        remember_draft(&mut self.draft_history, &prompt);
+        self.last_prompt = Some(prompt.clone());
+        self.input.clear();
+        self.messages.push(ChatMessage::user(prompt));
+        let assistant_index = self.messages.len();
+        self.messages.push(ChatMessage::assistant(String::new()));
+        self.assistant_index = Some(assistant_index);
+        self.streaming = true;
+        self.status = "Streaming from MiMo...".to_string();
+        self.scroll_to_bottom();
+        self.attachments.clear();
+
+        let stream_task = tokio::spawn(async move {
+            let result = client
+                .stream_chat(&request_messages, |delta| {
+                    event_tx
+                        .send(AppEvent::Delta(delta.to_string()))
+                        .context("TUI closed")?;
+                    Ok(())
+                })
+                .await
+                .map_err(|error| error.to_string());
+
+            let _ = event_tx.send(AppEvent::Finished(result));
+        });
+        self.stream_task = Some(stream_task);
+
+        Ok(())
+    }
+
+    fn handle_slash_command(
+        &mut self,
+        command_line: &str,
+        event_tx: UnboundedSender<AppEvent>,
+    ) -> Result<bool> {
+        self.input.clear();
+        match commands::parse_slash_command(command_line) {
+            Ok(command) => self.execute_command(command, event_tx),
+            Err(CommandParseError::NotACommand) => Ok(false),
+            Err(CommandParseError::UnknownCommand(name)) => {
+                self.status =
+                    format!("Unknown command /{name}. Type /help for available commands.");
+                Ok(false)
+            }
+            Err(CommandParseError::Usage(usage)) => {
+                self.status = format!("Usage: {usage}");
+                Ok(false)
+            }
+        }
+    }
+
+    fn execute_command(
+        &mut self,
+        command: SlashCommand,
+        event_tx: UnboundedSender<AppEvent>,
+    ) -> Result<bool> {
+        match command {
+            SlashCommand::Help { topic } => {
+                if topic.is_some() {
+                    self.push_system_message(commands::command_help(topic.as_deref()));
+                }
+                self.open_help(topic.as_deref());
+                self.status = "Help opened".to_string();
+                Ok(false)
+            }
+            SlashCommand::Clear => {
+                self.clear_conversation();
+                Ok(false)
+            }
+            SlashCommand::Exit => Ok(true),
+            SlashCommand::Model { model } => {
+                self.handle_model_command(model)?;
+                Ok(false)
+            }
+            SlashCommand::Models => {
+                self.open_model_picker(event_tx);
+                Ok(false)
+            }
+            SlashCommand::Save { path } => {
+                let saved_path = session_store::save_session(
+                    &self.config,
+                    &self.config.model,
+                    self.mode,
+                    &self.plan_items,
+                    &self.attachments,
+                    &self.messages,
+                    path.as_deref(),
+                )?;
+                self.status = format!("Saved session to {}", saved_path.display());
+                Ok(false)
+            }
+            SlashCommand::Load { path } => {
+                if self.streaming {
+                    self.status = "Cannot load a session while MiMo is responding".to_string();
+                    return Ok(false);
+                }
+                let (session, loaded_path) =
+                    session_store::load_session(&self.config, path.as_deref())?;
+                self.apply_loaded_session(session, loaded_path.display().to_string());
+                Ok(false)
+            }
+            SlashCommand::Sessions => {
+                self.open_session_picker()?;
+                Ok(false)
+            }
+            SlashCommand::Export { path } => {
+                let export_path = session_store::export_markdown(
+                    &self.config,
+                    &self.config.model,
+                    self.mode,
+                    &self.plan_items,
+                    &self.attachments,
+                    &self.messages,
+                    path.as_deref(),
+                )?;
+                self.status = format!("Exported conversation to {}", export_path.display());
+                Ok(false)
+            }
+            SlashCommand::Config(config_command) => {
+                self.handle_config_command(config_command)?;
+                Ok(false)
+            }
+            SlashCommand::Status => {
+                self.push_system_message(self.status_summary()?);
+                self.status = "Status summary shown".to_string();
+                Ok(false)
+            }
+            SlashCommand::Retry => {
+                if self.streaming {
+                    self.status = "Cannot retry while MiMo is responding".to_string();
+                    return Ok(false);
+                }
+                let Some(prompt) = self.last_prompt.clone() else {
+                    self.status = "No prompt available to retry".to_string();
+                    return Ok(false);
+                };
+                self.send_prompt(prompt, event_tx)?;
+                Ok(false)
+            }
+            SlashCommand::Context => {
+                let summary = project_context::summarize_current_directory(2, 60)?;
+                self.messages.push(ChatMessage::system(summary));
+                self.scroll_to_bottom();
+                self.status = "Project context added to the conversation".to_string();
+                Ok(false)
+            }
+            SlashCommand::Mode { mode } => {
+                if let Some(mode) = mode {
+                    self.mode = mode.into();
+                    self.status = format!("Mode switched to {}", self.mode);
+                } else {
+                    self.status = format!("Current mode: {}", self.mode);
+                }
+                Ok(false)
+            }
+            SlashCommand::Plan(command) => {
+                self.handle_plan_command(command);
+                Ok(false)
+            }
+        }
+    }
+
+    fn handle_model_command(&mut self, model: Option<String>) -> Result<()> {
+        let Some(model) = model else {
+            self.status = format!("Current model: {}", self.config.model);
+            return Ok(());
+        };
+        let Some(model) = normalize_model_name(&model) else {
+            self.status =
+                "Invalid MiMo model id. Expected a non-empty id starting with mimo-".to_string();
+            return Ok(());
+        };
+        self.config.set_model(model.clone())?;
+        self.status = format!("Model switched to {model}");
+        Ok(())
+    }
+
+    fn handle_config_command(&mut self, command: ConfigCommand) -> Result<()> {
+        match command {
+            ConfigCommand::Show => {
+                self.push_system_message(self.config_summary());
+                self.status = "Configuration shown".to_string();
+            }
+            ConfigCommand::SetApiKey(api_key) => {
+                self.config.set_api_key(Some(api_key))?;
+                self.status = "API key saved to config.toml".to_string();
+            }
+            ConfigCommand::ClearApiKey => {
+                self.config.set_api_key(None)?;
+                self.status = "API key removed from config.toml".to_string();
+            }
+            ConfigCommand::SetBaseUrl(base_url) => {
+                let Some(base_url) = normalize_base_url(&base_url) else {
+                    self.status = "Base URL must be a valid http(s) URL".to_string();
+                    return Ok(());
+                };
+                self.config.set_base_url(base_url.clone())?;
+                self.status = format!("Base URL switched to {base_url}");
+            }
+            ConfigCommand::SetModel(model) => {
+                let Some(model) = normalize_model_name(&model) else {
+                    self.status =
+                        "Invalid MiMo model id. Expected a non-empty id starting with mimo-"
+                            .to_string();
+                    return Ok(());
+                };
+                self.config.set_model(model.clone())?;
+                self.status = format!("Model saved as {model}");
+            }
+            ConfigCommand::SetTemperature(value) => match value.parse::<f32>() {
+                Ok(temperature) => {
+                    self.config.set_temperature(temperature)?;
+                    self.status = format!("Temperature saved as {temperature}");
+                }
+                Err(_) => self.status = "Temperature must be a floating point number".to_string(),
+            },
+        }
+        Ok(())
+    }
+
+    fn handle_plan_command(&mut self, command: PlanCommand) {
+        match command {
+            PlanCommand::Show => {
+                self.push_system_message(self.plan_summary());
+                self.status = "Plan checklist shown".to_string();
+            }
+            PlanCommand::Add(text) => {
+                self.plan_items.push(PlanItem::new(text.clone()));
+                self.status = format!("Added plan item: {text}");
+            }
+            PlanCommand::Done(index) => {
+                if let Some(item) = self.plan_items.get_mut(index.saturating_sub(1)) {
+                    item.done = true;
+                    self.status = format!("Completed plan item {index}");
+                } else {
+                    self.status = format!("Unknown plan item {index}");
+                }
+            }
+            PlanCommand::Undo(index) => {
+                if let Some(item) = self.plan_items.get_mut(index.saturating_sub(1)) {
+                    item.done = false;
+                    self.status = format!("Reopened plan item {index}");
+                } else {
+                    self.status = format!("Unknown plan item {index}");
+                }
+            }
+            PlanCommand::Remove(index) => {
+                let index = index.saturating_sub(1);
+                if index < self.plan_items.len() {
+                    self.plan_items.remove(index);
+                    self.status = format!("Removed plan item {}", index + 1);
+                } else {
+                    self.status = format!("Unknown plan item {}", index + 1);
+                }
+            }
+            PlanCommand::Clear => {
+                self.plan_items.clear();
+                self.status = "Plan checklist cleared".to_string();
+            }
+        }
+    }
+
+    fn clear_conversation(&mut self) {
+        if self.streaming {
+            self.status = "Cannot clear while MiMo is responding".to_string();
+            return;
+        }
+
+        self.messages.clear();
+        self.assistant_index = None;
+        self.last_prompt = None;
+        self.scroll = 0;
+        self.status = "Conversation cleared".to_string();
+    }
+
+    fn clear_current_draft(&mut self) {
+        let draft = self.input.trim().to_string();
+        if !draft.is_empty() {
+            remember_draft(&mut self.draft_history, &draft);
+        }
+        self.input.clear();
+        self.status = "Draft cleared".to_string();
+    }
+
+    fn stash_current_draft(&mut self) {
+        let draft = self.input.trim().to_string();
+        if draft.is_empty() {
+            self.status = "Nothing to stash".to_string();
+            return;
+        }
+        remember_draft(&mut self.draft_stash, &draft);
+        self.input.clear();
+        self.status = "Draft stashed".to_string();
+    }
+
+    fn push_system_message(&mut self, content: String) {
+        self.messages.push(ChatMessage::system(content));
+        self.scroll_to_bottom();
+    }
+
+    fn request_messages(&self) -> Result<Vec<ChatMessage>> {
+        let mut messages = Vec::with_capacity(self.messages.len() + 4);
+        messages.push(ChatMessage::system(self.config.system_prompt.clone()));
+        if self.mode == AppMode::Plan {
+            messages.push(ChatMessage::system(
+                "You are in planning mode. Analyze the project, propose concrete implementation steps, and do not claim that files were modified or commands were executed unless the user explicitly switches back to chat mode.".to_string(),
+            ));
+        }
+        if !self.plan_items.is_empty() {
+            messages.push(ChatMessage::system(self.plan_summary()));
+        }
+        messages.extend(attachments::attachment_messages(&self.attachments)?);
+        messages.extend(self.messages.clone());
+        Ok(messages)
+    }
+
+    fn cancel_active_stream(&mut self) {
+        if let Some(stream_task) = self.stream_task.take() {
+            stream_task.abort();
+        }
+        self.streaming = false;
+        if let Some(index) = self.assistant_index
+            && let Some(message) = self.messages.get_mut(index)
+            && message.content.trim().is_empty()
+        {
+            message.content = "Request cancelled.".to_string();
+        }
+        self.assistant_index = None;
+        self.status = "Generation cancelled".to_string();
+        self.scroll_to_bottom();
+    }
+
+    fn handle_escape_key(&mut self) {
+        if self.streaming {
+            self.cancel_active_stream();
+        }
+    }
+
+    fn open_help(&mut self, topic: Option<&str>) {
+        self.help.open = true;
+        self.help.scroll = 0;
+        self.help.filter.set_text(topic.unwrap_or_default());
+    }
+
+    fn open_model_picker(&mut self, event_tx: UnboundedSender<AppEvent>) {
+        self.refresh_model_picker_catalog();
+        self.model_picker.scroll = 0;
+        self.model_picker.open = true;
+        self.refresh_models_from_api(event_tx);
+    }
+
+    fn close_model_picker(&mut self) {
+        self.model_picker = ModelPickerState::default();
+        self.status = "Model picker closed".to_string();
+    }
+
+    fn open_session_picker(&mut self) -> Result<()> {
+        let entries = session_store::list_sessions(&self.config)?;
+        if entries.is_empty() {
+            self.status = "No saved sessions yet".to_string();
+            return Ok(());
+        }
+        self.session_picker.open = true;
+        self.session_picker.entries = entries;
+        self.session_picker.selected = 0;
+        self.session_picker.scroll = 0;
+        self.status = "Session picker opened".to_string();
+        Ok(())
+    }
+
+    fn open_command_palette(&mut self) {
+        self.command_palette = CommandPaletteState::default();
+        self.command_palette.open = true;
+        self.status = "Command palette opened".to_string();
+    }
+
+    fn open_draft_browser(&mut self, kind: DraftBrowserKind) {
+        let items = match kind {
+            DraftBrowserKind::History => &self.draft_history,
+            DraftBrowserKind::Stash => &self.draft_stash,
+        };
+        if items.is_empty() {
+            self.status = match kind {
+                DraftBrowserKind::History => "No cleared drafts yet".to_string(),
+                DraftBrowserKind::Stash => "No stashed drafts yet".to_string(),
+            };
+            return;
+        }
+        self.draft_browser.open = true;
+        self.draft_browser.kind = kind;
+        self.draft_browser.selected = 0;
+        self.draft_browser.scroll = 0;
+        self.status = match kind {
+            DraftBrowserKind::History => "Draft history opened".to_string(),
+            DraftBrowserKind::Stash => "Draft stash opened".to_string(),
+        };
+    }
+
+    fn open_last_message_pager(&mut self) {
+        let Some(message) = self.messages.last() else {
+            self.status = "No message to open in the pager".to_string();
+            return;
+        };
+        let role = match message.role {
+            Role::System => "System",
+            Role::User => "You",
+            Role::Assistant => "MiMo",
+        };
+        self.message_pager.open = true;
+        self.message_pager.title = format!("Last message — {role}");
+        self.message_pager.lines = markdown::render_markdown_lines(&message.content);
+        self.message_pager.scroll = 0;
+        self.status = "Opened last message pager".to_string();
+    }
+
+    fn apply_selected_model(&mut self) -> Result<()> {
+        let Some(model) = self
+            .model_picker
+            .models
+            .get(self.model_picker.selected)
+            .cloned()
+        else {
+            self.close_model_picker();
+            return Ok(());
+        };
+        self.config.set_model(model.clone())?;
+        self.model_picker = ModelPickerState::default();
+        self.status = format!("Model switched to {model}");
+        Ok(())
+    }
+
+    fn apply_selected_session(&mut self) -> Result<()> {
+        let Some(entry) = self
+            .session_picker
+            .entries
+            .get(self.session_picker.selected)
+            .cloned()
+        else {
+            self.session_picker = SessionPickerState::default();
+            return Ok(());
+        };
+        let (session, _) =
+            session_store::load_session(&self.config, Some(&entry.path.display().to_string()))?;
+        self.apply_loaded_session(session, entry.path.display().to_string());
+        Ok(())
+    }
+
+    fn apply_loaded_session(&mut self, session: session_store::SavedSession, source: String) {
+        self.messages = session.messages;
+        self.mode = session.mode;
+        self.config.model = session.model;
+        self.plan_items = session.plan_items;
+        self.attachments = session.attachments;
+        self.assistant_index = None;
+        self.scroll_to_bottom();
+        self.last_prompt = self.last_user_prompt();
+        self.session_picker = SessionPickerState::default();
+        self.status = format!("Loaded session from {source}");
+    }
+
+    fn apply_selected_draft(&mut self) {
+        let Some(draft) = self
+            .draft_browser_items()
+            .get(self.draft_browser.selected)
+            .cloned()
+        else {
+            self.draft_browser = DraftBrowserState::default();
+            return;
+        };
+        self.input.set_text(draft);
+        self.draft_browser = DraftBrowserState::default();
+        self.status = "Draft restored".to_string();
+    }
+
+    fn apply_palette_action(
+        &mut self,
+        action: command_palette::PaletteAction,
+        event_tx: UnboundedSender<AppEvent>,
+    ) -> Result<()> {
+        match action {
+            command_palette::PaletteAction::InsertCommand(command) => {
+                self.input.set_text(command.clone());
+                self.status = format!("Inserted {command}");
+            }
+            command_palette::PaletteAction::OpenHelp => self.open_help(None),
+            command_palette::PaletteAction::OpenModels => self.open_model_picker(event_tx),
+            command_palette::PaletteAction::OpenSessions => self.open_session_picker()?,
+            command_palette::PaletteAction::ShowStatus => {
+                self.push_system_message(self.status_summary()?);
+                self.status = "Status summary shown".to_string();
+            }
+            command_palette::PaletteAction::ShowLastMessage => self.open_last_message_pager(),
+            command_palette::PaletteAction::BrowseDraftHistory => {
+                self.open_draft_browser(DraftBrowserKind::History)
+            }
+            command_palette::PaletteAction::BrowseDraftStash => {
+                self.open_draft_browser(DraftBrowserKind::Stash)
+            }
+            command_palette::PaletteAction::SwitchMode(mode) => {
+                self.mode = mode;
+                self.status = format!("Mode switched to {}", self.mode);
+            }
+        }
+        Ok(())
+    }
+
+    fn refresh_model_picker_catalog(&mut self) {
+        let selected_model = self
+            .model_picker
+            .models
+            .get(self.model_picker.selected)
+            .cloned();
+        self.model_picker.models = model_catalog(&self.config.model, &self.discovered_models);
+        self.model_picker.selected = selected_model
+            .as_deref()
+            .and_then(|model| {
+                self.model_picker
+                    .models
+                    .iter()
+                    .position(|candidate| candidate == model)
+            })
+            .or_else(|| {
+                self.model_picker
+                    .models
+                    .iter()
+                    .position(|model| model == &self.config.model)
+            })
+            .unwrap_or_default();
+    }
+
+    fn refresh_models_from_api(&mut self, event_tx: UnboundedSender<AppEvent>) {
+        if let Some(task) = self.model_load_task.take() {
+            task.abort();
+        }
+
+        let client = match MimoClient::new(&self.config) {
+            Ok(client) => client,
+            Err(_) => {
+                self.model_picker.loading = false;
+                self.status =
+                    "Model picker opened with local suggestions (API key missing)".to_string();
+                return;
+            }
+        };
+
+        self.model_picker.loading = true;
+        self.status = "Loading latest models from MiMo API...".to_string();
+        let task = tokio::spawn(async move {
+            let result = client
+                .list_models()
+                .await
+                .map_err(|error| error.to_string());
+            let _ = event_tx.send(AppEvent::ModelsLoaded(result));
+        });
+        self.model_load_task = Some(task);
+    }
+
+    fn input_height(&self, total_height: u16) -> u16 {
+        let draft_height = self.input.line_count().clamp(1, 6) as u16 + 2;
+        let attachments_height = if self.attachments.is_empty() { 0 } else { 3 };
+        (draft_height + attachments_height)
+            .min(total_height.saturating_sub(4))
+            .max(3)
+    }
+
+    fn message_lines(&self) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        for message in &self.messages {
+            let (label, color) = match message.role {
+                Role::System => ("System", Color::DarkGray),
+                Role::User => ("You", Color::Green),
+                Role::Assistant => ("MiMo", Color::Cyan),
+            };
+
+            lines.push(Line::styled(
+                format!("{label}:"),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ));
+
+            if message.content.is_empty() {
+                lines.push(Line::styled("  ...", Style::default().fg(Color::DarkGray)));
+            } else {
+                lines.extend(markdown::render_markdown_lines(&message.content));
+            }
+            lines.push(Line::raw(""));
+        }
+        lines
+    }
+
+    fn total_conversation_lines(&self) -> usize {
+        if self.messages.is_empty() {
+            3
+        } else {
+            self.message_lines().len()
+        }
+    }
+
+    fn max_scroll(&self) -> u16 {
+        self.total_conversation_lines()
+            .saturating_sub(self.conversation_view_height as usize)
+            .try_into()
+            .unwrap_or(u16::MAX)
+    }
+
+    fn clamp_scroll(&mut self) {
+        self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    fn scroll_by(&mut self, amount: i32) {
+        let max_scroll = self.max_scroll() as i32;
+        self.scroll = (self.scroll as i32 + amount).clamp(0, max_scroll) as u16;
+    }
+
+    fn scroll_page_up(&mut self) {
+        self.scroll_by(-(self.conversation_view_height as i32));
+    }
+
+    fn scroll_page_down(&mut self) {
+        self.scroll_by(self.conversation_view_height as i32);
+    }
+
+    fn scroll_to_bottom(&mut self) {
+        self.scroll = self.max_scroll();
+    }
+
+    fn config_summary(&self) -> String {
+        format!(
+            "Configuration\n\nConfig file : {}\nBase URL    : {}\nModel       : {}\nTemperature : {}\nAPI key     : {}\nMode        : {}\nAttachments : {}\nPlan items  : {}",
+            self.config.config_path.display(),
+            self.config.base_url,
+            self.config.model,
+            self.config.temperature,
+            self.config.masked_api_key(),
+            self.mode,
+            self.attachments.len(),
+            self.plan_items.len(),
+        )
+    }
+
+    fn status_summary(&self) -> Result<String> {
+        let cwd = env::current_dir()?;
+        let session_count = session_store::list_sessions(&self.config)?.len();
+        Ok(format!(
+            "Status\n\nWorkspace    : {}\nMode         : {}\nModel        : {}\nStreaming    : {}\nMessages     : {}\nSaved files  : {}\nAPI key      : {}\nAttachments  : {}\nDraft stash  : {}\nPlan items   : {}\nTools        : {}",
+            cwd.display(),
+            self.mode,
+            self.config.model,
+            if self.streaming { "yes" } else { "no" },
+            self.messages.len(),
+            session_count,
+            self.config.masked_api_key(),
+            self.attachments.len(),
+            self.draft_stash.len(),
+            self.plan_items.len(),
+            self.tool_runtime.summary(),
+        ))
+    }
+
+    fn plan_summary(&self) -> String {
+        if self.plan_items.is_empty() {
+            return "Plan checklist\n\nNo plan items yet.".to_string();
+        }
+
+        let mut output = String::from("Plan checklist\n\n");
+        for (index, item) in self.plan_items.iter().enumerate() {
+            let marker = if item.done { "x" } else { " " };
+            output.push_str(&format!("{}. [{}] {}\n", index + 1, marker, item.text));
+        }
+        output
+    }
+
+    fn draft_browser_items(&self) -> &Vec<String> {
+        match self.draft_browser.kind {
+            DraftBrowserKind::History => &self.draft_history,
+            DraftBrowserKind::Stash => &self.draft_stash,
+        }
+    }
+
+    fn draft_browser_title(&self) -> &'static str {
+        match self.draft_browser.kind {
+            DraftBrowserKind::History => "Draft history",
+            DraftBrowserKind::Stash => "Draft stash",
+        }
+    }
+
+    fn last_user_prompt(&self) -> Option<String> {
+        self.messages
+            .iter()
+            .rev()
+            .find_map(|message| matches!(message.role, Role::User).then(|| message.content.clone()))
+    }
+
+    fn slash_menu_entries(&self) -> Vec<slash_menu::SlashMenuEntry> {
+        slash_menu::visible_entries(self.input.trim())
+    }
+
+    fn slash_menu_visible(&self) -> bool {
+        slash_menu::is_active(self.input.trim()) && !self.slash_menu_entries().is_empty()
+    }
+
+    fn clamp_slash_menu_selection(&mut self) {
+        let last = self.slash_menu_entries().len().saturating_sub(1);
+        self.slash_menu_selected = self.slash_menu_selected.min(last);
+    }
+}
+
+fn centered_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - height_percent) / 2),
+            Constraint::Percentage(height_percent),
+            Constraint::Percentage((100 - height_percent) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - width_percent) / 2),
+            Constraint::Percentage(width_percent),
+            Constraint::Percentage((100 - width_percent) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
+fn opens_help(key: KeyEvent, input_is_empty: bool) -> bool {
+    matches!(key.code, KeyCode::F(1)) || (input_is_empty && matches!(key.code, KeyCode::Char('?')))
+}
+
+fn opens_palette(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('k' | 'K') if key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn opens_session_picker(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('r' | 'R') if key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn opens_draft_history(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('r' | 'R') if key.modifiers.contains(KeyModifiers::ALT))
+}
+
+fn stashes_draft(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('s' | 'S') if key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn opens_last_message_pager(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('l')) && key.modifiers == KeyModifiers::NONE
+}
+
+fn inserts_newline(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::SHIFT)
+        || matches!(key.code, KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT))
+}
+
+fn closes_overlay(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Esc | KeyCode::F(1))
+        || matches!(key.code, KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn is_quit_key(key: KeyEvent, input_is_empty: bool) -> bool {
+    matches!(key.code, KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL))
+        || (input_is_empty
+            && matches!(key.code, KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL)))
+}
+
+fn model_catalog(current_model: &str, discovered_models: &[String]) -> Vec<String> {
+    let base = if discovered_models.is_empty() {
+        known_mimo_models(current_model)
+    } else {
+        discovered_models.to_vec()
+    };
+
+    let mut models = Vec::new();
+    for model in base.into_iter().chain(known_mimo_models(current_model)) {
+        let model = model.trim();
+        if !model.is_empty() && !models.iter().any(|existing| existing == model) {
+            models.push(model.to_string());
+        }
+    }
+
+    models
+}
+
+fn normalize_remote_models(models: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for model in models {
+        let model = model.trim();
+        if !model.is_empty() && !normalized.iter().any(|existing| existing == model) {
+            normalized.push(model.to_string());
+        }
+    }
+    normalized
+}
+
+fn clamp_scroll(line_count: usize, height: u16, scroll: u16) -> u16 {
+    line_count
+        .saturating_sub(height.saturating_sub(2).max(1) as usize)
+        .try_into()
+        .unwrap_or(u16::MAX)
+        .min(scroll)
+}
+
+fn adjust_selection_scroll(selected: usize, scroll: u16, visible_lines: usize) -> u16 {
+    let mut scroll = scroll;
+    if selected < scroll as usize {
+        scroll = selected as u16;
+    } else if selected >= scroll as usize + visible_lines {
+        scroll = (selected + 1 - visible_lines) as u16;
+    }
+    scroll
+}
+
+fn set_filter_cursor(frame: &mut Frame, area: Rect, input: &InputBuffer) {
+    let visible_lines = area.height.saturating_sub(2).max(1) as usize;
+    let (cursor_line, cursor_col) = input.cursor_line_col();
+    let cursor_scroll = cursor_line.saturating_sub(visible_lines.saturating_sub(1)) as u16;
+    let visible_line = cursor_line.saturating_sub(cursor_scroll as usize);
+    let cursor_x = area.x + 1 + cursor_col.min(area.width.saturating_sub(2) as usize) as u16;
+    let cursor_y = area.y + 1 + visible_line.min(visible_lines.saturating_sub(1)) as u16;
+    frame.set_cursor_position((cursor_x, cursor_y));
+}
+
+fn handle_text_input(input: &mut InputBuffer, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Backspace => {
+            input.backspace();
+            true
+        }
+        KeyCode::Delete => {
+            input.delete();
+            true
+        }
+        KeyCode::Left => {
+            input.move_left();
+            false
+        }
+        KeyCode::Right => {
+            input.move_right();
+            false
+        }
+        KeyCode::Char('a' | 'A') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            input.move_to_line_start();
+            false
+        }
+        KeyCode::Char('e' | 'E') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            input.move_to_line_end();
+            false
+        }
+        KeyCode::Char('u' | 'U') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            input.clear();
+            true
+        }
+        KeyCode::Char(c)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            input.insert_char(c);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn remember_draft(bucket: &mut Vec<String>, draft: &str) {
+    if draft.is_empty() {
+        return;
+    }
+    if let Some(index) = bucket.iter().position(|entry| entry == draft) {
+        bucket.remove(index);
+    }
+    bucket.insert(0, draft.to_string());
+    bucket.truncate(20);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use tokio::sync::mpsc::unbounded_channel;
+
+    use super::*;
+
+    fn test_app() -> App {
+        App::new(AppConfig {
+            api_key: None,
+            base_url: "https://example.test/v1".to_string(),
+            model: "mimo-v2-flash".to_string(),
+            temperature: 0.2,
+            system_prompt: "test".to_string(),
+            config_path: PathBuf::from("config.toml"),
+            base_url_source: crate::config::ConfigValueSource::Default,
+            model_source: crate::config::ConfigValueSource::Default,
+            temperature_source: crate::config::ConfigValueSource::Default,
+            system_prompt_source: crate::config::ConfigValueSource::Default,
+            api_key_source: crate::config::ConfigValueSource::Default,
+        })
+    }
+
+    #[test]
+    fn help_overlay_opens_from_question_mark_when_input_is_empty() {
+        let mut app = test_app();
+        assert!(opens_help(
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+            true
+        ));
+        app.input.insert_str("x");
+        assert!(!opens_help(
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+            false
+        ));
+    }
+
+    #[test]
+    fn clears_conversation_state() {
+        let mut app = test_app();
+        app.messages.push(ChatMessage::user("hello"));
+        app.messages.push(ChatMessage::assistant("world"));
+        app.assistant_index = Some(1);
+        app.scroll = 3;
+
+        app.clear_conversation();
+        assert!(app.messages.is_empty());
+        assert_eq!(app.assistant_index, None);
+        assert_eq!(app.scroll, 0);
+        assert_eq!(app.last_prompt, None);
+    }
+
+    #[test]
+    fn status_summary_mentions_mode() {
+        let app = test_app();
+        let summary = app.status_summary().expect("status summary");
+        assert!(summary.contains("Mode"));
+        assert!(summary.contains("chat"));
+    }
+
+    #[test]
+    fn slash_commands_clear_the_draft() {
+        let mut app = test_app();
+        app.input.insert_str("/status");
+
+        let (event_tx, _event_rx) = unbounded_channel();
+        app.handle_slash_command("/status", event_tx)
+            .expect("slash command should execute");
+
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn models_command_opens_picker() {
+        let mut app = test_app();
+        let (event_tx, _event_rx) = unbounded_channel();
+
+        app.handle_slash_command("/models", event_tx)
+            .expect("models command should execute");
+
+        assert!(app.model_picker.open);
+        assert!(!app.model_picker.models.is_empty());
+        assert!(!app.model_picker.loading);
+    }
+
+    #[test]
+    fn model_picker_applies_selected_model() {
+        let mut app = test_app();
+        let (event_tx, _event_rx) = unbounded_channel();
+        app.open_model_picker(event_tx);
+        app.model_picker.selected = app
+            .model_picker
+            .models
+            .iter()
+            .position(|model| model == "mimo-v2.5")
+            .expect("model present");
+
+        app.apply_selected_model().expect("model should apply");
+
+        assert_eq!(app.config.model, "mimo-v2.5");
+        assert!(!app.model_picker.open);
+    }
+
+    #[test]
+    fn model_picker_refreshes_when_remote_catalog_arrives() {
+        let mut app = test_app();
+        let (event_tx, _event_rx) = unbounded_channel();
+        app.open_model_picker(event_tx);
+
+        app.handle_app_event(AppEvent::ModelsLoaded(Ok(vec![
+            "mimo-v2.5-pro".to_string(),
+            "mimo-v3-coder".to_string(),
+        ])));
+
+        assert!(
+            app.model_picker
+                .models
+                .iter()
+                .any(|model| model == "mimo-v3-coder")
+        );
+        assert!(
+            app.discovered_models
+                .iter()
+                .any(|model| model == "mimo-v3-coder")
+        );
+        assert_eq!(app.status, "Loaded 2 models from MiMo API");
+    }
+
+    #[test]
+    fn model_picker_keeps_local_fallback_when_refresh_fails() {
+        let mut app = test_app();
+        let (event_tx, _event_rx) = unbounded_channel();
+        app.open_model_picker(event_tx);
+        let fallback = app.model_picker.models.clone();
+
+        app.handle_app_event(AppEvent::ModelsLoaded(Err("boom".to_string())));
+
+        assert_eq!(app.model_picker.models, fallback);
+        assert!(app.status.contains("using local suggestions"));
+    }
+
+    #[test]
+    fn escape_is_not_a_quit_key() {
+        assert!(!is_quit_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            true
+        ));
+        assert!(is_quit_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            false
+        ));
+    }
+
+    #[test]
+    fn escape_cancels_active_stream() {
+        let mut app = test_app();
+        app.streaming = true;
+        app.messages.push(ChatMessage::assistant(String::new()));
+        app.assistant_index = Some(0);
+
+        app.handle_escape_key();
+
+        assert!(!app.streaming);
+        assert_eq!(app.assistant_index, None);
+        assert_eq!(app.status, "Generation cancelled");
+        assert_eq!(app.messages[0].content, "Request cancelled.");
+    }
+
+    #[test]
+    fn plan_commands_update_checklist() {
+        let mut app = test_app();
+        app.handle_plan_command(PlanCommand::Add("Ship command palette".to_string()));
+        app.handle_plan_command(PlanCommand::Done(1));
+        assert_eq!(app.plan_items.len(), 1);
+        assert!(app.plan_items[0].done);
+    }
+}

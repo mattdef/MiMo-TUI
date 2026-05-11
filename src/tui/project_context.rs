@@ -4,9 +4,13 @@ use anyhow::Result;
 
 pub fn summarize_current_directory(max_depth: usize, max_entries: usize) -> Result<String> {
     let cwd = env::current_dir()?;
-    let mut lines = vec![format!("Workspace: {}", cwd.display())];
+    summarize_path(&cwd, max_depth, max_entries)
+}
+
+pub fn summarize_path(path: &Path, max_depth: usize, max_entries: usize) -> Result<String> {
+    let mut lines = vec![format!("Workspace: {}", path.display())];
     let mut entries_left = max_entries;
-    collect_entries(&cwd, 0, max_depth, &mut entries_left, &mut lines)?;
+    collect_entries(path, 0, max_depth, &mut entries_left, &mut lines)?;
     if entries_left == 0 {
         lines.push("... output truncated ...".to_string());
     }

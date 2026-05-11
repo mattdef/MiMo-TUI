@@ -9,13 +9,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::{client::ChatMessage, config::AppConfig};
 
-use super::AppMode;
+use super::state::{AppMode, FileAttachment, PlanItem};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavedSession {
     pub saved_at_epoch: u64,
+    #[serde(default)]
+    pub title: String,
     pub model: String,
     pub mode: AppMode,
+    #[serde(default)]
+    pub plan_items: Vec<PlanItem>,
+    #[serde(default)]
+    pub attachments: Vec<FileAttachment>,
     pub messages: Vec<ChatMessage>,
 }
 
@@ -23,12 +29,19 @@ pub struct SavedSession {
 pub struct SessionEntry {
     pub path: PathBuf,
     pub modified_epoch: u64,
+    pub saved_at_epoch: u64,
+    pub title: String,
+    pub model: String,
+    pub mode: AppMode,
+    pub message_count: usize,
 }
 
 pub fn save_session(
     config: &AppConfig,
     model: &str,
     mode: AppMode,
+    plan_items: &[PlanItem],
+    attachments: &[FileAttachment],
     messages: &[ChatMessage],
     path: Option<&str>,
 ) -> Result<PathBuf> {
@@ -39,8 +52,11 @@ pub fn save_session(
     ensure_parent_dir(&path)?;
     let session = SavedSession {
         saved_at_epoch: unix_timestamp(),
+        title: derive_title(messages),
         model: model.to_string(),
         mode,
+        plan_items: plan_items.to_vec(),
+        attachments: attachments.to_vec(),
         messages: messages.to_vec(),
     };
     let contents = serde_json::to_string_pretty(&session)?;
@@ -64,6 +80,8 @@ pub fn export_markdown(
     config: &AppConfig,
     model: &str,
     mode: AppMode,
+    plan_items: &[PlanItem],
+    attachments: &[FileAttachment],
     messages: &[ChatMessage],
     path: Option<&str>,
 ) -> Result<PathBuf> {
@@ -72,7 +90,21 @@ pub fn export_markdown(
         None => default_session_path(config, "conversation", "md"),
     };
     ensure_parent_dir(&path)?;
-    let mut output = format!("# MiMo TUI conversation\n\n- Model: {model}\n- Mode: {mode}\n\n");
+    let mut output = format!("# MiMo TUI conversation\n\n- Model: {model}\n- Mode: {mode}\n");
+    if !attachments.is_empty() {
+        output.push_str("- Attachments:\n");
+        for attachment in attachments {
+            output.push_str(&format!("  - {}\n", attachment.path));
+        }
+    }
+    if !plan_items.is_empty() {
+        output.push_str("- Plan checklist:\n");
+        for item in plan_items {
+            let marker = if item.done { "x" } else { " " };
+            output.push_str(&format!("  - [{}] {}\n", marker, item.text));
+        }
+    }
+    output.push('\n');
     for message in messages {
         let role = match message.role {
             crate::client::Role::System => "System",
@@ -94,6 +126,7 @@ pub fn list_sessions(config: &AppConfig) -> Result<Vec<SessionEntry>> {
         .filter_map(Result::ok)
         .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
         .filter_map(|entry| {
+            let path = entry.path();
             let modified = entry
                 .metadata()
                 .ok()?
@@ -102,9 +135,20 @@ pub fn list_sessions(config: &AppConfig) -> Result<Vec<SessionEntry>> {
                 .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
                 .map(|duration| duration.as_secs())
                 .unwrap_or_default();
+            let contents = fs::read_to_string(&path).ok()?;
+            let session = serde_json::from_str::<SavedSession>(&contents).ok()?;
             Some(SessionEntry {
-                path: entry.path(),
+                path,
                 modified_epoch: modified,
+                saved_at_epoch: session.saved_at_epoch,
+                title: if session.title.trim().is_empty() {
+                    derive_title(&session.messages)
+                } else {
+                    session.title
+                },
+                model: session.model,
+                mode: session.mode,
+                message_count: session.messages.len(),
             })
         })
         .collect::<Vec<_>>();
@@ -153,4 +197,23 @@ fn unix_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn derive_title(messages: &[ChatMessage]) -> String {
+    let title = messages
+        .iter()
+        .find_map(|message| match message.role {
+            crate::client::Role::User => {
+                Some(message.content.lines().next().unwrap_or_default().trim())
+            }
+            _ => None,
+        })
+        .filter(|title| !title.is_empty())
+        .unwrap_or("Untitled session");
+
+    let mut title = title.chars().take(60).collect::<String>();
+    if title.is_empty() {
+        title = "Untitled session".to_string();
+    }
+    title
 }

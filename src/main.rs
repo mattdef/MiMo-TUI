@@ -8,6 +8,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use client::{ChatMessage, MimoClient};
 use config::{AppConfig, ConfigOverrides};
+use tui::session_store;
 
 #[derive(Debug, Parser)]
 #[command(name = "mimo-tui")]
@@ -44,6 +45,10 @@ enum Command {
     },
     #[command(about = "Show resolved configuration and credential status")]
     Doctor,
+    #[command(about = "List MiMo models from the API, or local suggestions when offline")]
+    Models,
+    #[command(about = "List locally saved MiMo-TUI sessions")]
+    Sessions,
 }
 
 #[tokio::main]
@@ -58,10 +63,9 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Some(Command::Ask { prompt }) => ask(config, prompt).await,
-        Some(Command::Doctor) => {
-            doctor(&config);
-            Ok(())
-        }
+        Some(Command::Doctor) => doctor(&config).await,
+        Some(Command::Models) => list_models(&config).await,
+        Some(Command::Sessions) => list_sessions(&config),
         None => tui::run(config).await,
     }
 }
@@ -85,17 +89,102 @@ async fn ask(config: AppConfig, prompt: String) -> Result<()> {
     Ok(())
 }
 
-fn doctor(config: &AppConfig) {
-    println!("Config file : {}", config.config_path.display());
-    println!("Base URL    : {}", config.base_url);
-    println!("Model       : {}", config.model);
-    println!("Temperature : {}", config.temperature);
+async fn doctor(config: &AppConfig) -> Result<()> {
+    println!("Config file      : {}", config.config_path.display());
     println!(
-        "API key     : {}",
+        "Base URL         : {} ({})",
+        config.base_url, config.base_url_source
+    );
+    println!(
+        "Model            : {} ({})",
+        config.model, config.model_source
+    );
+    println!(
+        "Temperature      : {} ({})",
+        config.temperature, config.temperature_source
+    );
+    println!(
+        "System prompt    : {} ({})",
+        config
+            .system_prompt
+            .lines()
+            .next()
+            .unwrap_or("<empty system prompt>"),
+        config.system_prompt_source
+    );
+    println!(
+        "API key          : {} ({})",
         if config.api_key.is_some() {
             "configured"
         } else {
             "missing (set MIMO_API_KEY or config.toml)"
-        }
+        },
+        config.api_key_source
     );
+
+    match MimoClient::new(config) {
+        Ok(client) => match client.list_models().await {
+            Ok(models) => {
+                println!("Models API       : ok ({} models)", models.len());
+                if !models.is_empty() {
+                    println!(
+                        "Model preview    : {}",
+                        models.into_iter().take(5).collect::<Vec<_>>().join(", ")
+                    );
+                }
+            }
+            Err(error) => println!("Models API       : error ({error})"),
+        },
+        Err(_) => println!("Models API       : skipped (API key missing)"),
+    }
+
+    Ok(())
+}
+
+async fn list_models(config: &AppConfig) -> Result<()> {
+    match MimoClient::new(config) {
+        Ok(client) => match client.list_models().await {
+            Ok(models) if !models.is_empty() => {
+                for model in models {
+                    println!("{model}");
+                }
+            }
+            Ok(_) => {
+                for model in config::known_mimo_models(&config.model) {
+                    println!("{model}");
+                }
+            }
+            Err(error) => {
+                eprintln!("warning: failed to load models from MiMo API: {error}");
+                for model in config::known_mimo_models(&config.model) {
+                    println!("{model}");
+                }
+            }
+        },
+        Err(_) => {
+            for model in config::known_mimo_models(&config.model) {
+                println!("{model}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn list_sessions(config: &AppConfig) -> Result<()> {
+    let sessions = session_store::list_sessions(config)?;
+    if sessions.is_empty() {
+        println!("No saved sessions.");
+        return Ok(());
+    }
+
+    for session in sessions {
+        println!(
+            "{} | {} | {} | {}",
+            session.title,
+            session.model,
+            session.mode,
+            session.path.display()
+        );
+    }
+    Ok(())
 }

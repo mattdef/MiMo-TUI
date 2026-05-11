@@ -1,5 +1,7 @@
 use std::fmt::Write;
 
+use super::keybindings::KEYBINDINGS;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModeName {
     Chat,
@@ -22,6 +24,7 @@ pub enum SlashCommand {
     Retry,
     Context,
     Mode { mode: Option<ModeName> },
+    Plan(PlanCommand),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -34,17 +37,21 @@ pub enum ConfigCommand {
     SetTemperature(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanCommand {
+    Show,
+    Add(String),
+    Done(usize),
+    Undo(usize),
+    Remove(usize),
+    Clear,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandInfo {
     pub name: &'static str,
     pub aliases: &'static [&'static str],
     pub usage: &'static str,
-    pub description: &'static str,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct KeybindingInfo {
-    pub chord: &'static str,
     pub description: &'static str,
 }
 
@@ -100,9 +107,9 @@ pub const COMMANDS: &[CommandInfo] = &[
     },
     CommandInfo {
         name: "sessions",
-        aliases: &[],
+        aliases: &["resume"],
         usage: "/sessions",
-        description: "List local saved sessions.",
+        description: "Open the local saved-session picker.",
     },
     CommandInfo {
         name: "export",
@@ -140,56 +147,11 @@ pub const COMMANDS: &[CommandInfo] = &[
         usage: "/mode [chat|plan]",
         description: "Show or switch the current MiMo interaction mode.",
     },
-];
-
-pub const KEYBINDINGS: &[KeybindingInfo] = &[
-    KeybindingInfo {
-        chord: "Enter",
-        description: "Send the draft or execute a slash command.",
-    },
-    KeybindingInfo {
-        chord: "Ctrl+J / Shift+Enter",
-        description: "Insert a newline in the draft.",
-    },
-    KeybindingInfo {
-        chord: "Ctrl+U",
-        description: "Clear the current draft.",
-    },
-    KeybindingInfo {
-        chord: "Left / Right",
-        description: "Move the cursor inside the draft.",
-    },
-    KeybindingInfo {
-        chord: "Home / End",
-        description: "Jump to the start or end of the current line.",
-    },
-    KeybindingInfo {
-        chord: "Ctrl+A / Ctrl+E",
-        description: "Jump to the start or end of the current line.",
-    },
-    KeybindingInfo {
-        chord: "Delete / Backspace",
-        description: "Delete text around the cursor.",
-    },
-    KeybindingInfo {
-        chord: "Up / Down",
-        description: "Scroll the conversation or the help overlay.",
-    },
-    KeybindingInfo {
-        chord: "PageUp / PageDown",
-        description: "Scroll by one page.",
-    },
-    KeybindingInfo {
-        chord: "Ctrl+Home / Ctrl+End",
-        description: "Jump to the top or bottom of the conversation.",
-    },
-    KeybindingInfo {
-        chord: "F1 / ?",
-        description: "Open the searchable help overlay.",
-    },
-    KeybindingInfo {
-        chord: "Esc / Ctrl+C",
-        description: "Close help or quit MiMo TUI.",
+    CommandInfo {
+        name: "plan",
+        aliases: &[],
+        usage: "/plan [show|add <text>|done <n>|undo <n>|remove <n>|clear]",
+        description: "Inspect or update the local plan checklist.",
     },
 ];
 
@@ -214,7 +176,7 @@ pub fn parse_slash_command(input: &str) -> Result<SlashCommand, CommandParseErro
         "load" => Ok(SlashCommand::Load {
             path: non_empty(args).map(ToOwned::to_owned),
         }),
-        "sessions" => require_no_args(args, SlashCommand::Sessions, "/sessions"),
+        "sessions" | "resume" => require_no_args(args, SlashCommand::Sessions, "/sessions"),
         "export" => Ok(SlashCommand::Export {
             path: non_empty(args).map(ToOwned::to_owned),
         }),
@@ -223,6 +185,7 @@ pub fn parse_slash_command(input: &str) -> Result<SlashCommand, CommandParseErro
         "retry" => require_no_args(args, SlashCommand::Retry, "/retry"),
         "context" => require_no_args(args, SlashCommand::Context, "/context"),
         "mode" => parse_mode_command(args),
+        "plan" => parse_plan_command(args),
         _ => Err(CommandParseError::UnknownCommand(name.to_string())),
     }
 }
@@ -341,6 +304,32 @@ fn parse_mode_command(args: &str) -> Result<SlashCommand, CommandParseError> {
     Ok(SlashCommand::Mode { mode: Some(mode) })
 }
 
+fn parse_plan_command(args: &str) -> Result<SlashCommand, CommandParseError> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("show") {
+        return Ok(SlashCommand::Plan(PlanCommand::Show));
+    }
+
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let action = parts.next().unwrap_or_default().to_ascii_lowercase();
+    let value = parts.next().unwrap_or_default().trim();
+
+    let command = match action.as_str() {
+        "add" if !value.is_empty() => PlanCommand::Add(value.to_string()),
+        "done" => PlanCommand::Done(parse_index(value)?),
+        "undo" => PlanCommand::Undo(parse_index(value)?),
+        "remove" => PlanCommand::Remove(parse_index(value)?),
+        "clear" if value.is_empty() => PlanCommand::Clear,
+        _ => {
+            return Err(CommandParseError::Usage(
+                "/plan [show|add <text>|done <n>|undo <n>|remove <n>|clear]",
+            ));
+        }
+    };
+
+    Ok(SlashCommand::Plan(command))
+}
+
 fn command_parts(input: &str) -> Option<(&str, &str)> {
     let command = input.trim().strip_prefix('/')?;
     let command = command.trim_start();
@@ -367,9 +356,17 @@ fn require_no_args(
     }
 }
 
+fn parse_index(value: &str) -> Result<usize, CommandParseError> {
+    value.parse::<usize>().map_err(|_| {
+        CommandParseError::Usage("/plan [show|add <text>|done <n>|undo <n>|remove <n>|clear]")
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CommandParseError, ConfigCommand, ModeName, SlashCommand, parse_slash_command};
+    use super::{
+        CommandParseError, ConfigCommand, ModeName, PlanCommand, SlashCommand, parse_slash_command,
+    };
 
     #[test]
     fn parses_core_commands() {
@@ -389,6 +386,12 @@ mod tests {
             parse_slash_command("/config model mimo-v2-flash"),
             Ok(SlashCommand::Config(ConfigCommand::SetModel(
                 "mimo-v2-flash".to_string()
+            )))
+        );
+        assert_eq!(
+            parse_slash_command("/plan add Build slash menu"),
+            Ok(SlashCommand::Plan(PlanCommand::Add(
+                "Build slash menu".to_string()
             )))
         );
     }
