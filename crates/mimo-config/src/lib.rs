@@ -1,4 +1,4 @@
-use std::{env, fmt, fs, path::PathBuf};
+use std::{env, fmt, fs, io::Write, path::PathBuf};
 
 use anyhow::{Context, Result};
 use reqwest::Url;
@@ -225,9 +225,41 @@ fn update_file_config(path: &PathBuf, mutate: impl FnOnce(&mut FileConfig)) -> R
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create config directory {}", parent.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = fs::metadata(parent) {
+                let mut perms = meta.permissions();
+                if perms.mode() & 0o077 != 0 {
+                    perms.set_mode(0o700);
+                    let _ = fs::set_permissions(parent, perms);
+                }
+            }
+        }
     }
     let contents = toml::to_string_pretty(&file_config).context("failed to encode config file")?;
-    fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))
+    write_config_file_atomic(path, &contents)
+}
+
+fn write_config_file_atomic(path: &PathBuf, contents: &str) -> Result<()> {
+    let temp = path.with_extension("tmp");
+    {
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts
+            .open(&temp)
+            .with_context(|| format!("failed to open {}", temp.display()))?;
+        file.write_all(contents.as_bytes())
+            .with_context(|| format!("failed to write {}", temp.display()))?;
+        file.flush().ok();
+    }
+    fs::rename(&temp, path)
+        .with_context(|| format!("failed to rename {} to {}", temp.display(), path.display()))
 }
 
 fn env_f32(name: &str) -> Result<Option<f32>> {
@@ -261,7 +293,10 @@ fn pick_temperature<const N: usize>(
     values: [(ConfigValueSource, Option<f32>); N],
 ) -> (Option<f32>, ConfigValueSource) {
     for (source, value) in values {
-        if let Some(value) = value {
+        if let Some(value) = value
+            && value.is_finite()
+            && (0.0..=2.0).contains(&value)
+        {
             return (Some(value), source);
         }
     }

@@ -39,6 +39,7 @@ struct ChatChunk {
 
 #[derive(Debug, Deserialize)]
 struct Choice {
+    #[serde(default)]
     delta: Delta,
     #[serde(default)]
     finish_reason: Option<String>,

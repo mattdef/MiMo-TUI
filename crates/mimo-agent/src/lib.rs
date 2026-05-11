@@ -1,7 +1,9 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use mimo_client::MimoClient;
 use mimo_protocol::ChatMessage;
 use mimo_tools::{ApprovalRequirement, ToolContext, ToolInvocation, ToolRegistry};
+
+const MAX_TOOL_ROUNDS: usize = 25;
 
 pub async fn run_agent_turn<FDelta, FStatus, FApprove, Fut>(
     client: &MimoClient,
@@ -18,7 +20,11 @@ where
     FApprove: FnMut(ToolInvocation) -> Fut,
     Fut: std::future::Future<Output = Result<bool>>,
 {
-    loop {
+    for _round in 0..MAX_TOOL_ROUNDS {
+        if context.is_cancelled() {
+            bail!("agent turn cancelled");
+        }
+
         let assistant = client
             .stream_chat_completion(&messages, registry.api_tools(), |delta| on_delta(delta))
             .await?;
@@ -78,6 +84,10 @@ where
             }
         }
     }
+
+    Err(anyhow!(
+        "agent exceeded {MAX_TOOL_ROUNDS} tool-call rounds; possible infinite loop"
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -87,4 +97,46 @@ pub enum AgentStatus {
     ToolSucceeded(ToolInvocation, String),
     ToolFailed(ToolInvocation, String),
     ToolFinished(ToolInvocation, bool),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AgentStatus;
+    use mimo_tools::{ApprovalRequirement, ToolInvocation, ToolKind};
+
+    fn make_invocation(name: &str) -> ToolInvocation {
+        ToolInvocation {
+            call_id: String::new(),
+            name: name.to_string(),
+            kind: ToolKind::Shell,
+            summary: name.to_string(),
+            approval_requirement: ApprovalRequirement::Auto,
+            input: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn agent_status_variants_are_clonable() {
+        let inv = make_invocation("test");
+        let requested = AgentStatus::ToolRequested(inv);
+        let clone = requested.clone();
+        assert!(matches!(clone, AgentStatus::ToolRequested(_)));
+    }
+
+    #[test]
+    fn agent_status_variants_cover_lifecycle() {
+        let inv = make_invocation("build");
+
+        let started = AgentStatus::ToolStarted(inv.clone());
+        assert!(matches!(started, AgentStatus::ToolStarted(_)));
+
+        let succeeded = AgentStatus::ToolSucceeded(inv.clone(), "done".to_string());
+        assert!(matches!(succeeded, AgentStatus::ToolSucceeded(_, _)));
+
+        let failed = AgentStatus::ToolFailed(inv.clone(), "error".to_string());
+        assert!(matches!(failed, AgentStatus::ToolFailed(_, _)));
+
+        let finished = AgentStatus::ToolFinished(inv, true);
+        assert!(matches!(finished, AgentStatus::ToolFinished(_, _)));
+    }
 }

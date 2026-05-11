@@ -8,3 +8,7 @@ anyhow.workspace = true
 mimo-client = { path = "../mimo-client" }
 mimo-protocol = { path = "../mimo-protocol" }
 mimo-tools = { path = "../mimo-tools" }
+tokio.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

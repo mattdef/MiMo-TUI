@@ -4,9 +4,9 @@ use std::{
 };
 
 use anyhow::{Result, bail};
-use mimo_tools::summarize_directory;
 use mimo_protocol::ChatMessage;
 use mimo_state::FileAttachment;
+use mimo_tools::summarize_directory;
 use mimo_tui_core::input::InputBuffer;
 
 pub fn try_attach_from_input(

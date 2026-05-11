@@ -10,7 +10,7 @@ MiMo-TUI turns your terminal into a capable AI coding workspace. Type a prompt, 
 
 **Highlights:**
 
-- 🖥️ **Full-screen TUI** with streaming responses, multiline editor, and slash-command palette
+- 🖥️ **Full-screen TUI** with an OpenCode-style landing prompt, streaming responses, multiline editor, and slash-command palette
 - 🔧 **Agentic tool loop** — file read/write, shell execution, git, search, and diagnostics
 - 💾 **Session persistence** — save, restore, and export conversations as Markdown
 - 🗂️ **Plan mode** — keep a live checklist alongside your conversation

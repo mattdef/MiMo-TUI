@@ -5,9 +5,9 @@ use clap::{Parser, Subcommand};
 use mimo_agent::run_agent_turn;
 use mimo_client::MimoClient;
 use mimo_config::{AppConfig, ConfigOverrides, known_mimo_models};
-use mimo_tools::{ToolContext, ToolRegistryBuilder, default_workspace_root};
 use mimo_protocol::ChatMessage;
 use mimo_state::session_store;
+use mimo_tools::{ToolContext, ToolRegistryBuilder, default_workspace_root};
 
 #[derive(Debug, Parser)]
 #[command(name = "mimo-tui")]

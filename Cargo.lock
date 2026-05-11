@@ -797,6 +797,8 @@ dependencies = [
  "mimo-client",
  "mimo-protocol",
  "mimo-tools",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -881,7 +883,6 @@ dependencies = [
  "anyhow",
  "crossterm",
  "dirs",
- "libc",
  "mimo-agent",
  "mimo-client",
  "mimo-config",

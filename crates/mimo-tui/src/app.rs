@@ -26,11 +26,11 @@ use mimo_tui_core::{
         ModeName, PlanCommand, ReviewCommand, SkillCommand, SlashCommand, TaskCommand,
     },
     input::InputBuffer,
-    keybindings, markdown,
+    markdown,
 };
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
@@ -71,6 +71,8 @@ pub enum AppEvent {
         result: Result<(), String>,
     },
 }
+
+const XIAOMI_ORANGE: Color = Color::Rgb(255, 106, 0);
 
 fn app_mode_for(mode: ModeName) -> AppMode {
     match mode {
@@ -284,24 +286,13 @@ impl App {
 
     pub fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
-        let input_height = self.input_height(area.height);
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(4),
-                Constraint::Length(input_height),
-                Constraint::Length(1),
-            ])
-            .split(area);
-
-        self.conversation_view_height = chunks[1].height.saturating_sub(2).max(1);
-        self.clamp_scroll();
-
-        self.render_header(frame, chunks[0]);
-        self.render_main_panel(frame, chunks[1]);
-        self.render_input(frame, chunks[2]);
-        self.render_footer(frame, chunks[3]);
+        if self.is_landing_screen() {
+            self.conversation_view_height = 1;
+            self.scroll = 0;
+            self.render_landing_screen(frame, area);
+        } else {
+            self.render_workspace(frame, area);
+        }
 
         if self.tool_runtime.pending_approval.is_some() {
             self.render_approval_overlay(frame, area);
@@ -321,6 +312,121 @@ impl App {
             self.render_message_pager_overlay(frame, area);
         } else if self.slash_menu_visible() {
             self.render_slash_menu_overlay(frame, area);
+        }
+    }
+
+    fn render_workspace(&mut self, frame: &mut Frame, area: Rect) {
+        let input_height = self.input_height(area.height);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(4),
+                Constraint::Length(input_height),
+                Constraint::Length(1),
+            ])
+            .split(area);
+
+        self.conversation_view_height = chunks[1].height.saturating_sub(2).max(1);
+        self.clamp_scroll();
+
+        self.render_header(frame, chunks[0]);
+        self.render_main_panel(frame, chunks[1]);
+        self.render_input(frame, chunks[2]);
+        self.render_footer(frame, chunks[3]);
+    }
+
+    fn render_landing_screen(&mut self, frame: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(6), Constraint::Length(1)])
+            .split(area);
+        let popup = centered_rect(chunks[0], 78, 64);
+        let status_height = u16::from(self.status != "Ready");
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(self.landing_hero_height()),
+                Constraint::Length(2),
+                Constraint::Length(self.landing_prompt_height()),
+                Constraint::Length(1),
+                Constraint::Length(status_height),
+                Constraint::Min(0),
+            ])
+            .split(popup);
+        frame.render_widget(
+            Paragraph::new(self.landing_hero()).alignment(Alignment::Center),
+            sections[0],
+        );
+
+        self.render_landing_prompt(frame, sections[2]);
+        frame.render_widget(
+            Paragraph::new(self.landing_tip())
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::DarkGray)),
+            sections[3],
+        );
+        if status_height > 0 {
+            frame.render_widget(
+                Paragraph::new(self.status.as_str())
+                    .alignment(Alignment::Center)
+                    .style(self.status_style()),
+                sections[4],
+            );
+        }
+        self.render_footer(frame, chunks[1]);
+    }
+
+    fn is_landing_screen(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    fn landing_tip(&self) -> &'static str {
+        if self.config.api_key.is_some() {
+            "Tip: use /help for commands or @path + Tab to attach workspace context."
+        } else {
+            "Tip: use /config api-key <key> to save credentials from inside the TUI."
+        }
+    }
+
+    fn landing_hero_height(&self) -> u16 {
+        7
+    }
+
+    fn landing_hero(&self) -> Text<'static> {
+        Text::from(vec![
+            Line::styled("Xiaomi", Style::default().fg(XIAOMI_ORANGE)),
+            Line::raw(""),
+            Line::styled(
+                "█   █  ██  █   █   ███        █████  █ █  ██",
+                Style::default().fg(Color::White),
+            ),
+            Line::styled(
+                "██ ██   █  ██ ██  █   █         █    █ █   █",
+                Style::default().fg(Color::White),
+            ),
+            Line::styled(
+                "█ █ █   █  █ █ █  █   █   ███   █    █ █   █",
+                Style::default().fg(Color::White),
+            ),
+            Line::styled(
+                "█   █   █  █   █  █   █         █    █ █   █",
+                Style::default().fg(Color::White),
+            ),
+            Line::styled(
+                "█   █  ███ █   █   ███          █    ███  ███",
+                Style::default().fg(Color::White),
+            ),
+        ])
+    }
+
+    fn status_style(&self) -> Style {
+        if self.streaming {
+            Style::default().fg(Color::Yellow)
+        } else if self.config.api_key.is_none() {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default().fg(Color::Green)
         }
     }
 
@@ -485,7 +591,9 @@ impl App {
                 self.stream_context = None;
                 self.streaming = false;
                 self.assistant_index = None;
-                self.status = "Ready".to_string();
+                if self.status != "Generation cancelled" {
+                    self.status = "Ready".to_string();
+                }
                 self.scroll_to_bottom();
             }
             AppEvent::Finished(Err(error)) => {
@@ -638,14 +746,6 @@ impl App {
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
-        let status_style = if self.streaming {
-            Style::default().fg(Color::Yellow)
-        } else if self.config.api_key.is_none() {
-            Style::default().fg(Color::Red)
-        } else {
-            Style::default().fg(Color::Green)
-        };
-
         let line = Line::from(vec![
             Span::styled(
                 "MiMo TUI",
@@ -678,26 +778,26 @@ impl App {
                 Style::default().fg(Color::Yellow),
             ),
             Span::raw(" | "),
-            Span::styled(&self.status, status_style),
+            Span::styled(&self.status, self.status_style()),
         ]);
 
         frame.render_widget(
-            Paragraph::new(line).block(Block::default().borders(Borders::ALL)),
+            Paragraph::new(line).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(panel_border_style()),
+            ),
             area,
         );
     }
 
     fn render_main_panel(&self, frame: &mut Frame, area: Rect) {
-        if self.mode == AppMode::Plan {
-            let panels = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-                .split(area);
-            self.render_conversation(frame, panels[0]);
-            self.render_plan_panel(frame, panels[1]);
-        } else {
-            self.render_conversation(frame, area);
-        }
+        let panels = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+            .split(area);
+        self.render_conversation(frame, panels[0]);
+        self.render_plan_panel(frame, panels[1]);
     }
 
     fn render_conversation(&self, frame: &mut Frame, area: Rect) {
@@ -719,7 +819,12 @@ impl App {
 
         frame.render_widget(
             Paragraph::new(text)
-                .block(Block::default().title("Conversation").borders(Borders::ALL))
+                .block(
+                    Block::default()
+                        .title("Conversation")
+                        .borders(Borders::ALL)
+                        .border_style(panel_border_style()),
+                )
                 .wrap(Wrap { trim: false })
                 .scroll((self.scroll, 0)),
             area,
@@ -740,10 +845,12 @@ impl App {
             lines.push(Line::raw("Use /plan add <text> to track planned steps."));
             lines.push(Line::raw("Use /plan done <n> to mark a step complete."));
             lines.push(Line::raw(""));
-            lines.push(Line::styled(
-                "Plan mode stays read-only until you switch to agent or yolo mode.",
-                Style::default().fg(Color::DarkGray),
-            ));
+            let hint = if self.mode == AppMode::Plan {
+                "Plan mode stays read-only until you switch to agent or yolo mode."
+            } else {
+                "This checklist stays visible while you work in other modes."
+            };
+            lines.push(Line::styled(hint, Style::default().fg(Color::DarkGray)));
         } else {
             for (index, item) in self.plan_items.iter().enumerate() {
                 let marker = if item.done { "[x]" } else { "[ ]" };
@@ -766,7 +873,12 @@ impl App {
 
         frame.render_widget(
             Paragraph::new(Text::from(lines))
-                .block(Block::default().title("Plan").borders(Borders::ALL))
+                .block(
+                    Block::default()
+                        .title("Plan")
+                        .borders(Borders::ALL)
+                        .border_style(panel_border_style()),
+                )
                 .wrap(Wrap { trim: false }),
             area,
         );
@@ -784,7 +896,8 @@ impl App {
                     .block(
                         Block::default()
                             .title("Attached context")
-                            .borders(Borders::ALL),
+                            .borders(Borders::ALL)
+                            .border_style(panel_border_style()),
                     )
                     .wrap(Wrap { trim: false }),
                 chunks[0],
@@ -801,7 +914,138 @@ impl App {
         } else {
             "Prompt"
         };
-        let visible_lines = area.height.saturating_sub(2).max(1) as usize;
+        let block = Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(panel_border_style());
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let visible_lines = inner.height.max(1) as usize;
+        let (cursor_line, cursor_col) = self.sync_input_scroll(visible_lines);
+        frame.render_widget(
+            Paragraph::new(self.input.as_str()).scroll((self.input_scroll, 0)),
+            inner,
+        );
+
+        if !self.help.open
+            && !self.model_picker.open
+            && !self.session_picker.open
+            && !self.command_palette.open
+            && !self.draft_browser.open
+            && !self.message_pager.open
+            && !self.inspector_browser.open
+            && self.tool_runtime.pending_approval.is_none()
+            && !self.slash_menu_visible()
+        {
+            self.set_input_cursor(frame, inner, visible_lines, cursor_line, cursor_col);
+        }
+    }
+
+    fn render_footer(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(
+            Paragraph::new(self.footer_summary())
+                .alignment(Alignment::Right)
+                .style(Style::default().fg(Color::DarkGray)),
+            area,
+        );
+    }
+
+    fn footer_summary(&self) -> String {
+        match self.footer_context_chars() {
+            Ok(used_chars) => {
+                let max_chars = estimated_max_context_chars(&self.config.model);
+                let used_percent = ((used_chars as f64 / max_chars as f64) * 100.0).min(100.0);
+                format!(
+                    "{} ({used_percent:.0}%) · F1/? help",
+                    format_compact_count(used_chars)
+                )
+            }
+            Err(_) => "context unavailable · F1/? help".to_string(),
+        }
+    }
+
+    fn footer_context_chars(&self) -> Result<usize> {
+        let request_chars = self
+            .request_messages()?
+            .iter()
+            .map(|message| message.content.chars().count())
+            .sum::<usize>();
+        Ok(request_chars + self.input.as_str().chars().count())
+    }
+
+    fn render_landing_prompt(&mut self, frame: &mut Frame, area: Rect) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(panel_border_style());
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let attachments_height = u16::from(!self.attachments.is_empty());
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(attachments_height),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+        let draft_area = if attachments_height > 0 {
+            frame.render_widget(
+                Paragraph::new(attachments::attachment_preview(&self.attachments))
+                    .style(Style::default().fg(Color::Yellow)),
+                sections[0],
+            );
+            sections[1]
+        } else {
+            sections[1]
+        };
+        let visible_lines = draft_area.height.max(1) as usize;
+        let (cursor_line, cursor_col) = self.sync_input_scroll(visible_lines);
+        let prompt_text = if self.input.is_empty() {
+            Text::from(vec![Line::styled(
+                "Ask anything...  \"Fix a TODO in the codebase\"",
+                Style::default().fg(Color::DarkGray),
+            )])
+        } else {
+            Text::from(self.input.as_str())
+        };
+        frame.render_widget(
+            Paragraph::new(prompt_text)
+                .scroll((self.input_scroll, 0))
+                .wrap(Wrap { trim: false }),
+            draft_area,
+        );
+
+        let meta = Line::from(vec![
+            Span::styled(self.mode.to_string(), Style::default().fg(Color::Blue)),
+            Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&self.config.model, Style::default().fg(Color::Magenta)),
+            Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Ctrl+K commands", Style::default().fg(Color::DarkGray)),
+        ]);
+        frame.render_widget(Paragraph::new(meta), sections[2]);
+
+        if !self.help.open
+            && !self.model_picker.open
+            && !self.session_picker.open
+            && !self.command_palette.open
+            && !self.draft_browser.open
+            && !self.message_pager.open
+            && !self.inspector_browser.open
+            && self.tool_runtime.pending_approval.is_none()
+            && !self.slash_menu_visible()
+        {
+            self.set_input_cursor(frame, draft_area, visible_lines, cursor_line, cursor_col);
+        }
+    }
+
+    fn landing_prompt_height(&self) -> u16 {
+        let draft_height = self.input.line_count().clamp(1, 4) as u16;
+        let attachments_height = u16::from(!self.attachments.is_empty());
+        (draft_height + attachments_height + 3).max(5)
+    }
+
+    fn sync_input_scroll(&mut self, visible_lines: usize) -> (usize, usize) {
         let (cursor_line, cursor_col) = self.input.cursor_line_col();
         let max_scroll = self
             .input
@@ -815,34 +1059,21 @@ impl App {
             self.input_scroll = (cursor_line + 1 - visible_lines) as u16;
         }
         self.input_scroll = self.input_scroll.min(max_scroll);
-
-        frame.render_widget(
-            Paragraph::new(self.input.as_str())
-                .block(Block::default().title(title).borders(Borders::ALL))
-                .scroll((self.input_scroll, 0)),
-            area,
-        );
-
-        if !self.help.open
-            && !self.model_picker.open
-            && !self.session_picker.open
-            && !self.command_palette.open
-            && !self.draft_browser.open
-            && !self.message_pager.open
-        {
-            let visible_line = cursor_line.saturating_sub(self.input_scroll as usize);
-            let cursor_x =
-                area.x + 1 + cursor_col.min(area.width.saturating_sub(2) as usize) as u16;
-            let cursor_y = area.y + 1 + visible_line.min(visible_lines.saturating_sub(1)) as u16;
-            frame.set_cursor_position((cursor_x, cursor_y));
-        }
+        (cursor_line, cursor_col)
     }
 
-    fn render_footer(&self, frame: &mut Frame, area: Rect) {
-        frame.render_widget(
-            Paragraph::new(keybindings::footer_hint()).style(Style::default().fg(Color::DarkGray)),
-            area,
-        );
+    fn set_input_cursor(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        visible_lines: usize,
+        cursor_line: usize,
+        cursor_col: usize,
+    ) {
+        let visible_line = cursor_line.saturating_sub(self.input_scroll as usize);
+        let cursor_x = area.x + cursor_col.min(area.width.saturating_sub(1) as usize) as u16;
+        let cursor_y = area.y + visible_line.min(visible_lines.saturating_sub(1)) as u16;
+        frame.set_cursor_position((cursor_x, cursor_y));
     }
 
     fn render_help_overlay(&mut self, frame: &mut Frame, area: Rect) {
@@ -857,7 +1088,7 @@ impl App {
             Block::default()
                 .title("Help")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(panel_border_style()),
             popup,
         );
 
@@ -872,7 +1103,8 @@ impl App {
             .block(
                 Block::default()
                     .title("Commands and keybindings")
-                    .borders(Borders::ALL),
+                    .borders(Borders::ALL)
+                    .border_style(panel_border_style()),
             )
             .wrap(Wrap { trim: false })
             .scroll((self.help.scroll, 0)),
@@ -894,7 +1126,7 @@ impl App {
             Block::default()
                 .title("MiMo models")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Magenta)),
+                .border_style(panel_border_style()),
             popup,
         );
 
@@ -929,7 +1161,8 @@ impl App {
                 .block(
                     Block::default()
                         .title("Select a model")
-                        .borders(Borders::ALL),
+                        .borders(Borders::ALL)
+                        .border_style(panel_border_style()),
                 )
                 .scroll((self.model_picker.scroll, 0)),
             inner[0],
@@ -956,7 +1189,7 @@ impl App {
             Block::default()
                 .title("Saved sessions")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Green)),
+                .border_style(panel_border_style()),
             popup,
         );
 
@@ -971,7 +1204,8 @@ impl App {
                 .block(
                     Block::default()
                         .title("Resume a session")
-                        .borders(Borders::ALL),
+                        .borders(Borders::ALL)
+                        .border_style(panel_border_style()),
                 )
                 .wrap(Wrap { trim: false })
                 .scroll((self.session_picker.scroll, 0)),
@@ -995,7 +1229,7 @@ impl App {
             Block::default()
                 .title("Command palette")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
+                .border_style(panel_border_style()),
             popup,
         );
 
@@ -1027,7 +1261,12 @@ impl App {
             .collect::<Vec<_>>();
         frame.render_widget(
             Paragraph::new(Text::from(lines))
-                .block(Block::default().title("Actions").borders(Borders::ALL))
+                .block(
+                    Block::default()
+                        .title("Actions")
+                        .borders(Borders::ALL)
+                        .border_style(panel_border_style()),
+                )
                 .wrap(Wrap { trim: false })
                 .scroll((self.command_palette.scroll, 0)),
             inner[1],
@@ -1046,7 +1285,7 @@ impl App {
             Block::default()
                 .title(self.draft_browser_title())
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Magenta)),
+                .border_style(panel_border_style()),
             popup,
         );
 
@@ -1077,7 +1316,12 @@ impl App {
             .collect::<Vec<_>>();
         frame.render_widget(
             Paragraph::new(Text::from(lines))
-                .block(Block::default().title("Drafts").borders(Borders::ALL))
+                .block(
+                    Block::default()
+                        .title("Drafts")
+                        .borders(Borders::ALL)
+                        .border_style(panel_border_style()),
+                )
                 .wrap(Wrap { trim: false })
                 .scroll((self.draft_browser.scroll, 0)),
             inner[0],
@@ -1100,7 +1344,7 @@ impl App {
             Block::default()
                 .title(self.inspector_browser_title())
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(panel_border_style()),
             popup,
         );
 
@@ -1131,7 +1375,12 @@ impl App {
             .collect::<Vec<_>>();
         frame.render_widget(
             Paragraph::new(Text::from(lines))
-                .block(Block::default().title("Entries").borders(Borders::ALL))
+                .block(
+                    Block::default()
+                        .title("Entries")
+                        .borders(Borders::ALL)
+                        .border_style(panel_border_style()),
+                )
                 .wrap(Wrap { trim: false })
                 .scroll((self.inspector_browser.scroll, 0)),
             inner[0],
@@ -1157,7 +1406,7 @@ impl App {
                     Block::default()
                         .title(self.message_pager.title.as_str())
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Cyan)),
+                        .border_style(panel_border_style()),
                 )
                 .wrap(Wrap { trim: false })
                 .scroll((self.message_pager.scroll, 0)),
@@ -1172,7 +1421,7 @@ impl App {
             Block::default()
                 .title("Tool approval")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
+                .border_style(panel_border_style()),
             popup,
         );
 
@@ -1199,7 +1448,8 @@ impl App {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title("Pending request"),
+                        .title("Pending request")
+                        .border_style(panel_border_style()),
                 )
                 .wrap(Wrap { trim: false }),
             centered_rect(popup, 94, 80),
@@ -1213,7 +1463,7 @@ impl App {
             Block::default()
                 .title("Commands")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Blue)),
+                .border_style(panel_border_style()),
             popup,
         );
         let entries = self.slash_menu_entries();
@@ -1244,7 +1494,12 @@ impl App {
             .collect::<Vec<_>>();
         frame.render_widget(
             Paragraph::new(Text::from(lines))
-                .block(Block::default().title("Slash menu").borders(Borders::ALL))
+                .block(
+                    Block::default()
+                        .title("Slash menu")
+                        .borders(Borders::ALL)
+                        .border_style(panel_border_style()),
+                )
                 .wrap(Wrap { trim: false }),
             popup,
         );
@@ -1258,7 +1513,12 @@ impl App {
 
         frame.render_widget(
             Paragraph::new(input.as_str())
-                .block(Block::default().title(title).borders(Borders::ALL))
+                .block(
+                    Block::default()
+                        .title(title)
+                        .borders(Borders::ALL)
+                        .border_style(panel_border_style()),
+                )
                 .scroll((filter_scroll, 0)),
             area,
         );
@@ -1403,6 +1663,9 @@ impl App {
     }
 
     fn handle_model_picker_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.model_picker.models.is_empty() {
+            return Ok(false);
+        }
         match key.code {
             KeyCode::Esc => self.close_model_picker(),
             KeyCode::Up => {
@@ -3605,6 +3868,31 @@ fn remember_draft(bucket: &mut Vec<String>, draft: &str) {
     bucket.truncate(20);
 }
 
+fn estimated_max_context_chars(model: &str) -> usize {
+    match model {
+        "mimo-v2-flash" | "mimo-v2.5" | "mimo-v2.5-pro" | AUTO_MODEL => 1_000_000,
+        _ => 1_000_000,
+    }
+}
+
+fn format_compact_count(value: usize) -> String {
+    match value {
+        1_000_000.. => format_compact_decimal(value as f64 / 1_000_000.0, "M"),
+        1_000.. => format_compact_decimal(value as f64 / 1_000.0, "K"),
+        _ => value.to_string(),
+    }
+}
+
+fn format_compact_decimal(value: f64, suffix: &str) -> String {
+    let formatted = format!("{value:.1}");
+    let formatted = formatted.strip_suffix(".0").unwrap_or(&formatted);
+    format!("{formatted}{suffix}")
+}
+
+fn panel_border_style() -> Style {
+    Style::default().fg(XIAOMI_ORANGE)
+}
+
 fn tool_request_from_invocation(
     invocation: &ToolInvocation,
     status: ToolStatus,
@@ -3890,6 +4178,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::{Terminal, backend::TestBackend};
     use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
@@ -3908,6 +4197,29 @@ mod tests {
             system_prompt_source: mimo_config::ConfigValueSource::Default,
             api_key_source: mimo_config::ConfigValueSource::Default,
         })
+    }
+
+    fn render_screen(app: &mut App) -> String {
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal should initialize");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("app should render");
+
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area();
+        let mut screen = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                let symbol = buffer
+                    .cell((x, y))
+                    .expect("cell should exist inside the rendered area")
+                    .symbol();
+                screen.push_str(symbol);
+            }
+            screen.push('\n');
+        }
+        screen
     }
 
     #[test]
@@ -4074,6 +4386,60 @@ mod tests {
         app.handle_plan_command(PlanCommand::Done(1));
         assert_eq!(app.plan_items.len(), 1);
         assert!(app.plan_items[0].done);
+    }
+
+    #[test]
+    fn landing_screen_replaces_workspace_panels_when_empty() {
+        let mut app = test_app();
+        let screen = render_screen(&mut app);
+        assert!(screen.contains("Xiaomi"));
+        assert!(screen.contains("█   █  ██  █   █   ███        █████ █   █ █"));
+        assert!(screen.contains("Ask anything...  \"Fix a TODO in the codebase\""));
+        assert!(screen.contains("(0%) · F1/? help"));
+        assert!(!screen.contains("Enter send |"));
+        assert!(!screen.contains("Ask anything about this workspace."));
+        assert!(!screen.contains("Conversation"));
+        assert!(!screen.contains("Plan"));
+    }
+
+    #[test]
+    fn workspace_panels_return_once_messages_exist() {
+        let mut app = test_app();
+        app.messages.push(ChatMessage::user("hello"));
+        app.messages.push(ChatMessage::assistant("world"));
+
+        let screen = render_screen(&mut app);
+        assert!(screen.contains("Conversation"));
+        assert!(screen.contains("Plan"));
+    }
+
+    #[test]
+    fn plan_panel_remains_visible_outside_plan_mode() {
+        let mut app = test_app();
+        app.messages.push(ChatMessage::user("hello"));
+        app.messages.push(ChatMessage::assistant("world"));
+
+        let screen = render_screen(&mut app);
+        assert!(screen.contains("Conversation"));
+        assert!(screen.contains("Plan"));
+
+        app.mode = AppMode::Yolo;
+        let screen = render_screen(&mut app);
+        assert!(screen.contains("Conversation"));
+        assert!(screen.contains("Plan"));
+    }
+
+    #[test]
+    fn clearing_conversation_returns_to_landing_screen() {
+        let mut app = test_app();
+        app.messages.push(ChatMessage::user("hello"));
+        app.messages.push(ChatMessage::assistant("world"));
+
+        app.clear_conversation();
+
+        let screen = render_screen(&mut app);
+        assert!(screen.contains("Ask anything...  \"Fix a TODO in the codebase\""));
+        assert!(screen.contains("Conversation cleared"));
     }
 
     #[test]

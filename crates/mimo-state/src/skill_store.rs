@@ -1,14 +1,26 @@
 use std::{
     ffi::OsStr,
     fs,
+    io::Read,
     path::{Path, PathBuf},
+    sync::LazyLock,
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
-use reqwest::blocking::Client;
+use reqwest::{Url, blocking::Client};
 
 use mimo_config::AppConfig;
+
+const MAX_SKILL_SIZE_BYTES: u64 = 256 * 1024;
+
+static SKILL_HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| {
+    Client::builder()
+        .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::limited(3))
+        .build()
+        .expect("failed to build shared HTTP client")
+});
 
 #[derive(Debug, Clone)]
 pub struct InstalledSkill {
@@ -49,19 +61,34 @@ pub fn install_skill(config: &AppConfig, spec: &str) -> Result<InstalledSkill> {
     }
 
     let (content, fallback_name) = if spec.starts_with("http://") || spec.starts_with("https://") {
-        let response = Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(20))
-            .build()
-            .context("failed to create HTTP client")?
+        let parsed = Url::parse(spec).with_context(|| format!("invalid URL: {spec}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            bail!("only http(s) URLs are supported for skill installation");
+        }
+        if let Some(host) = parsed.host_str() {
+            if !is_allowed_skill_host(host) {
+                bail!("internal/private hosts are not allowed for skill installation: {host}");
+            }
+        }
+        let response = SKILL_HTTP_CLIENT
             .get(spec)
             .send()
             .with_context(|| format!("failed to fetch {spec}"))?
             .error_for_status()
             .with_context(|| format!("failed to fetch {spec}"))?;
-        let content = response
-            .text()
+        let mut body = Vec::new();
+        response
+            .take(MAX_SKILL_SIZE_BYTES + 1)
+            .read_to_end(&mut body)
             .with_context(|| format!("failed to read {spec}"))?;
+        if body.len() > MAX_SKILL_SIZE_BYTES as usize {
+            bail!(
+                "skill content exceeds maximum size of {} bytes",
+                MAX_SKILL_SIZE_BYTES
+            );
+        }
+        let content = String::from_utf8(body)
+            .with_context(|| format!("skill at {spec} is not valid UTF-8"))?;
         let fallback = Path::new(spec)
             .file_stem()
             .and_then(OsStr::to_str)
@@ -177,4 +204,20 @@ pub fn normalize_skill_name(value: &str) -> String {
         }
     }
     normalized.trim_matches('-').to_string()
+}
+
+fn is_allowed_skill_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return false;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return !ip.is_loopback()
+            && !ip.is_unspecified()
+            && !ip.is_multicast()
+            && match ip {
+                std::net::IpAddr::V4(v4) => !v4.is_private() && !v4.is_link_local(),
+                std::net::IpAddr::V6(_) => true,
+            };
+    }
+    true
 }

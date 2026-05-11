@@ -94,7 +94,3 @@ pub const KEYBINDINGS: &[KeybindingInfo] = &[
         description: "Approve, deny, or change approval mode in the tool prompt.",
     },
 ];
-
-pub fn footer_hint() -> &'static str {
-    "Enter send/approve | F2 cycle mode | Tab complete | Ctrl+K palette | Ctrl+R sessions | F1/? help"
-}

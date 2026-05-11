@@ -115,7 +115,7 @@ impl InputBuffer {
     }
 
     pub fn line_count(&self) -> usize {
-        self.text.lines().count().max(1)
+        self.text.chars().filter(|ch| *ch == '\n').count() + 1
     }
 
     pub fn cursor_line_col(&self) -> (usize, usize) {
@@ -194,5 +194,12 @@ mod tests {
         let mut buffer = InputBuffer::from("alpha beta");
         buffer.replace_char_range(6, 10, "gamma");
         assert_eq!(buffer.as_str(), "alpha gamma");
+    }
+
+    #[test]
+    fn counts_trailing_empty_line() {
+        let buffer = InputBuffer::from("one\n");
+        assert_eq!(buffer.line_count(), 2);
+        assert_eq!(buffer.cursor_line_col(), (1, 0));
     }
 }

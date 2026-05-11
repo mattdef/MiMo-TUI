@@ -133,12 +133,12 @@ impl BackgroundShell {
             .stdout_buffer
             .lock()
             .map(|data| String::from_utf8_lossy(&data).to_string())
-            .unwrap_or_default();
+            .unwrap_or_else(|poison| String::from_utf8_lossy(&poison.into_inner()).to_string());
         let stderr = self
             .stderr_buffer
             .lock()
             .map(|data| String::from_utf8_lossy(&data).to_string())
-            .unwrap_or_default();
+            .unwrap_or_else(|poison| String::from_utf8_lossy(&poison.into_inner()).to_string());
         (stdout, stderr)
     }
 
@@ -333,12 +333,12 @@ impl ShellManager {
                     .stdout_buffer
                     .lock()
                     .map(|data| data.len() > shell.stdout_cursor)
-                    .unwrap_or(false)
+                    .unwrap_or_else(|poison| poison.into_inner().len() > shell.stdout_cursor)
                     || shell
                         .stderr_buffer
                         .lock()
                         .map(|data| data.len() > shell.stderr_cursor)
-                        .unwrap_or(false);
+                        .unwrap_or_else(|poison| poison.into_inner().len() > shell.stderr_cursor);
                 if has_new_output || Instant::now() >= deadline {
                     break;
                 }
@@ -391,6 +391,7 @@ impl ShellManager {
     }
 
     pub fn list_jobs(&mut self) -> Result<Vec<ShellJobSnapshot>> {
+        self.prune_completed();
         let ids = self.processes.keys().cloned().collect::<Vec<_>>();
         let mut jobs = Vec::with_capacity(ids.len());
         for id in ids {
@@ -400,6 +401,11 @@ impl ShellManager {
             }
         }
         Ok(jobs)
+    }
+
+    fn prune_completed(&mut self) {
+        self.processes
+            .retain(|_, shell| shell.status == ShellStatus::Running);
     }
 
     fn spawn_background(
@@ -845,9 +851,7 @@ fn tail(text: &str, max_chars: usize) -> String {
 }
 
 fn take_buffer_delta(buffer: &Arc<Mutex<Vec<u8>>>, cursor: &mut usize) -> Vec<u8> {
-    let Ok(data) = buffer.lock() else {
-        return Vec::new();
-    };
+    let data = buffer.lock().unwrap_or_else(|poison| poison.into_inner());
     let delta = data.get(*cursor..).unwrap_or_default().to_vec();
     *cursor = data.len();
     delta
@@ -863,13 +867,11 @@ type SpawnedProcess = (
 );
 
 fn collect_locked_output(buffer: &Arc<Mutex<Vec<u8>>>) -> String {
-    String::from_utf8_lossy(
-        &buffer
-            .lock()
-            .map(|data| data.clone())
-            .unwrap_or_default(),
-    )
-    .to_string()
+    let data = buffer
+        .lock()
+        .map(|data| data.clone())
+        .unwrap_or_else(|poison| (*poison.into_inner()).clone());
+    String::from_utf8_lossy(&data).to_string()
 }
 
 fn spawn_command(command: &str, working_dir: &Path) -> Result<SpawnedProcess> {

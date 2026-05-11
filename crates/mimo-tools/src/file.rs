@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -197,7 +198,7 @@ impl ToolSpec for WriteFileTool {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        fs::write(&resolved, content)
+        write_file_safe(&resolved, content)
             .with_context(|| format!("failed to write {}", resolved.display()))?;
 
         let display = relative_display(&context.workspace_root, &resolved);
@@ -276,7 +277,7 @@ impl ToolSpec for EditFileTool {
         }
 
         let updated = existing.replace(search, replace);
-        fs::write(&resolved, &updated)
+        write_file_safe(&resolved, &updated)
             .with_context(|| format!("failed to write {}", resolved.display()))?;
 
         let display = relative_display(&context.workspace_root, &resolved);
@@ -292,6 +293,22 @@ impl ToolSpec for EditFileTool {
             format!("Edited {} ({count} replacements)", display),
         ))
     }
+}
+
+fn write_file_safe(path: &std::path::Path, content: &str) -> Result<()> {
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = opts
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    file.write_all(content.as_bytes())?;
+    file.flush()?;
+    Ok(())
 }
 
 fn render_diff(path: &str, before: &str, after: &str) -> String {

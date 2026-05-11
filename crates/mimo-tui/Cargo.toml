@@ -7,7 +7,6 @@ edition.workspace = true
 anyhow.workspace = true
 crossterm.workspace = true
 dirs.workspace = true
-libc.workspace = true
 mimo-agent = { path = "../mimo-agent" }
 mimo-client = { path = "../mimo-client" }
 mimo-config = { path = "../mimo-config" }

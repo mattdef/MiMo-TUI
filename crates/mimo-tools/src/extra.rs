@@ -19,6 +19,7 @@ use super::{
 static HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| {
     Client::builder()
         .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::limited(3))
         .build()
         .expect("failed to build shared HTTP client")
 });
@@ -422,6 +423,11 @@ impl ToolSpec for WebFetchTool {
         if !matches!(parsed.scheme(), "http" | "https") {
             bail!("only http(s) URLs are supported");
         }
+        if let Some(host) = parsed.host_str() {
+            if !is_allowed_web_fetch_host(host) {
+                bail!("internal/private hosts are not allowed: {host}");
+            }
+        }
         let max_chars = bounded_usize(&input, "max_chars", 12_000, 50_000);
         let response = HTTP_CLIENT
             .get(parsed.clone())
@@ -488,7 +494,7 @@ impl ToolSpec for ApplyPatchTool {
             &["apply", "--stat", "--summary", "--whitespace=nowarn", "-"],
             patch,
         )
-        .unwrap_or_else(|_| "Patch applied successfully.".to_string());
+        .context("patch preview failed; refusing to apply broken or inapplicable patch")?;
         run_command_with_stdin(
             context.workspace_root.as_path(),
             "git",
@@ -894,6 +900,22 @@ fn bounded_usize(input: &Value, field: &str, default: usize, upper_bound: usize)
         .map(|value| value as usize)
         .unwrap_or(default)
         .clamp(1, upper_bound)
+}
+
+fn is_allowed_web_fetch_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return false;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return !ip.is_loopback()
+            && !ip.is_unspecified()
+            && !ip.is_multicast()
+            && match ip {
+                std::net::IpAddr::V4(v4) => !v4.is_private() && !v4.is_link_local(),
+                std::net::IpAddr::V6(_) => true,
+            };
+    }
+    true
 }
 
 fn summarize_path(path: &Path, max_depth: usize, max_entries: usize) -> Result<String> {
