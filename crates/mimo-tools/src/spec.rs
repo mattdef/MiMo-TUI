@@ -1,4 +1,10 @@
-use std::path::{Component, Path, PathBuf};
+use std::{
+    path::{Component, Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -70,6 +76,7 @@ pub struct ToolContext {
     pub workspace_root: PathBuf,
     pub shell_manager: SharedShellManager,
     pub workspace_history: SharedWorkspaceHistory,
+    pub(crate) cancellation: CancellationFlag,
 }
 
 impl ToolContext {
@@ -78,8 +85,26 @@ impl ToolContext {
         Self {
             shell_manager: new_shared_shell_manager(workspace_root.clone()),
             workspace_history: new_shared_workspace_history(),
+            cancellation: CancellationFlag::default(),
             workspace_root,
         }
+    }
+
+    pub fn child_operation(&self) -> Self {
+        Self {
+            workspace_root: self.workspace_root.clone(),
+            shell_manager: Arc::clone(&self.shell_manager),
+            workspace_history: Arc::clone(&self.workspace_history),
+            cancellation: CancellationFlag::default(),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
     }
 
     pub fn resolve_path(&self, raw: &str) -> Result<PathBuf> {
@@ -170,28 +195,96 @@ impl ToolContext {
             }
         };
 
-        for file in &snapshot.files {
-            let resolved = self.resolve_path(&file.path)?;
-            match &file.previous_content {
-                Some(content) => {
-                    if let Some(parent) = resolved.parent() {
-                        std::fs::create_dir_all(parent)
-                            .with_context(|| format!("failed to create {}", parent.display()))?;
-                    }
-                    std::fs::write(&resolved, content)
-                        .with_context(|| format!("failed to restore {}", resolved.display()))?;
-                }
-                None => {
-                    if resolved.exists() {
-                        std::fs::remove_file(&resolved)
-                            .with_context(|| format!("failed to remove {}", resolved.display()))?;
-                    }
-                }
+        let restore_targets = snapshot
+            .files
+            .iter()
+            .map(|file| {
+                let resolved = self.resolve_path(&file.path)?;
+                let current_content = if resolved.exists() {
+                    Some(std::fs::read_to_string(&resolved).with_context(|| {
+                        format!("failed to read current {}", resolved.display())
+                    })?)
+                } else {
+                    None
+                };
+                Ok(RestoreTarget {
+                    path: file.path.clone(),
+                    resolved,
+                    target_content: file.previous_content.clone(),
+                    current_content,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut applied = Vec::with_capacity(restore_targets.len());
+        for target in &restore_targets {
+            if let Err(error) = apply_restore_target(target) {
+                rollback_restore_targets(&applied)
+                    .with_context(|| format!("failed to rollback restore after: {error}"))?;
+                return Err(error);
             }
+            applied.push(target.clone());
         }
 
         Ok(snapshot)
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CancellationFlag {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellationFlag {
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RestoreTarget {
+    path: String,
+    resolved: PathBuf,
+    target_content: Option<String>,
+    current_content: Option<String>,
+}
+
+fn apply_restore_target(target: &RestoreTarget) -> Result<()> {
+    match &target.target_content {
+        Some(content) => {
+            if let Some(parent) = target.resolved.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+            std::fs::write(&target.resolved, content)
+                .with_context(|| format!("failed to restore {}", target.resolved.display()))?;
+        }
+        None => {
+            if target.resolved.exists() {
+                std::fs::remove_file(&target.resolved)
+                    .with_context(|| format!("failed to remove {}", target.resolved.display()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rollback_restore_targets(applied: &[RestoreTarget]) -> Result<()> {
+    for target in applied.iter().rev() {
+        let rollback_target = RestoreTarget {
+            path: target.path.clone(),
+            resolved: target.resolved.clone(),
+            target_content: target.current_content.clone(),
+            current_content: None,
+        };
+        apply_restore_target(&rollback_target)
+            .with_context(|| format!("failed to rollback {}", target.resolved.display()))?;
+    }
+    Ok(())
 }
 
 fn normalize_path(path: &Path) -> PathBuf {

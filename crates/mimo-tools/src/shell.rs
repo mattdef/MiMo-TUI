@@ -15,6 +15,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::spec::CancellationFlag;
+
 use super::{ApprovalRequirement, ToolContext, ToolKind, ToolResult, ToolSpec};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -211,13 +213,14 @@ impl ShellManager {
         }
     }
 
-    pub fn execute(
+    pub(crate) fn execute(
         &mut self,
         command: &str,
         working_dir: Option<&Path>,
         timeout_ms: u64,
         background: bool,
         stdin: Option<&str>,
+        cancellation: Option<CancellationFlag>,
     ) -> Result<ShellResult> {
         let work_dir = working_dir
             .map(PathBuf::from)
@@ -303,6 +306,39 @@ impl ShellManager {
                 return Ok(ShellResult {
                     task_id: None,
                     status: ShellStatus::TimedOut,
+                    exit_code: status.and_then(|exit| exit.code()),
+                    stdout,
+                    stderr,
+                    duration_ms: u64::try_from(started_at.elapsed().as_millis())
+                        .unwrap_or(u64::MAX),
+                });
+            }
+
+            if cancellation
+                .as_ref()
+                .is_some_and(CancellationFlag::is_cancelled)
+            {
+                kill_child_process(&mut child).context("failed to kill canceled process")?;
+                let status = child.wait().ok();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                let stdout = String::from_utf8_lossy(
+                    &stdout_buffer
+                        .lock()
+                        .map(|data| data.clone())
+                        .unwrap_or_default(),
+                )
+                .to_string();
+                let stderr = String::from_utf8_lossy(
+                    &stderr_buffer
+                        .lock()
+                        .map(|data| data.clone())
+                        .unwrap_or_default(),
+                )
+                .to_string();
+                return Ok(ShellResult {
+                    task_id: None,
+                    status: ShellStatus::Killed,
                     exit_code: status.and_then(|exit| exit.code()),
                     stdout,
                     stderr,
@@ -542,7 +578,14 @@ impl ToolSpec for ExecShellTool {
             .shell_manager
             .lock()
             .map_err(|_| anyhow!("shell manager lock poisoned"))?
-            .execute(command, cwd.as_deref(), timeout_ms, background, stdin)?;
+            .execute(
+                command,
+                cwd.as_deref(),
+                timeout_ms,
+                background,
+                stdin,
+                Some(context.cancellation.clone()),
+            )?;
 
         Ok(ToolResult::new(
             render_shell_result(&result, timeout_ms),
@@ -615,7 +658,7 @@ impl ToolSpec for ShellWaitTool {
     }
 
     fn approval_requirement(&self) -> ApprovalRequirement {
-        ApprovalRequirement::Auto
+        ApprovalRequirement::Prompt
     }
 }
 
@@ -956,6 +999,8 @@ fn kill_child_process(child: &mut Child) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use serde_json::json;
 
     use super::{ExecShellTool, ShellCancelTool, ShellInteractTool, ShellWaitTool};
@@ -1031,5 +1076,30 @@ mod tests {
             .execute(json!({ "task_id": task_id }), &context)
             .expect("cancel result");
         assert!(canceled.summary.contains("canceled") || canceled.summary.contains("Cancel"));
+    }
+
+    #[test]
+    fn cancels_foreground_shell_command() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let context = ToolContext::new(workspace.path());
+        let cancellable = context.child_operation();
+        let cancel_handle = cancellable.clone();
+        #[cfg(windows)]
+        let command = "ping -n 10 127.0.0.1 > NUL";
+        #[cfg(not(windows))]
+        let command = "sleep 10";
+
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            cancel_handle.cancel();
+        });
+
+        let result = ExecShellTool
+            .execute(
+                json!({ "command": command, "timeout_ms": 5_000 }),
+                &cancellable,
+            )
+            .expect("shell result");
+        assert!(result.summary.contains("canceled"));
     }
 }

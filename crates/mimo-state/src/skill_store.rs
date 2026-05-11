@@ -2,6 +2,7 @@ use std::{
     ffi::OsStr,
     fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -48,7 +49,11 @@ pub fn install_skill(config: &AppConfig, spec: &str) -> Result<InstalledSkill> {
     }
 
     let (content, fallback_name) = if spec.starts_with("http://") || spec.starts_with("https://") {
-        let response = Client::new()
+        let response = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(20))
+            .build()
+            .context("failed to create HTTP client")?
             .get(spec)
             .send()
             .with_context(|| format!("failed to fetch {spec}"))?

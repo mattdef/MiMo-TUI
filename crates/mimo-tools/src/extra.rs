@@ -610,7 +610,14 @@ fn run_named_shell_command(
         .shell_manager
         .lock()
         .map_err(|_| anyhow!("shell manager is unavailable"))?
-        .execute(&command, Some(&cwd), timeout_ms, background, None)?;
+        .execute(
+            &command,
+            Some(&cwd),
+            timeout_ms,
+            background,
+            None,
+            Some(context.cancellation.clone()),
+        )?;
     Ok(ToolResult::new(
         shell_result_output(&result),
         format!("Ran {label} command"),

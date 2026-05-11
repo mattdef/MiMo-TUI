@@ -51,6 +51,7 @@ pub enum AppEvent {
     ModelsLoaded(Result<Vec<String>, String>),
     Status(String),
     DiagnosticsFinished(Result<diagnostics_store::DiagnosticsSnapshot, String>),
+    SkillInstalled(Result<skill_store::InstalledSkill, String>),
     ApprovalRequested(ToolRequest, oneshot::Sender<bool>),
     ToolStarted(ToolRequest),
     ToolFinished(ToolRequest),
@@ -190,10 +191,13 @@ pub struct App {
     message_pager: MessagePagerState,
     inspector_browser: InspectorBrowserState,
     discovered_models: Vec<String>,
+    installed_skills_cache: Vec<skill_store::InstalledSkill>,
     last_prompt: Option<String>,
     mode: AppMode,
     stream_task: Option<JoinHandle<()>>,
+    stream_context: Option<ToolContext>,
     model_load_task: Option<JoinHandle<()>>,
+    skill_install_task: Option<JoinHandle<()>>,
     draft_history: Vec<String>,
     draft_stash: Vec<String>,
     attachments: Vec<FileAttachment>,
@@ -205,7 +209,9 @@ pub struct App {
     approval_mode_shared: Arc<Mutex<ApprovalMode>>,
     slash_menu_selected: usize,
     event_tx: Option<UnboundedSender<AppEvent>>,
+    mcp_servers_cache: Vec<mcp_store::McpServerConfig>,
     tasks: Vec<task_store::SavedTask>,
+    task_contexts: BTreeMap<String, ToolContext>,
     task_handles: BTreeMap<String, JoinHandle<()>>,
     diagnostics_task: Option<JoinHandle<()>>,
 }
@@ -218,6 +224,9 @@ impl App {
         let approval_mode_shared = Arc::new(Mutex::new(mode_approval_mode(mode)));
         let tasks = task_store::load_tasks(&config).unwrap_or_default();
         let diagnostics = diagnostics_store::load_snapshot(&config).unwrap_or_default();
+        let installed_skills_cache =
+            skill_store::list_installed_skills(&config).unwrap_or_default();
+        let mcp_servers_cache = mcp_store::load_servers(&config).unwrap_or_default();
         let _ = task_store::save_tasks(&config, &tasks);
         let status = if config.api_key.is_some() {
             "Ready".to_string()
@@ -245,10 +254,13 @@ impl App {
             message_pager: MessagePagerState::default(),
             inspector_browser: InspectorBrowserState::default(),
             discovered_models: Vec::new(),
+            installed_skills_cache,
             last_prompt: None,
             mode,
             stream_task: None,
+            stream_context: None,
             model_load_task: None,
+            skill_install_task: None,
             draft_history: Vec::new(),
             draft_stash: Vec::new(),
             attachments: Vec::new(),
@@ -263,7 +275,9 @@ impl App {
             approval_mode_shared,
             slash_menu_selected: 0,
             event_tx: None,
+            mcp_servers_cache,
             tasks,
+            task_contexts: BTreeMap::new(),
             task_handles: BTreeMap::new(),
             diagnostics_task: None,
         }
@@ -469,6 +483,7 @@ impl App {
             }
             AppEvent::Finished(Ok(())) => {
                 self.stream_task = None;
+                self.stream_context = None;
                 self.streaming = false;
                 self.assistant_index = None;
                 self.status = "Ready".to_string();
@@ -476,6 +491,7 @@ impl App {
             }
             AppEvent::Finished(Err(error)) => {
                 self.stream_task = None;
+                self.stream_context = None;
                 self.streaming = false;
                 if let Some(index) = self.assistant_index
                     && let Some(message) = self.messages.get_mut(index)
@@ -517,6 +533,19 @@ impl App {
                     }
                     Err(error) => {
                         self.status = format!("Diagnostics failed: {error}");
+                    }
+                }
+            }
+            AppEvent::SkillInstalled(result) => {
+                self.skill_install_task = None;
+                match result {
+                    Ok(skill) => {
+                        self.refresh_skill_cache();
+                        self.status =
+                            format!("Installed skill {} at {}", skill.name, skill.path.display());
+                    }
+                    Err(error) => {
+                        self.status = format!("Skill install failed: {error}");
                     }
                 }
             }
@@ -579,6 +608,7 @@ impl App {
             }
             AppEvent::TaskFinished { id, result } => {
                 self.task_handles.remove(&id);
+                self.task_contexts.remove(&id);
                 let mut next_status = None;
                 if let Some(task) = self.find_task_mut(&id) {
                     task.updated_at_epoch = task_store::now_epoch();
@@ -1275,9 +1305,9 @@ impl App {
                 let last = command_palette::filtered_entries(
                     self.command_palette.filter.trim(),
                     self.mode,
-                    &self.installed_skills(),
+                    self.installed_skills(),
                     &self.active_skills,
-                    &self.mcp_servers(),
+                    self.mcp_servers(),
                 )
                 .len()
                 .saturating_sub(1);
@@ -1498,9 +1528,10 @@ impl App {
         };
         self.scroll_to_bottom();
         self.attachments.clear();
-        let tool_context = self.tool_context.clone();
+        let tool_context = self.tool_context.child_operation();
         let tool_registry = self.tool_registry.clone();
         let approval_mode = Arc::clone(&self.approval_mode_shared);
+        self.stream_context = Some(tool_context.clone());
 
         let stream_task = tokio::spawn(async move {
             let result = agent::run_agent_turn(
@@ -2129,8 +2160,7 @@ impl App {
                 }
             }
             SkillCommand::Install(spec) => {
-                let skill = skill_store::install_skill(&self.config, &spec)?;
-                self.status = format!("Installed skill {} at {}", skill.name, skill.path.display());
+                self.start_skill_install(spec)?;
             }
             SkillCommand::Show(name) => {
                 let skill = skill_store::load_skill(&self.config, &name)?;
@@ -2147,6 +2177,7 @@ impl App {
                 let normalized = skill_store::normalize_skill_name(&name);
                 let path = skill_store::uninstall_skill(&self.config, &normalized)?;
                 self.active_skills.retain(|skill| skill != &normalized);
+                self.refresh_skill_cache();
                 self.status = format!("Removed skill {} from {}", normalized, path.display());
             }
         }
@@ -2176,43 +2207,52 @@ impl App {
                 args,
             } => {
                 let server = mcp_store::add_stdio_server(&self.config, &name, &command, args)?;
+                self.refresh_mcp_cache();
                 self.status = format!("Saved MCP server {} ({})", server.name, server.summary());
             }
             McpCommand::AddHttp { name, url } => {
                 let server = mcp_store::add_http_server(&self.config, &name, &url)?;
+                self.refresh_mcp_cache();
                 self.status = format!("Saved MCP server {} ({})", server.name, server.summary());
             }
             McpCommand::Enable(name) => {
                 let server = mcp_store::set_enabled(&self.config, &name, true)?;
+                self.refresh_mcp_cache();
                 self.status = format!("Enabled MCP server {}", server.name);
             }
             McpCommand::Disable(name) => {
                 let server = mcp_store::set_enabled(&self.config, &name, false)?;
+                self.refresh_mcp_cache();
                 self.status = format!("Disabled MCP server {}", server.name);
             }
             McpCommand::Remove(name) => {
                 let server = mcp_store::remove_server(&self.config, &name)?;
+                self.refresh_mcp_cache();
                 self.status = format!("Removed MCP server {}", server.name);
             }
         }
         Ok(())
     }
 
-    fn installed_skills(&self) -> Vec<skill_store::InstalledSkill> {
-        skill_store::list_installed_skills(&self.config).unwrap_or_default()
+    fn refresh_skill_cache(&mut self) {
+        self.installed_skills_cache =
+            skill_store::list_installed_skills(&self.config).unwrap_or_default();
+    }
+
+    fn installed_skills(&self) -> &[skill_store::InstalledSkill] {
+        &self.installed_skills_cache
     }
 
     fn skills_summary(&self) -> Result<String> {
-        let skills = skill_store::list_installed_skills(&self.config)?;
         let mut output = format!(
             "Skills\n\nDirectory: {}\n",
             skill_store::skills_path(&self.config).display()
         );
-        if skills.is_empty() {
+        if self.installed_skills().is_empty() {
             output.push_str("\nNo installed skills.\n");
         } else {
             output.push('\n');
-            for skill in skills {
+            for skill in self.installed_skills() {
                 let active = if self.active_skills.iter().any(|name| name == &skill.name) {
                     "active"
                 } else {
@@ -2230,21 +2270,24 @@ impl App {
         Ok(output.trim_end().to_string())
     }
 
-    fn mcp_servers(&self) -> Vec<mcp_store::McpServerConfig> {
-        mcp_store::load_servers(&self.config).unwrap_or_default()
+    fn refresh_mcp_cache(&mut self) {
+        self.mcp_servers_cache = mcp_store::load_servers(&self.config).unwrap_or_default();
+    }
+
+    fn mcp_servers(&self) -> &[mcp_store::McpServerConfig] {
+        &self.mcp_servers_cache
     }
 
     fn mcp_summary(&self) -> String {
-        let servers = self.mcp_servers();
         let mut output = format!(
             "MCP servers\n\nFile: {}\n",
             mcp_store::mcp_servers_path(&self.config).display()
         );
-        if servers.is_empty() {
+        if self.mcp_servers().is_empty() {
             output.push_str("\nNo configured MCP servers.\n");
         } else {
             output.push('\n');
-            for server in servers {
+            for server in self.mcp_servers() {
                 output.push_str(&format!(
                     "- {} | {} | {} | {}\n",
                     server.name,
@@ -2378,6 +2421,9 @@ impl App {
                 self.status = format!("Background task {id} shown");
             }
             TaskCommand::Cancel(id) => {
+                if let Some(context) = self.task_contexts.remove(&id) {
+                    context.cancel();
+                }
                 if let Some(handle) = self.task_handles.remove(&id) {
                     handle.abort();
                 }
@@ -2477,8 +2523,9 @@ impl App {
         let mode = self.mode;
         let config = self.config.clone();
         let request_messages = self.task_request_messages(prompt.clone(), mode)?;
-        let tool_context = self.tool_context.clone();
+        let tool_context = self.tool_context.child_operation();
         let tool_registry = self.tool_registry.clone();
+        self.task_contexts.insert(id.clone(), tool_context.clone());
 
         let task_id = id.clone();
         let task_handle = tokio::spawn(async move {
@@ -2631,8 +2678,12 @@ impl App {
 
     fn cancel_active_stream(&mut self) {
         if let Some(stream_task) = self.stream_task.take() {
+            if let Some(tool_context) = &self.stream_context {
+                tool_context.cancel();
+            }
             stream_task.abort();
         }
+        self.stream_context = None;
         self.streaming = false;
         if let Some(index) = self.assistant_index
             && let Some(message) = self.messages.get_mut(index)
@@ -2744,9 +2795,9 @@ impl App {
         command_palette::filtered_entries(
             self.command_palette.filter.trim(),
             self.mode,
-            &self.installed_skills(),
+            self.installed_skills(),
             &self.active_skills,
-            &self.mcp_servers(),
+            self.mcp_servers(),
         )
     }
 
@@ -3283,6 +3334,27 @@ impl App {
                     .count()
             })
             .unwrap_or(0)
+    }
+
+    fn start_skill_install(&mut self, spec: String) -> Result<()> {
+        if self.skill_install_task.is_some() {
+            self.status = "A skill install is already running".to_string();
+            return Ok(());
+        }
+        let Some(event_tx) = self.event_tx.clone() else {
+            bail!("event channel is unavailable");
+        };
+        let config = self.config.clone();
+        self.status = format!("Installing skill from {spec}...");
+        self.skill_install_task = Some(tokio::spawn(async move {
+            let result =
+                tokio::task::spawn_blocking(move || skill_store::install_skill(&config, &spec))
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result.map_err(|error| error.to_string()));
+            let _ = event_tx.send(AppEvent::SkillInstalled(result));
+        }));
+        Ok(())
     }
 
     fn draft_browser_items(&self) -> &Vec<String> {
