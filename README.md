@@ -5,13 +5,13 @@ MiMo TUI is a Rust terminal client specialised for Xiaomi MiMo models. It uses a
 ## Features
 
 - Ratatui/crossterm terminal interface with streaming assistant responses.
-- OpenAI-compatible tool loop with workspace-bound `list_dir`, `read_file`, `write_file`, `edit_file`, and shell tools.
+- OpenAI-compatible tool loop with workspace-bound file, search, git, web, patch, project-summary, diagnostics/test, and shell tools.
 - Approval prompt for shell execution and file writes, plus shared background shell jobs across turns.
 - `ask`, `doctor`, `models`, and `sessions` CLI commands outside the TUI.
 - Searchable help overlay, slash-command registry, slash-menu completion, command palette, multiline input editor, and bounded transcript scrolling.
 - Draft stash/history recovery (`Ctrl+S`, `Alt+R`), last-message pager (`Ctrl+L`), and interactive model/session pickers.
 - Local session save/load/export with persisted plan checklist and attached workspace context.
-- Interactive `/config`, `/status`, `/models`, `/retry`, `/mode`, `/plan`, and `/context` commands.
+- Interactive `/config`, `/status`, `/models`, `/retry`, `/mode`, `/plan`, `/jobs`, `/note`, `/memory`, `/recall`, `/compact`, and `/context` commands.
 - Configurable MiMo API key, base URL, model, temperature, and system prompt, with doctor output that shows the winning config source for each value.
 - Defaults for `https://api.xiaomimimo.com/v1` and `mimo-v2-flash`, with bundled model suggestions for `mimo-v2-flash`, `mimo-v2.5`, and `mimo-v2.5-pro`.
 - `/models` tries to refresh the picker from the MiMo `/models` API and falls back to the bundled suggestions when the catalog cannot be loaded.
@@ -75,14 +75,18 @@ Supported environment variables:
 - `/help`: open command help
 - `/clear`: clear conversation history
 - `/exit` / `/quit` / `/q`: quit
-- `/model [id]`: show or switch the current MiMo model
+- `/model [id|auto]`: show or switch the current MiMo model, or enable local auto-routing
 - `/models`: open the MiMo model picker and refresh it from the API when available
 - `/save` / `/load` / `/sessions` / `/export`: manage local sessions
 - `/config`: inspect or update local config
 - `/status`: show runtime status
 - `/retry`: resend the last prompt
-- `/mode [chat|plan]`: switch between normal and planning behavior
+- `/mode [agent|plan|yolo]`: switch between prompted, read-only, and auto-approved behavior
+- `F2` or `Ctrl+Tab`: cycle between plan, agent, and yolo modes
 - `/plan [show|add <text>|done <n>|undo <n>|remove <n>|clear]`: manage the local planning checklist
+- `/jobs [list|show <id>|poll <id>|wait <id>|stdin <id> <input>|cancel <id>]`: inspect and control background shell jobs
+- `/note <text>` / `/memory [show|path|clear|help]`: manage persistent user memory
+- `/recall <query>` / `/compact`: search memory + transcript or compact older messages into a summary
 - `/context`: inject a read-only workspace summary into the conversation
 - `Tab`: complete a slash command from the slash menu
 - `@path` then `Tab`: attach a file or directory to the next prompt
@@ -139,9 +143,21 @@ By default, session JSON files and Markdown exports are stored under:
 
 `/save` creates a new JSON snapshot, `/load` restores the most recent saved session when no path is provided, `/sessions` opens an interactive picker, and `/export` writes a Markdown transcript.
 
-## Plan mode
+## Modes
 
-`/mode plan` now opens a dedicated plan side panel. Use `/plan add <text>` to create checklist items, then `/plan done <n>` or `/plan undo <n>` as work progresses. The checklist is included in saved sessions and added back to the request context while plan mode is active.
+- `plan` keeps the conversation read-only and opens the checklist side panel.
+- `agent` is the default interactive mode and prompts before mutating tool calls.
+- `yolo` auto-approves tool execution for faster autonomous runs.
+
+`/mode plan` opens a dedicated plan side panel. Use `/plan add <text>` to create checklist items, then `/plan done <n>` or `/plan undo <n>` as work progresses. The checklist is included in saved sessions and added back to the request context while plan mode is active.
+
+## Memory and compaction
+
+Use `/note <text>` to save persistent MiMo memory notes under the local config directory. `/memory show` displays the current note file, `/memory clear` resets it, `/recall <query>` searches both memory and the current transcript, and `/compact` replaces older transcript messages with a local summary to keep the active context tighter.
+
+## Auto model routing
+
+Set `/model auto` to let MiMo-TUI choose a concrete MiMo model per turn. Short requests stay on `mimo-v2-flash`; larger, code-heavy, debugging, review, or planning turns are routed locally to `mimo-v2.5` or `mimo-v2.5-pro` before the request is sent.
 
 ## Architecture snapshot
 

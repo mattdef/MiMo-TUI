@@ -17,6 +17,10 @@ pub enum ApprovalRequirement {
 pub enum ToolKind {
     FileRead,
     FileWrite,
+    Search,
+    Git,
+    Network,
+    Project,
     Shell,
 }
 
@@ -44,8 +48,12 @@ pub trait ToolSpec: Send + Sync {
 
     fn approval_requirement(&self) -> ApprovalRequirement {
         match self.kind() {
-            ToolKind::FileRead => ApprovalRequirement::Auto,
-            ToolKind::FileWrite | ToolKind::Shell => ApprovalRequirement::Prompt,
+            ToolKind::FileRead | ToolKind::Search | ToolKind::Git | ToolKind::Project => {
+                ApprovalRequirement::Auto
+            }
+            ToolKind::FileWrite | ToolKind::Network | ToolKind::Shell => {
+                ApprovalRequirement::Prompt
+            }
         }
     }
 

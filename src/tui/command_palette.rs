@@ -58,17 +58,31 @@ pub fn filtered_entries(filter: &str, mode: AppMode) -> Vec<PaletteEntry> {
             action: PaletteAction::BrowseDraftStash,
         },
         PaletteEntry {
-            label: if mode == AppMode::Plan {
-                "Switch to chat mode".to_string()
+            label: "Switch to plan mode".to_string(),
+            hint: if mode == AppMode::Plan {
+                "Current mode".to_string()
             } else {
-                "Switch to plan mode".to_string()
+                "Read-only planning mode".to_string()
             },
-            hint: "Toggle the active MiMo mode".to_string(),
-            action: PaletteAction::SwitchMode(if mode == AppMode::Plan {
-                AppMode::Chat
+            action: PaletteAction::SwitchMode(AppMode::Plan),
+        },
+        PaletteEntry {
+            label: "Switch to agent mode".to_string(),
+            hint: if mode == AppMode::Agent {
+                "Current mode".to_string()
             } else {
-                AppMode::Plan
-            }),
+                "Prompt for mutating tool approvals".to_string()
+            },
+            action: PaletteAction::SwitchMode(AppMode::Agent),
+        },
+        PaletteEntry {
+            label: "Switch to yolo mode".to_string(),
+            hint: if mode == AppMode::Yolo {
+                "Current mode".to_string()
+            } else {
+                "Auto-approve tool execution".to_string()
+            },
+            action: PaletteAction::SwitchMode(AppMode::Yolo),
         },
     ];
 

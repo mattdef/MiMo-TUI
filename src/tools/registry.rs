@@ -7,8 +7,10 @@ use serde_json::Value;
 use crate::client::ToolCall;
 
 use super::{
-    EditFileTool, ExecShellTool, ListDirTool, ReadFileTool, ShellCancelTool, ShellInteractTool,
-    ShellWaitTool, ToolContext, ToolKind, ToolResult, ToolSpec, WriteFileTool,
+    ApplyPatchTool, EditFileTool, ExecShellTool, FindPathsTool, GitDiffTool, GitLogTool,
+    GitStatusTool, ListDirTool, ProjectSummaryTool, ReadFileTool, RunDiagnosticsTool, RunTestsTool,
+    SearchTextTool, ShellCancelTool, ShellInteractTool, ShellWaitTool, ToolContext, ToolKind,
+    ToolResult, ToolSpec, WebFetchTool, WriteFileTool,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -105,6 +107,37 @@ impl ToolRegistryBuilder {
             .with_tool(Arc::new(ShellWaitTool))
             .with_tool(Arc::new(ShellInteractTool))
             .with_tool(Arc::new(ShellCancelTool))
+    }
+
+    pub fn with_search_tools(self) -> Self {
+        self.with_tool(Arc::new(FindPathsTool))
+            .with_tool(Arc::new(SearchTextTool))
+    }
+
+    pub fn with_git_tools(self) -> Self {
+        self.with_tool(Arc::new(GitStatusTool))
+            .with_tool(Arc::new(GitDiffTool))
+            .with_tool(Arc::new(GitLogTool))
+    }
+
+    pub fn with_web_tools(self) -> Self {
+        self.with_tool(Arc::new(WebFetchTool))
+    }
+
+    pub fn with_project_tools(self) -> Self {
+        self.with_tool(Arc::new(ProjectSummaryTool))
+    }
+
+    pub fn with_patch_tools(self) -> Self {
+        self.with_tool(Arc::new(ApplyPatchTool))
+    }
+
+    pub fn with_diagnostics_tool(self) -> Self {
+        self.with_tool(Arc::new(RunDiagnosticsTool))
+    }
+
+    pub fn with_test_runner_tool(self) -> Self {
+        self.with_tool(Arc::new(RunTestsTool))
     }
 
     pub fn build(self) -> ToolRegistry {

@@ -4,8 +4,9 @@ use super::keybindings::KEYBINDINGS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModeName {
-    Chat,
+    Agent,
     Plan,
+    Yolo,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -25,6 +26,11 @@ pub enum SlashCommand {
     Context,
     Mode { mode: Option<ModeName> },
     Plan(PlanCommand),
+    Jobs(JobsCommand),
+    Note { text: String },
+    Memory(MemoryCommand),
+    Recall { query: String },
+    Compact,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -45,6 +51,24 @@ pub enum PlanCommand {
     Undo(usize),
     Remove(usize),
     Clear,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryCommand {
+    Show,
+    Path,
+    Clear,
+    Help,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobsCommand {
+    List,
+    Show(String),
+    Poll(String),
+    Wait(String),
+    Stdin { id: String, input: String },
+    Cancel(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,7 +168,7 @@ pub const COMMANDS: &[CommandInfo] = &[
     CommandInfo {
         name: "mode",
         aliases: &[],
-        usage: "/mode [chat|plan]",
+        usage: "/mode [agent|plan|yolo]",
         description: "Show or switch the current MiMo interaction mode.",
     },
     CommandInfo {
@@ -152,6 +176,36 @@ pub const COMMANDS: &[CommandInfo] = &[
         aliases: &[],
         usage: "/plan [show|add <text>|done <n>|undo <n>|remove <n>|clear]",
         description: "Inspect or update the local plan checklist.",
+    },
+    CommandInfo {
+        name: "jobs",
+        aliases: &["job"],
+        usage: "/jobs [list|show <id>|poll <id>|wait <id>|stdin <id> <input>|cancel <id>]",
+        description: "Inspect or control background shell jobs started by tools.",
+    },
+    CommandInfo {
+        name: "note",
+        aliases: &[],
+        usage: "/note <text>",
+        description: "Add a persistent memory note that is injected into later requests.",
+    },
+    CommandInfo {
+        name: "memory",
+        aliases: &[],
+        usage: "/memory [show|path|clear|help]",
+        description: "Inspect or clear the persistent MiMo memory file.",
+    },
+    CommandInfo {
+        name: "recall",
+        aliases: &[],
+        usage: "/recall <query>",
+        description: "Search the current transcript and memory notes for a query.",
+    },
+    CommandInfo {
+        name: "compact",
+        aliases: &[],
+        usage: "/compact",
+        description: "Compact older transcript messages into a local summary.",
     },
 ];
 
@@ -186,6 +240,11 @@ pub fn parse_slash_command(input: &str) -> Result<SlashCommand, CommandParseErro
         "context" => require_no_args(args, SlashCommand::Context, "/context"),
         "mode" => parse_mode_command(args),
         "plan" => parse_plan_command(args),
+        "jobs" | "job" => parse_jobs_command(args),
+        "note" => parse_note_command(args),
+        "memory" => parse_memory_command(args),
+        "recall" => parse_recall_command(args),
+        "compact" => require_no_args(args, SlashCommand::Compact, "/compact"),
         _ => Err(CommandParseError::UnknownCommand(name.to_string())),
     }
 }
@@ -297,9 +356,11 @@ fn parse_mode_command(args: &str) -> Result<SlashCommand, CommandParseError> {
         return Ok(SlashCommand::Mode { mode: None });
     };
     let mode = match value.to_ascii_lowercase().as_str() {
-        "chat" => ModeName::Chat,
         "plan" => ModeName::Plan,
-        _ => return Err(CommandParseError::Usage("/mode [chat|plan]")),
+        "agent" | "chat" | "2" => ModeName::Agent,
+        "yolo" | "3" => ModeName::Yolo,
+        "1" => ModeName::Plan,
+        _ => return Err(CommandParseError::Usage("/mode [agent|plan|yolo]")),
     };
     Ok(SlashCommand::Mode { mode: Some(mode) })
 }
@@ -328,6 +389,72 @@ fn parse_plan_command(args: &str) -> Result<SlashCommand, CommandParseError> {
     };
 
     Ok(SlashCommand::Plan(command))
+}
+
+fn parse_note_command(args: &str) -> Result<SlashCommand, CommandParseError> {
+    let Some(text) = non_empty(args) else {
+        return Err(CommandParseError::Usage("/note <text>"));
+    };
+    Ok(SlashCommand::Note {
+        text: text.to_string(),
+    })
+}
+
+fn parse_jobs_command(args: &str) -> Result<SlashCommand, CommandParseError> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("list") {
+        return Ok(SlashCommand::Jobs(JobsCommand::List));
+    }
+
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let action = parts.next().unwrap_or_default().to_ascii_lowercase();
+    let remainder = parts.next().unwrap_or_default().trim();
+    let command = match action.as_str() {
+        "show" if !remainder.is_empty() => JobsCommand::Show(remainder.to_string()),
+        "poll" if !remainder.is_empty() => JobsCommand::Poll(remainder.to_string()),
+        "wait" if !remainder.is_empty() => JobsCommand::Wait(remainder.to_string()),
+        "cancel" if !remainder.is_empty() => JobsCommand::Cancel(remainder.to_string()),
+        "stdin" => {
+            let mut parts = remainder.splitn(2, char::is_whitespace);
+            let id = parts.next().unwrap_or_default().trim();
+            let input = parts.next().unwrap_or_default();
+            if id.is_empty() || input.is_empty() {
+                return Err(CommandParseError::Usage(
+                    "/jobs [list|show <id>|poll <id>|wait <id>|stdin <id> <input>|cancel <id>]",
+                ));
+            }
+            JobsCommand::Stdin {
+                id: id.to_string(),
+                input: input.to_string(),
+            }
+        }
+        _ => {
+            return Err(CommandParseError::Usage(
+                "/jobs [list|show <id>|poll <id>|wait <id>|stdin <id> <input>|cancel <id>]",
+            ));
+        }
+    };
+    Ok(SlashCommand::Jobs(command))
+}
+
+fn parse_memory_command(args: &str) -> Result<SlashCommand, CommandParseError> {
+    let command = match args.trim().to_ascii_lowercase().as_str() {
+        "" | "show" => MemoryCommand::Show,
+        "path" => MemoryCommand::Path,
+        "clear" => MemoryCommand::Clear,
+        "help" => MemoryCommand::Help,
+        _ => return Err(CommandParseError::Usage("/memory [show|path|clear|help]")),
+    };
+    Ok(SlashCommand::Memory(command))
+}
+
+fn parse_recall_command(args: &str) -> Result<SlashCommand, CommandParseError> {
+    let Some(query) = non_empty(args) else {
+        return Err(CommandParseError::Usage("/recall <query>"));
+    };
+    Ok(SlashCommand::Recall {
+        query: query.to_string(),
+    })
 }
 
 fn command_parts(input: &str) -> Option<(&str, &str)> {
@@ -365,7 +492,8 @@ fn parse_index(value: &str) -> Result<usize, CommandParseError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandParseError, ConfigCommand, ModeName, PlanCommand, SlashCommand, parse_slash_command,
+        CommandParseError, ConfigCommand, JobsCommand, MemoryCommand, ModeName, PlanCommand,
+        SlashCommand, parse_slash_command,
     };
 
     #[test]
@@ -383,6 +511,12 @@ mod tests {
             })
         );
         assert_eq!(
+            parse_slash_command("/mode yolo"),
+            Ok(SlashCommand::Mode {
+                mode: Some(ModeName::Yolo)
+            })
+        );
+        assert_eq!(
             parse_slash_command("/config model mimo-v2-flash"),
             Ok(SlashCommand::Config(ConfigCommand::SetModel(
                 "mimo-v2-flash".to_string()
@@ -394,6 +528,17 @@ mod tests {
                 "Build slash menu".to_string()
             )))
         );
+        assert_eq!(
+            parse_slash_command("/memory path"),
+            Ok(SlashCommand::Memory(MemoryCommand::Path))
+        );
+        assert_eq!(
+            parse_slash_command("/jobs stdin shell-1 y{enter}"),
+            Ok(SlashCommand::Jobs(JobsCommand::Stdin {
+                id: "shell-1".to_string(),
+                input: "y{enter}".to_string()
+            }))
+        );
     }
 
     #[test]
@@ -404,7 +549,7 @@ mod tests {
         );
         assert_eq!(
             parse_slash_command("/mode fast"),
-            Err(CommandParseError::Usage("/mode [chat|plan]"))
+            Err(CommandParseError::Usage("/mode [agent|plan|yolo]"))
         );
     }
 }

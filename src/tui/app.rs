@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
@@ -12,6 +12,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
+use serde_json::to_string_pretty;
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 use tokio::task::JoinHandle;
 
@@ -24,9 +25,13 @@ use crate::{
 
 use super::{
     attachments, command_palette,
-    commands::{self, CommandParseError, ConfigCommand, ModeName, PlanCommand, SlashCommand},
+    commands::{
+        self, CommandParseError, ConfigCommand, JobsCommand, MemoryCommand, ModeName, PlanCommand,
+        SlashCommand,
+    },
     input::InputBuffer,
-    keybindings, markdown, project_context, session_picker, session_store, slash_menu,
+    keybindings, markdown, memory_store, project_context, session_picker, session_store,
+    slash_menu,
     state::{AppMode, FileAttachment, PlanItem},
     tooling::{ApprovalMode, ToolRequest, ToolRuntime, ToolStatus},
 };
@@ -44,8 +49,9 @@ pub enum AppEvent {
 impl From<ModeName> for AppMode {
     fn from(value: ModeName) -> Self {
         match value {
-            ModeName::Chat => Self::Chat,
+            ModeName::Agent => Self::Agent,
             ModeName::Plan => Self::Plan,
+            ModeName::Yolo => Self::Yolo,
         }
     }
 }
@@ -153,9 +159,17 @@ impl App {
         let tool_context = ToolContext::new(workspace_root);
         let tool_registry = ToolRegistryBuilder::new()
             .with_file_tools()
+            .with_search_tools()
+            .with_git_tools()
+            .with_web_tools()
+            .with_project_tools()
+            .with_patch_tools()
+            .with_diagnostics_tool()
+            .with_test_runner_tool()
             .with_shell_tools()
             .build();
-        let approval_mode_shared = Arc::new(Mutex::new(ApprovalMode::Prompt));
+        let mode = AppMode::Agent;
+        let approval_mode_shared = Arc::new(Mutex::new(mode_approval_mode(mode)));
         let status = if config.api_key.is_some() {
             "Ready".to_string()
         } else {
@@ -182,14 +196,17 @@ impl App {
             message_pager: MessagePagerState::default(),
             discovered_models: Vec::new(),
             last_prompt: None,
-            mode: AppMode::Chat,
+            mode,
             stream_task: None,
             model_load_task: None,
             draft_history: Vec::new(),
             draft_stash: Vec::new(),
             attachments: Vec::new(),
             plan_items: Vec::new(),
-            tool_runtime: ToolRuntime::default(),
+            tool_runtime: ToolRuntime {
+                approval_mode: mode_approval_mode(mode),
+                ..ToolRuntime::default()
+            },
             approval_mode_shared,
             slash_menu_selected: 0,
         }
@@ -286,6 +303,10 @@ impl App {
                 }
                 if opens_last_message_pager(key) {
                     self.open_last_message_pager();
+                    return Ok(false);
+                }
+                if toggles_mode_shortcut(key) {
+                    self.toggle_mode();
                     return Ok(false);
                 }
 
@@ -463,6 +484,11 @@ impl App {
             ),
             Span::raw(" | mode: "),
             Span::styled(self.mode.to_string(), Style::default().fg(Color::Blue)),
+            Span::raw(" | approvals: "),
+            Span::styled(
+                approval_mode_label(self.tool_runtime.approval_mode),
+                Style::default().fg(Color::Yellow),
+            ),
             Span::raw(" | model: "),
             Span::styled(&self.config.model, Style::default().fg(Color::Magenta)),
             Span::raw(" | attachments: "),
@@ -539,7 +565,7 @@ impl App {
             lines.push(Line::raw("Use /plan done <n> to mark a step complete."));
             lines.push(Line::raw(""));
             lines.push(Line::styled(
-                "Plan mode stays read-only until you switch back to chat mode.",
+                "Plan mode stays read-only until you switch to agent or yolo mode.",
                 Style::default().fg(Color::DarkGray),
             ));
         } else {
@@ -923,15 +949,15 @@ impl App {
         let kind = match pending.request.kind {
             crate::tools::ToolKind::FileRead => "File read",
             crate::tools::ToolKind::FileWrite => "File write",
+            crate::tools::ToolKind::Search => "Search",
+            crate::tools::ToolKind::Git => "Git",
+            crate::tools::ToolKind::Network => "Network",
+            crate::tools::ToolKind::Project => "Project",
             crate::tools::ToolKind::Shell => "Shell",
         };
-        let mode = match self.tool_runtime.approval_mode {
-            ApprovalMode::Prompt => "prompt",
-            ApprovalMode::ReadOnly => "read-only",
-            ApprovalMode::Auto => "auto",
-        };
+        let mode = approval_mode_label(self.tool_runtime.approval_mode);
         let body = format!(
-            "Kind: {kind}\nTool: {}\nMode: {mode}\n\n{}\n\nEnter/y approve | Esc/n deny | a auto-approve future tools | r deny and switch to read-only mode | p prompt mode",
+            "Kind: {kind}\nTool: {}\nMode: {mode}\n\n{}\n\nEnter/y approve | Esc/n deny | a approve and switch to yolo mode | r deny and switch to plan mode | p switch to agent mode",
             pending.request.name, pending.request.summary
         );
         frame.render_widget(
@@ -1223,7 +1249,9 @@ impl App {
             }
         };
 
-        let request_messages = self.request_messages()?;
+        let mut request_messages = self.request_messages()?;
+        request_messages.push(ChatMessage::user(prompt.clone()));
+        let routed_model = client.resolve_model(&request_messages);
         remember_draft(&mut self.draft_history, &prompt);
         self.last_prompt = Some(prompt.clone());
         self.input.clear();
@@ -1232,7 +1260,11 @@ impl App {
         self.messages.push(ChatMessage::assistant(String::new()));
         self.assistant_index = Some(assistant_index);
         self.streaming = true;
-        self.status = "Streaming from MiMo...".to_string();
+        self.status = if self.config.model == crate::config::AUTO_MODEL {
+            format!("Auto routed to {routed_model}; streaming from MiMo...")
+        } else {
+            "Streaming from MiMo...".to_string()
+        };
         self.scroll_to_bottom();
         self.attachments.clear();
         let tool_context = self.tool_context.clone();
@@ -1461,7 +1493,7 @@ impl App {
             }
             SlashCommand::Mode { mode } => {
                 if let Some(mode) = mode {
-                    self.mode = mode.into();
+                    self.set_mode(mode.into());
                     self.status = format!("Mode switched to {}", self.mode);
                 } else {
                     self.status = format!("Current mode: {}", self.mode);
@@ -1470,6 +1502,28 @@ impl App {
             }
             SlashCommand::Plan(command) => {
                 self.handle_plan_command(command);
+                Ok(false)
+            }
+            SlashCommand::Jobs(command) => {
+                self.handle_jobs_command(command)?;
+                Ok(false)
+            }
+            SlashCommand::Note { text } => {
+                let path = memory_store::append_note(&self.config, &text)?;
+                self.status = format!("Saved memory note to {}", path.display());
+                Ok(false)
+            }
+            SlashCommand::Memory(command) => {
+                self.handle_memory_command(command)?;
+                Ok(false)
+            }
+            SlashCommand::Recall { query } => {
+                self.push_system_message(self.recall_matches(&query)?);
+                self.status = format!("Recall results shown for {query}");
+                Ok(false)
+            }
+            SlashCommand::Compact => {
+                self.compact_conversation();
                 Ok(false)
             }
         }
@@ -1482,7 +1536,8 @@ impl App {
         };
         let Some(model) = normalize_model_name(&model) else {
             self.status =
-                "Invalid MiMo model id. Expected a non-empty id starting with mimo-".to_string();
+                "Invalid MiMo model id. Expected auto or a non-empty id starting with mimo-"
+                    .to_string();
             return Ok(());
         };
         self.config.set_model(model.clone())?;
@@ -1515,7 +1570,7 @@ impl App {
             ConfigCommand::SetModel(model) => {
                 let Some(model) = normalize_model_name(&model) else {
                     self.status =
-                        "Invalid MiMo model id. Expected a non-empty id starting with mimo-"
+                        "Invalid MiMo model id. Expected auto or a non-empty id starting with mimo-"
                             .to_string();
                     return Ok(());
                 };
@@ -1575,6 +1630,111 @@ impl App {
         }
     }
 
+    fn handle_memory_command(&mut self, command: MemoryCommand) -> Result<()> {
+        match command {
+            MemoryCommand::Show => {
+                self.push_system_message(memory_store::show_memory(&self.config)?);
+                self.status = "Memory shown".to_string();
+            }
+            MemoryCommand::Path => {
+                self.push_system_message(format!(
+                    "Memory path\n\n{}",
+                    memory_store::memory_path(&self.config).display()
+                ));
+                self.status = "Memory path shown".to_string();
+            }
+            MemoryCommand::Clear => {
+                let path = memory_store::clear_memory(&self.config)?;
+                self.status = format!("Cleared memory file {}", path.display());
+            }
+            MemoryCommand::Help => {
+                self.push_system_message(
+                    "Memory commands\n\n/memory show\n/memory path\n/memory clear\n/note <text>\n/recall <query>\n/compact"
+                        .to_string(),
+                );
+                self.status = "Memory help shown".to_string();
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_jobs_command(&mut self, command: JobsCommand) -> Result<()> {
+        let (message, status) = {
+            let mut manager = self
+                .tool_context
+                .shell_manager
+                .lock()
+                .map_err(|_| anyhow::anyhow!("shell manager is unavailable"))?;
+            match command {
+                JobsCommand::List => {
+                    let jobs = manager.list_jobs()?;
+                    if jobs.is_empty() {
+                        (
+                            "Shell jobs\n\nNo background shell jobs.".to_string(),
+                            "Shell jobs listed".to_string(),
+                        )
+                    } else {
+                        let mut output = String::from("Shell jobs\n\n");
+                        for job in jobs {
+                            output.push_str(&format!(
+                                "- {} | {:?} | stdin={} | {}\n",
+                                job.id, job.status, job.stdin_available, job.command
+                            ));
+                        }
+                        (
+                            output.trim_end().to_string(),
+                            "Shell jobs listed".to_string(),
+                        )
+                    }
+                }
+                JobsCommand::Show(id) => {
+                    let jobs = manager.list_jobs()?;
+                    let Some(job) = jobs.into_iter().find(|job| job.id == id) else {
+                        bail!("shell job {id} not found");
+                    };
+                    (
+                        format!(
+                            "Shell job details\n\n{}",
+                            to_string_pretty(&job).context("failed to encode job snapshot")?
+                        ),
+                        format!("Shell job {id} shown"),
+                    )
+                }
+                JobsCommand::Poll(id) => {
+                    let result = manager.wait(&id, false, 100)?;
+                    (
+                        format!("Shell job poll\n\n{}", render_shell_result(&result)),
+                        format!("Polled shell job {id}"),
+                    )
+                }
+                JobsCommand::Wait(id) => {
+                    let result = manager.wait(&id, true, 30_000)?;
+                    (
+                        format!("Shell job wait\n\n{}", render_shell_result(&result)),
+                        format!("Waited on shell job {id}"),
+                    )
+                }
+                JobsCommand::Stdin { id, input } => {
+                    let result = manager.write_stdin(&id, &input, false)?;
+                    (
+                        format!("Shell job stdin\n\n{}", render_shell_result(&result)),
+                        format!("Sent stdin to shell job {id}"),
+                    )
+                }
+                JobsCommand::Cancel(id) => {
+                    let result = manager.cancel(&id)?;
+                    (
+                        format!("Shell job cancelled\n\n{}", render_shell_result(&result)),
+                        format!("Cancelled shell job {id}"),
+                    )
+                }
+            }
+        };
+        self.push_system_message(message);
+        self.status = status;
+        Ok(())
+    }
+
     fn clear_conversation(&mut self) {
         if self.streaming {
             self.status = "Cannot clear while MiMo is responding".to_string();
@@ -1615,12 +1775,22 @@ impl App {
     }
 
     fn request_messages(&self) -> Result<Vec<ChatMessage>> {
-        let mut messages = Vec::with_capacity(self.messages.len() + 4);
+        let memory_notes = memory_store::load_notes(&self.config)?;
+        let mut messages = Vec::with_capacity(self.messages.len() + memory_notes.len() + 5);
         messages.push(ChatMessage::system(self.config.system_prompt.clone()));
         if self.mode == AppMode::Plan {
             messages.push(ChatMessage::system(
-                "You are in planning mode. Analyze the project, propose concrete implementation steps, and do not claim that files were modified or commands were executed unless the user explicitly switches back to chat mode.".to_string(),
+                "You are in planning mode. Analyze the project, propose concrete implementation steps, and do not claim that files were modified or commands were executed unless the user explicitly switches to agent or yolo mode.".to_string(),
             ));
+        }
+        if !memory_notes.is_empty() {
+            let mut memory = String::from("User memory\n\n");
+            for note in memory_notes {
+                memory.push_str("- ");
+                memory.push_str(&note);
+                memory.push('\n');
+            }
+            messages.push(ChatMessage::system(memory.trim_end().to_string()));
         }
         if !self.plan_items.is_empty() {
             messages.push(ChatMessage::system(self.plan_summary()));
@@ -1665,23 +1835,21 @@ impl App {
                 }
             }
             KeyCode::Char('a' | 'A') => {
-                self.set_approval_mode(ApprovalMode::Auto);
+                self.set_mode(AppMode::Yolo);
                 if let Some(request) = self.tool_runtime.approve_pending(true) {
-                    self.status = format!("Approved and enabled auto mode: {}", request.summary);
+                    self.status =
+                        format!("Approved and switched to yolo mode: {}", request.summary);
                 }
             }
             KeyCode::Char('r' | 'R') => {
-                self.set_approval_mode(ApprovalMode::ReadOnly);
+                self.set_mode(AppMode::Plan);
                 if let Some(request) = self.tool_runtime.approve_pending(false) {
-                    self.status = format!(
-                        "Denied and switched to read-only approval mode: {}",
-                        request.summary
-                    );
+                    self.status = format!("Denied and switched to plan mode: {}", request.summary);
                 }
             }
             KeyCode::Char('p' | 'P') => {
-                self.set_approval_mode(ApprovalMode::Prompt);
-                self.status = "Approval mode switched to prompt".to_string();
+                self.set_mode(AppMode::Agent);
+                self.status = "Mode switched to agent".to_string();
             }
             _ => {}
         }
@@ -1695,10 +1863,20 @@ impl App {
         }
     }
 
+    fn set_mode(&mut self, mode: AppMode) {
+        self.mode = mode;
+        self.set_approval_mode(mode_approval_mode(mode));
+    }
+
     fn open_help(&mut self, topic: Option<&str>) {
         self.help.open = true;
         self.help.scroll = 0;
         self.help.filter.set_text(topic.unwrap_or_default());
+    }
+
+    fn toggle_mode(&mut self) {
+        self.set_mode(next_mode(self.mode));
+        self.status = format!("Mode switched to {}", self.mode);
     }
 
     fn open_model_picker(&mut self, event_tx: UnboundedSender<AppEvent>) {
@@ -1807,7 +1985,7 @@ impl App {
 
     fn apply_loaded_session(&mut self, session: session_store::SavedSession, source: String) {
         self.messages = session.messages;
-        self.mode = session.mode;
+        self.set_mode(session.mode);
         self.config.model = session.model;
         self.plan_items = session.plan_items;
         self.attachments = session.attachments;
@@ -1858,7 +2036,7 @@ impl App {
                 self.open_draft_browser(DraftBrowserKind::Stash)
             }
             command_palette::PaletteAction::SwitchMode(mode) => {
-                self.mode = mode;
+                self.set_mode(mode);
                 self.status = format!("Mode switched to {}", self.mode);
             }
         }
@@ -1986,25 +2164,37 @@ impl App {
     }
 
     fn config_summary(&self) -> String {
+        let memory_notes = memory_store::load_notes(&self.config)
+            .map(|notes| notes.len())
+            .unwrap_or_default();
         format!(
-            "Configuration\n\nConfig file : {}\nBase URL    : {}\nModel       : {}\nTemperature : {}\nAPI key     : {}\nMode        : {}\nAttachments : {}\nPlan items  : {}",
+            "Configuration\n\nConfig file : {}\nBase URL    : {}\nModel       : {}\nTemperature : {}\nAPI key     : {}\nMode        : {}\nApprovals   : {}\nAttachments : {}\nPlan items  : {}\nMemory notes: {}",
             self.config.config_path.display(),
             self.config.base_url,
             self.config.model,
             self.config.temperature,
             self.config.masked_api_key(),
             self.mode,
+            approval_mode_label(self.tool_runtime.approval_mode),
             self.attachments.len(),
             self.plan_items.len(),
+            memory_notes,
         )
     }
 
     fn status_summary(&self) -> Result<String> {
         let session_count = session_store::list_sessions(&self.config)?.len();
+        let memory_notes = memory_store::load_notes(&self.config)?.len();
+        let request_chars = self
+            .request_messages()?
+            .iter()
+            .map(|message| message.content.chars().count())
+            .sum::<usize>();
         Ok(format!(
-            "Status\n\nWorkspace    : {}\nMode         : {}\nModel        : {}\nStreaming    : {}\nMessages     : {}\nSaved files  : {}\nAPI key      : {}\nAttachments  : {}\nDraft stash  : {}\nPlan items   : {}\nShell jobs   : {}\nTools        : {}",
+            "Status\n\nWorkspace    : {}\nMode         : {}\nApprovals    : {}\nModel        : {}\nStreaming    : {}\nMessages     : {}\nSaved files  : {}\nAPI key      : {}\nAttachments  : {}\nDraft stash  : {}\nPlan items   : {}\nMemory notes : {}\nRequest chars: {}\nShell jobs   : {}\nTools        : {}",
             self.tool_context.workspace_root.display(),
             self.mode,
+            approval_mode_label(self.tool_runtime.approval_mode),
             self.config.model,
             if self.streaming { "yes" } else { "no" },
             self.messages.len(),
@@ -2013,6 +2203,8 @@ impl App {
             self.attachments.len(),
             self.draft_stash.len(),
             self.plan_items.len(),
+            memory_notes,
+            request_chars,
             self.active_shell_jobs(),
             self.tool_runtime.summary(),
         ))
@@ -2029,6 +2221,78 @@ impl App {
             output.push_str(&format!("{}. [{}] {}\n", index + 1, marker, item.text));
         }
         output
+    }
+
+    fn recall_matches(&self, query: &str) -> Result<String> {
+        let query = query.trim();
+        if query.is_empty() {
+            bail!("recall query cannot be empty");
+        }
+        let query_lower = query.to_ascii_lowercase();
+        let mut output = format!("Recall results for \"{query}\"\n\n");
+
+        let memory_matches = memory_store::search_memory(&self.config, query, 10)?;
+        let has_memory_matches = !memory_matches.is_empty();
+        if has_memory_matches {
+            output.push_str("Memory notes\n");
+            for entry in &memory_matches {
+                output.push_str("- ");
+                output.push_str(entry);
+                output.push('\n');
+            }
+            output.push('\n');
+        }
+
+        let transcript_matches = self
+            .messages
+            .iter()
+            .filter(|message| message.content.to_ascii_lowercase().contains(&query_lower))
+            .take(10)
+            .collect::<Vec<_>>();
+        let has_transcript_matches = !transcript_matches.is_empty();
+        if has_transcript_matches {
+            output.push_str("Transcript matches\n");
+            for message in transcript_matches {
+                let role = match message.role {
+                    Role::System => "System",
+                    Role::User => "You",
+                    Role::Assistant => "MiMo",
+                    Role::Tool => "Tool",
+                };
+                output.push_str("- ");
+                output.push_str(role);
+                output.push_str(": ");
+                output.push_str(&truncate_for_summary(&message.content, 180));
+                output.push('\n');
+            }
+        }
+
+        if !has_memory_matches && !has_transcript_matches {
+            output.push_str("No memory or transcript matches found.");
+        }
+
+        Ok(output.trim_end().to_string())
+    }
+
+    fn compact_conversation(&mut self) {
+        if self.streaming {
+            self.status = "Cannot compact while MiMo is responding".to_string();
+            return;
+        }
+        const KEEP_RECENT_MESSAGES: usize = 6;
+        if self.messages.len() <= KEEP_RECENT_MESSAGES {
+            self.status = "Conversation is already compact".to_string();
+            return;
+        }
+
+        let split_index = self.messages.len() - KEEP_RECENT_MESSAGES;
+        let summary = compacted_summary(&self.messages[..split_index]);
+        let mut recent = self.messages.split_off(split_index);
+        self.messages = vec![ChatMessage::system(summary)];
+        self.messages.append(&mut recent);
+        self.assistant_index = None;
+        self.scroll_to_bottom();
+        self.status = "Compacted older conversation into a summary".to_string();
     }
 
     fn active_shell_jobs(&self) -> usize {
@@ -2121,6 +2385,12 @@ fn stashes_draft(key: KeyEvent) -> bool {
 
 fn opens_last_message_pager(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('l' | 'L') if key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn toggles_mode_shortcut(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::F(2))
+        || (matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
+            && key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
 fn inserts_newline(key: KeyEvent) -> bool {
@@ -2262,11 +2532,91 @@ fn tool_request_from_invocation(
     }
 }
 
+fn render_shell_result(result: &crate::tools::ShellResult) -> String {
+    let mut output = format!(
+        "status: {:?}\nexit_code: {}\nduration_ms: {}",
+        result.status,
+        result
+            .exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        result.duration_ms
+    );
+    if let Some(task_id) = &result.task_id {
+        output.push_str("\ntask_id: ");
+        output.push_str(task_id);
+    }
+    if !result.stdout.trim().is_empty() {
+        output.push_str("\n\nstdout:\n");
+        output.push_str(&result.stdout);
+    }
+    if !result.stderr.trim().is_empty() {
+        output.push_str("\n\nstderr:\n");
+        output.push_str(&result.stderr);
+    }
+    output
+}
+
+fn approval_mode_label(mode: ApprovalMode) -> &'static str {
+    match mode {
+        ApprovalMode::Prompt => "prompt",
+        ApprovalMode::ReadOnly => "read-only",
+        ApprovalMode::Auto => "auto",
+    }
+}
+
+fn mode_approval_mode(mode: AppMode) -> ApprovalMode {
+    match mode {
+        AppMode::Plan => ApprovalMode::ReadOnly,
+        AppMode::Agent => ApprovalMode::Prompt,
+        AppMode::Yolo => ApprovalMode::Auto,
+    }
+}
+
+fn next_mode(mode: AppMode) -> AppMode {
+    match mode {
+        AppMode::Agent => AppMode::Plan,
+        AppMode::Plan => AppMode::Yolo,
+        AppMode::Yolo => AppMode::Agent,
+    }
+}
+
+fn compacted_summary(messages: &[ChatMessage]) -> String {
+    let mut output = String::from("Conversation summary (compacted)\n\n");
+    for message in messages {
+        let role = match message.role {
+            Role::System => "System",
+            Role::User => "You",
+            Role::Assistant => "MiMo",
+            Role::Tool => "Tool",
+        };
+        output.push_str("- ");
+        output.push_str(role);
+        output.push_str(": ");
+        output.push_str(&truncate_for_summary(&message.content, 220));
+        output.push('\n');
+    }
+    output.trim_end().to_string()
+}
+
+fn truncate_for_summary(content: &str, limit: usize) -> String {
+    let collapsed = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut shortened = collapsed.chars().take(limit).collect::<String>();
+    if collapsed.chars().count() > limit {
+        shortened.push_str("...");
+    }
+    if shortened.is_empty() {
+        "(empty)".to_string()
+    } else {
+        shortened
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
@@ -2321,7 +2671,7 @@ mod tests {
         let app = test_app();
         let summary = app.status_summary().expect("status summary");
         assert!(summary.contains("Mode"));
-        assert!(summary.contains("chat"));
+        assert!(summary.contains("agent"));
     }
 
     #[test]
@@ -2451,5 +2801,50 @@ mod tests {
         app.handle_plan_command(PlanCommand::Done(1));
         assert_eq!(app.plan_items.len(), 1);
         assert!(app.plan_items[0].done);
+    }
+
+    #[test]
+    fn ctrl_tab_toggles_mode() {
+        let mut app = test_app();
+        let (event_tx, _event_rx) = unbounded_channel();
+
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL)),
+            event_tx.clone(),
+        )
+        .expect("ctrl+tab should toggle mode");
+        assert_eq!(app.mode, AppMode::Plan);
+
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL)),
+            event_tx.clone(),
+        )
+        .expect("ctrl+tab should cycle to yolo");
+        assert_eq!(app.mode, AppMode::Yolo);
+
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL)),
+            event_tx,
+        )
+        .expect("ctrl+tab should cycle back to agent");
+        assert_eq!(app.mode, AppMode::Agent);
+    }
+
+    #[test]
+    fn f2_toggles_mode() {
+        let mut app = test_app();
+        let (event_tx, _event_rx) = unbounded_channel();
+
+        app.handle_terminal_event(Event::Key(KeyEvent::from(KeyCode::F(2))), event_tx.clone())
+            .expect("f2 should toggle mode");
+        assert_eq!(app.mode, AppMode::Plan);
+
+        app.handle_terminal_event(Event::Key(KeyEvent::from(KeyCode::F(2))), event_tx.clone())
+            .expect("f2 should cycle to yolo");
+        assert_eq!(app.mode, AppMode::Yolo);
+
+        app.handle_terminal_event(Event::Key(KeyEvent::from(KeyCode::F(2))), event_tx)
+            .expect("f2 should cycle back to agent");
+        assert_eq!(app.mode, AppMode::Agent);
     }
 }

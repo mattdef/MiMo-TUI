@@ -5,7 +5,8 @@ mod commands;
 mod input;
 mod keybindings;
 mod markdown;
-mod project_context;
+mod memory_store;
+pub(crate) mod project_context;
 mod session_picker;
 pub mod session_store;
 mod slash_menu;
@@ -16,9 +17,14 @@ use std::{io, time::Duration};
 
 use anyhow::Result;
 use crossterm::{
-    event::{self},
+    event::{
+        self, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        supports_keyboard_enhancement,
+    },
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc::unbounded_channel;
@@ -52,19 +58,37 @@ pub async fn run(config: AppConfig) -> Result<()> {
     Ok(())
 }
 
-struct TerminalGuard;
+struct TerminalGuard {
+    keyboard_enhancement_enabled: bool,
+}
 
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
+        let keyboard_enhancement_enabled = matches!(supports_keyboard_enhancement(), Ok(true));
+        if keyboard_enhancement_enabled {
+            execute!(
+                io::stdout(),
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                )
+            )?;
+        }
         execute!(io::stdout(), EnterAlternateScreen)?;
-        Ok(Self)
+        Ok(Self {
+            keyboard_enhancement_enabled,
+        })
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
+        if self.keyboard_enhancement_enabled {
+            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        }
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
     }
 }

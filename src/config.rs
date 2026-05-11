@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 const DEFAULT_BASE_URL: &str = "https://api.xiaomimimo.com/v1";
 const DEFAULT_MODEL: &str = "mimo-v2-flash";
 const DEFAULT_TEMPERATURE: f32 = 0.2;
+pub const AUTO_MODEL: &str = "auto";
 const KNOWN_MIMO_MODELS: &[&str] = &["mimo-v2-flash", "mimo-v2.5", "mimo-v2.5-pro"];
 const DEFAULT_SYSTEM_PROMPT: &str = r#"You are MiMo TUI, a terminal assistant specialised for Xiaomi MiMo models.
 Answer concisely, preserve technical accuracy, and adapt to developer workflows.
@@ -164,10 +165,8 @@ impl AppConfig {
 }
 
 pub fn known_mimo_models(current_model: &str) -> Vec<String> {
-    let mut models = KNOWN_MIMO_MODELS
-        .iter()
-        .map(|model| (*model).to_string())
-        .collect::<Vec<_>>();
+    let mut models = vec![AUTO_MODEL.to_string()];
+    models.extend(KNOWN_MIMO_MODELS.iter().map(|model| (*model).to_string()));
     let normalized_current = current_model.trim().to_ascii_lowercase();
     if !normalized_current.is_empty() && !models.iter().any(|model| model == &normalized_current) {
         models.push(normalized_current);
@@ -177,6 +176,9 @@ pub fn known_mimo_models(current_model: &str) -> Vec<String> {
 
 pub fn normalize_model_name(model: &str) -> Option<String> {
     let model = model.trim().to_ascii_lowercase();
+    if model == AUTO_MODEL {
+        return Some(model);
+    }
     is_valid_model_name(&model).then_some(model)
 }
 
@@ -267,12 +269,18 @@ fn pick_temperature<const N: usize>(
 
 #[cfg(test)]
 mod tests {
-    use super::known_mimo_models;
+    use super::{known_mimo_models, normalize_model_name};
 
     #[test]
     fn known_model_catalog_includes_mimo_25_models() {
         let models = known_mimo_models("mimo-v2-flash");
+        assert!(models.iter().any(|model| model == "auto"));
         assert!(models.iter().any(|model| model == "mimo-v2.5"));
         assert!(models.iter().any(|model| model == "mimo-v2.5-pro"));
+    }
+
+    #[test]
+    fn normalize_model_name_accepts_auto() {
+        assert_eq!(normalize_model_name("AUTO"), Some("auto".to_string()));
     }
 }

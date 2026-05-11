@@ -86,6 +86,13 @@ async fn ask(config: AppConfig, prompt: String) -> Result<()> {
     let tool_context = ToolContext::new(workspace);
     let tool_registry = ToolRegistryBuilder::new()
         .with_file_tools()
+        .with_search_tools()
+        .with_git_tools()
+        .with_web_tools()
+        .with_project_tools()
+        .with_patch_tools()
+        .with_diagnostics_tool()
+        .with_test_runner_tool()
         .with_shell_tools()
         .build();
 

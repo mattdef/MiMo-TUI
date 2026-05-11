@@ -3,17 +3,21 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
 pub enum AppMode {
-    #[default]
-    Chat,
     Plan,
+    #[default]
+    #[serde(alias = "chat")]
+    Agent,
+    Yolo,
 }
 
 impl fmt::Display for AppMode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Chat => formatter.write_str("chat"),
             Self::Plan => formatter.write_str("plan"),
+            Self::Agent => formatter.write_str("agent"),
+            Self::Yolo => formatter.write_str("yolo"),
         }
     }
 }

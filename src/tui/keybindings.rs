@@ -42,6 +42,10 @@ pub const KEYBINDINGS: &[KeybindingInfo] = &[
         description: "Open a pager for the latest message.",
     },
     KeybindingInfo {
+        chord: "F2 / Ctrl+Tab",
+        description: "Cycle between plan, agent, and yolo modes.",
+    },
+    KeybindingInfo {
         chord: "@path + Tab",
         description: "Attach a file or directory from the workspace.",
     },
@@ -92,5 +96,5 @@ pub const KEYBINDINGS: &[KeybindingInfo] = &[
 ];
 
 pub fn footer_hint() -> &'static str {
-    "Enter send/approve | Tab complete | Ctrl+K palette | Ctrl+R sessions | Alt+R drafts | F1/? help"
+    "Enter send/approve | F2 cycle mode | Tab complete | Ctrl+K palette | Ctrl+R sessions | F1/? help"
 }

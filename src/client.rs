@@ -3,7 +3,10 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::{config::AppConfig, tools::ApiTool};
+use crate::{
+    config::{AUTO_MODEL, AppConfig},
+    tools::ApiTool,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -192,8 +195,9 @@ impl MimoClient {
         F: FnMut(&str) -> Result<()>,
     {
         let url = format!("{}/chat/completions", self.base_url);
+        let resolved_model = self.resolve_model(messages);
         let request = ChatRequest {
-            model: &self.model,
+            model: &resolved_model,
             messages,
             stream: true,
             temperature: self.temperature,
@@ -288,6 +292,13 @@ impl MimoClient {
 
         Ok(model_ids_from_response(response))
     }
+
+    pub fn resolve_model(&self, messages: &[ChatMessage]) -> String {
+        if self.model != AUTO_MODEL {
+            return self.model.clone();
+        }
+        auto_route_model(messages).to_string()
+    }
 }
 
 fn model_ids_from_response(response: ModelListResponse) -> Vec<String> {
@@ -297,6 +308,50 @@ fn model_ids_from_response(response: ModelListResponse) -> Vec<String> {
         .map(|model| model.id.trim().to_string())
         .filter(|model| !model.is_empty())
         .collect()
+}
+
+fn auto_route_model(messages: &[ChatMessage]) -> &'static str {
+    let latest_user = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == Role::User)
+        .map(|message| message.content.as_str())
+        .unwrap_or_default();
+    let transcript_chars = messages
+        .iter()
+        .map(|message| message.content.len())
+        .sum::<usize>();
+    let latest_lower = latest_user.to_ascii_lowercase();
+    let complex_keywords = [
+        "architecture",
+        "debug",
+        "error",
+        "failure",
+        "fix",
+        "implement",
+        "investigate",
+        "migrate",
+        "plan",
+        "refactor",
+        "review",
+        "security",
+        "test",
+        "trace",
+    ];
+    let is_complex = latest_user.len() > 600
+        || transcript_chars > 4_000
+        || latest_user.matches('\n').count() > 8
+        || latest_user.contains("```")
+        || complex_keywords
+            .iter()
+            .any(|keyword| latest_lower.contains(keyword));
+    if is_complex {
+        "mimo-v2.5-pro"
+    } else if latest_user.len() > 200 || transcript_chars > 1_500 {
+        "mimo-v2.5"
+    } else {
+        "mimo-v2-flash"
+    }
 }
 
 fn handle_sse_line<F>(
@@ -379,8 +434,9 @@ fn merge_tool_call_deltas(tool_calls: &mut Vec<ToolCall>, deltas: Vec<ToolCallDe
 mod tests {
     use super::{
         ModelListResponse, ToolCall, ToolCallDelta, ToolFunction, ToolFunctionDelta,
-        handle_sse_line, merge_tool_call_deltas, model_ids_from_response,
+        auto_route_model, handle_sse_line, merge_tool_call_deltas, model_ids_from_response,
     };
+    use crate::client::ChatMessage;
 
     #[test]
     fn extracts_model_ids_from_openai_style_catalog() {
@@ -477,5 +533,19 @@ mod tests {
         assert!(content.is_empty());
         assert!(tool_calls.is_empty());
         assert!(finish_reason.is_none());
+    }
+
+    #[test]
+    fn auto_router_uses_pro_for_complex_turns() {
+        let messages = vec![ChatMessage::user(
+            "Please investigate this failing build, review the architecture, and propose a refactor plan.\n```\nerror[E0308]\n```",
+        )];
+        assert_eq!(auto_route_model(&messages), "mimo-v2.5-pro");
+    }
+
+    #[test]
+    fn auto_router_uses_flash_for_short_turns() {
+        let messages = vec![ChatMessage::user("Summarize this repo.")];
+        assert_eq!(auto_route_model(&messages), "mimo-v2-flash");
     }
 }
