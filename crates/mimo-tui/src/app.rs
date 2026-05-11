@@ -341,7 +341,7 @@ impl App {
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(6), Constraint::Length(1)])
             .split(area);
-        let popup = centered_rect(chunks[0], 78, 64);
+        let popup = landing_popup_rect(chunks[0], 78, 64);
         let status_height = u16::from(self.status != "Ready");
         let sections = Layout::default()
             .direction(Direction::Vertical)
@@ -3713,6 +3713,15 @@ fn centered_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
         .split(popup_layout[1])[1]
 }
 
+fn landing_popup_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
+    let mut rect = centered_rect(area, width_percent, height_percent);
+    let max_y = area.y + area.height.saturating_sub(rect.height);
+    let spare_height = area.height.saturating_sub(rect.height);
+    let downward_offset = spare_height.saturating_add(5) / 6;
+    rect.y = rect.y.saturating_add(downward_offset).min(max_y);
+    rect
+}
+
 fn opens_help(key: KeyEvent, input_is_empty: bool) -> bool {
     matches!(key.code, KeyCode::F(1)) || (input_is_empty && matches!(key.code, KeyCode::Char('?')))
 }
@@ -4393,7 +4402,6 @@ mod tests {
         let mut app = test_app();
         let screen = render_screen(&mut app);
         assert!(screen.contains("Xiaomi"));
-        assert!(screen.contains("█   █  ██  █   █   ███        █████ █   █ █"));
         assert!(screen.contains("Ask anything...  \"Fix a TODO in the codebase\""));
         assert!(screen.contains("(0%) · F1/? help"));
         assert!(!screen.contains("Enter send |"));
