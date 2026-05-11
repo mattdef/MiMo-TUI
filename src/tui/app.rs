@@ -1,9 +1,11 @@
 use std::{
+    collections::BTreeMap,
     env,
+    process::Command,
     sync::{Arc, Mutex},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
@@ -27,12 +29,13 @@ use super::{
     attachments, command_palette,
     commands::{
         self, CommandParseError, ConfigCommand, JobsCommand, MemoryCommand, ModeName, PlanCommand,
-        SlashCommand,
+        SlashCommand, TaskCommand,
     },
     input::InputBuffer,
     keybindings, markdown, memory_store, project_context, session_picker, session_store,
     slash_menu,
     state::{AppMode, FileAttachment, PlanItem},
+    task_store,
     tooling::{ApprovalMode, ToolRequest, ToolRuntime, ToolStatus},
 };
 
@@ -44,6 +47,22 @@ pub enum AppEvent {
     ApprovalRequested(ToolRequest, oneshot::Sender<bool>),
     ToolStarted(ToolRequest),
     ToolFinished(ToolRequest),
+    TaskStarted {
+        id: String,
+        routed_model: String,
+    },
+    TaskProgress {
+        id: String,
+        line: String,
+    },
+    TaskOutputDelta {
+        id: String,
+        delta: String,
+    },
+    TaskFinished {
+        id: String,
+        result: Result<(), String>,
+    },
 }
 
 impl From<ModeName> for AppMode {
@@ -151,6 +170,8 @@ pub struct App {
     tool_runtime: ToolRuntime,
     approval_mode_shared: Arc<Mutex<ApprovalMode>>,
     slash_menu_selected: usize,
+    tasks: Vec<task_store::SavedTask>,
+    task_handles: BTreeMap<String, JoinHandle<()>>,
 }
 
 impl App {
@@ -170,6 +191,8 @@ impl App {
             .build();
         let mode = AppMode::Agent;
         let approval_mode_shared = Arc::new(Mutex::new(mode_approval_mode(mode)));
+        let tasks = task_store::load_tasks(&config).unwrap_or_default();
+        let _ = task_store::save_tasks(&config, &tasks);
         let status = if config.api_key.is_some() {
             "Ready".to_string()
         } else {
@@ -209,6 +232,8 @@ impl App {
             },
             approval_mode_shared,
             slash_menu_selected: 0,
+            tasks,
+            task_handles: BTreeMap::new(),
         }
     }
 
@@ -463,6 +488,61 @@ impl App {
                 self.tool_runtime.finish(request);
                 self.status = status;
             }
+            AppEvent::TaskStarted { id, routed_model } => {
+                if let Some(task) = self.find_task_mut(&id) {
+                    task.status = task_store::TaskStatus::Running;
+                    task.started_at_epoch = Some(task_store::now_epoch());
+                    task.updated_at_epoch = task_store::now_epoch();
+                    task.routed_model = Some(routed_model.clone());
+                    task.activity_log
+                        .push(format!("Started background task on {routed_model}."));
+                    let _ = self.persist_tasks();
+                }
+                self.status = format!("Background task {id} started");
+            }
+            AppEvent::TaskProgress { id, line } => {
+                if let Some(task) = self.find_task_mut(&id) {
+                    task.updated_at_epoch = task_store::now_epoch();
+                    task.activity_log.push(line);
+                    trim_task_log(&mut task.activity_log);
+                    let _ = self.persist_tasks();
+                }
+            }
+            AppEvent::TaskOutputDelta { id, delta } => {
+                if let Some(task) = self.find_task_mut(&id) {
+                    task.updated_at_epoch = task_store::now_epoch();
+                    task.assistant_output.push_str(&delta);
+                    let _ = self.persist_tasks();
+                }
+            }
+            AppEvent::TaskFinished { id, result } => {
+                self.task_handles.remove(&id);
+                let mut next_status = None;
+                if let Some(task) = self.find_task_mut(&id) {
+                    task.updated_at_epoch = task_store::now_epoch();
+                    task.finished_at_epoch = Some(task_store::now_epoch());
+                    match result {
+                        Ok(()) => {
+                            task.status = task_store::TaskStatus::Completed;
+                            task.error = None;
+                            task.activity_log
+                                .push("Task completed successfully.".to_string());
+                            next_status = Some(format!("Background task {id} completed"));
+                        }
+                        Err(error) => {
+                            task.status = task_store::TaskStatus::Failed;
+                            task.error = Some(error.clone());
+                            task.activity_log.push(format!("Task failed: {error}"));
+                            next_status = Some(format!("Background task {id} failed"));
+                        }
+                    }
+                    trim_task_log(&mut task.activity_log);
+                    let _ = self.persist_tasks();
+                }
+                if let Some(status) = next_status {
+                    self.status = status;
+                }
+            }
         }
     }
 
@@ -499,6 +579,11 @@ impl App {
             Span::raw(" | jobs: "),
             Span::styled(
                 self.active_shell_jobs().to_string(),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::raw(" | tasks: "),
+            Span::styled(
+                self.tasks.len().to_string(),
                 Style::default().fg(Color::Yellow),
             ),
             Span::raw(" | "),
@@ -1508,6 +1593,22 @@ impl App {
                 self.handle_jobs_command(command)?;
                 Ok(false)
             }
+            SlashCommand::Task(command) => {
+                self.handle_task_command(command, event_tx)?;
+                Ok(false)
+            }
+            SlashCommand::Diff => {
+                self.show_workspace_diff()?;
+                Ok(false)
+            }
+            SlashCommand::Undo => {
+                self.restore_snapshot(None)?;
+                Ok(false)
+            }
+            SlashCommand::Restore { id } => {
+                self.restore_snapshot(id.as_deref())?;
+                Ok(false)
+            }
             SlashCommand::Note { text } => {
                 let path = memory_store::append_note(&self.config, &text)?;
                 self.status = format!("Saved memory note to {}", path.display());
@@ -1735,6 +1836,207 @@ impl App {
         Ok(())
     }
 
+    fn handle_task_command(
+        &mut self,
+        command: TaskCommand,
+        event_tx: UnboundedSender<AppEvent>,
+    ) -> Result<()> {
+        match command {
+            TaskCommand::Add(prompt) => self.enqueue_background_task(prompt, event_tx)?,
+            TaskCommand::List => {
+                if self.tasks.is_empty() {
+                    self.push_system_message("Background tasks\n\nNo saved tasks.".to_string());
+                } else {
+                    let mut output = String::from("Background tasks\n\n");
+                    for task in &self.tasks {
+                        let routed = task.routed_model.as_deref().unwrap_or("-");
+                        output.push_str(&format!(
+                            "- {} | {:?} | mode={} | model={} | routed={} | {}\n",
+                            task.id, task.status, task.mode, task.model, routed, task.prompt
+                        ));
+                    }
+                    self.push_system_message(output.trim_end().to_string());
+                }
+                self.status = "Background tasks listed".to_string();
+            }
+            TaskCommand::Show(id) => {
+                let task = self
+                    .tasks
+                    .iter()
+                    .find(|task| task.id == id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("background task {id} not found"))?;
+                self.push_system_message(format!(
+                    "Background task details\n\n{}",
+                    to_string_pretty(&task).context("failed to encode background task")?
+                ));
+                self.status = format!("Background task {id} shown");
+            }
+            TaskCommand::Cancel(id) => {
+                if let Some(handle) = self.task_handles.remove(&id) {
+                    handle.abort();
+                }
+                let Some(task) = self.find_task_mut(&id) else {
+                    bail!("background task {id} not found");
+                };
+                task.status = task_store::TaskStatus::Cancelled;
+                task.updated_at_epoch = task_store::now_epoch();
+                task.finished_at_epoch = Some(task_store::now_epoch());
+                task.error = Some("Cancelled by user".to_string());
+                task.activity_log
+                    .push("Task cancelled by user.".to_string());
+                trim_task_log(&mut task.activity_log);
+                self.persist_tasks()?;
+                self.status = format!("Background task {id} cancelled");
+            }
+        }
+        Ok(())
+    }
+
+    fn enqueue_background_task(
+        &mut self,
+        prompt: String,
+        event_tx: UnboundedSender<AppEvent>,
+    ) -> Result<()> {
+        let now = task_store::now_epoch();
+        let id = task_store::next_task_id(&self.tasks);
+        let task = task_store::SavedTask {
+            id: id.clone(),
+            prompt: prompt.clone(),
+            model: self.config.model.clone(),
+            routed_model: None,
+            mode: self.mode,
+            status: task_store::TaskStatus::Queued,
+            created_at_epoch: now,
+            updated_at_epoch: now,
+            started_at_epoch: None,
+            finished_at_epoch: None,
+            assistant_output: String::new(),
+            activity_log: vec!["Task queued.".to_string()],
+            error: None,
+        };
+        self.tasks.push(task);
+        task_store::sort_tasks(&mut self.tasks);
+        self.persist_tasks()?;
+        self.spawn_background_task(id.clone(), prompt, event_tx)?;
+        self.status = format!("Queued background task {id}");
+        Ok(())
+    }
+
+    fn show_workspace_diff(&mut self) -> Result<()> {
+        let diff = current_workspace_diff(&self.tool_context.workspace_root)?;
+        let snapshots = self.tool_context.list_workspace_snapshots()?;
+        let mut output = String::from("Workspace diff\n\n");
+        if diff.trim().is_empty() {
+            output.push_str("No git diff.\n");
+        } else {
+            output.push_str(&diff);
+            output.push_str("\n\n");
+        }
+        output.push_str("Tracked restore snapshots\n");
+        if snapshots.is_empty() {
+            output.push_str("- none");
+        } else {
+            for snapshot in snapshots {
+                output.push_str(&format!(
+                    "- {} | {} | files={}\n",
+                    snapshot.id,
+                    snapshot.summary,
+                    snapshot.files.len()
+                ));
+            }
+        }
+        self.push_system_message(output.trim_end().to_string());
+        self.status = "Workspace diff shown".to_string();
+        Ok(())
+    }
+
+    fn restore_snapshot(&mut self, id: Option<&str>) -> Result<()> {
+        let snapshot = self.tool_context.restore_workspace_snapshot(id)?;
+        self.push_system_message(format!(
+            "Workspace restored\n\nSnapshot: {}\nSummary : {}\nFiles   : {}",
+            snapshot.id,
+            snapshot.summary,
+            snapshot.files.len()
+        ));
+        self.status = format!("Restored {}", snapshot.id);
+        Ok(())
+    }
+
+    fn spawn_background_task(
+        &mut self,
+        id: String,
+        prompt: String,
+        event_tx: UnboundedSender<AppEvent>,
+    ) -> Result<()> {
+        let mode = self.mode;
+        let config = self.config.clone();
+        let request_messages = self.task_request_messages(prompt.clone(), mode)?;
+        let tool_context = self.tool_context.clone();
+        let tool_registry = self.tool_registry.clone();
+
+        let task_id = id.clone();
+        let task_handle = tokio::spawn(async move {
+            let client = match MimoClient::new(&config) {
+                Ok(client) => client,
+                Err(error) => {
+                    let _ = event_tx.send(AppEvent::TaskFinished {
+                        id: task_id,
+                        result: Err(error.to_string()),
+                    });
+                    return;
+                }
+            };
+            let routed_model = client.resolve_model(&request_messages);
+            let _ = event_tx.send(AppEvent::TaskStarted {
+                id: task_id.clone(),
+                routed_model,
+            });
+            let result = agent::run_agent_turn(
+                &client,
+                request_messages,
+                &tool_registry,
+                &tool_context,
+                |delta| {
+                    event_tx
+                        .send(AppEvent::TaskOutputDelta {
+                            id: task_id.clone(),
+                            delta: delta.to_string(),
+                        })
+                        .context("TUI closed")?;
+                    Ok(())
+                },
+                |status| {
+                    let line = background_task_status_line(&status);
+                    event_tx
+                        .send(AppEvent::TaskProgress {
+                            id: task_id.clone(),
+                            line,
+                        })
+                        .context("TUI closed")?;
+                    Ok(())
+                },
+                |invocation| {
+                    let allow_prompt_tools = matches!(mode, AppMode::Agent | AppMode::Yolo);
+                    async move {
+                        match invocation.approval_requirement {
+                            crate::tools::ApprovalRequirement::Auto => Ok(true),
+                            crate::tools::ApprovalRequirement::Prompt => Ok(allow_prompt_tools),
+                        }
+                    }
+                },
+            )
+            .await
+            .map_err(|error| error.to_string());
+            let _ = event_tx.send(AppEvent::TaskFinished {
+                id: task_id,
+                result,
+            });
+        });
+        self.task_handles.insert(id, task_handle);
+        Ok(())
+    }
+
     fn clear_conversation(&mut self) {
         if self.streaming {
             self.status = "Cannot clear while MiMo is responding".to_string();
@@ -1775,10 +2077,29 @@ impl App {
     }
 
     fn request_messages(&self) -> Result<Vec<ChatMessage>> {
+        let mut messages = self.base_request_messages(self.mode)?;
+        if !self.plan_items.is_empty() {
+            messages.push(ChatMessage::system(self.plan_summary()));
+        }
+        messages.extend(attachments::attachment_messages(&self.attachments)?);
+        messages.extend(self.messages.clone());
+        Ok(messages)
+    }
+
+    fn task_request_messages(&self, prompt: String, mode: AppMode) -> Result<Vec<ChatMessage>> {
+        let mut messages = self.base_request_messages(mode)?;
+        messages.push(ChatMessage::system(format!(
+            "Background task request\n\nRun this task independently from the visible transcript. Summarize progress through tool actions when useful and finish with a direct final answer.\n\nTask: {prompt}"
+        )));
+        messages.push(ChatMessage::user(prompt));
+        Ok(messages)
+    }
+
+    fn base_request_messages(&self, mode: AppMode) -> Result<Vec<ChatMessage>> {
         let memory_notes = memory_store::load_notes(&self.config)?;
-        let mut messages = Vec::with_capacity(self.messages.len() + memory_notes.len() + 5);
+        let mut messages = Vec::with_capacity(memory_notes.len() + 4);
         messages.push(ChatMessage::system(self.config.system_prompt.clone()));
-        if self.mode == AppMode::Plan {
+        if mode == AppMode::Plan {
             messages.push(ChatMessage::system(
                 "You are in planning mode. Analyze the project, propose concrete implementation steps, and do not claim that files were modified or commands were executed unless the user explicitly switches to agent or yolo mode.".to_string(),
             ));
@@ -1792,11 +2113,6 @@ impl App {
             }
             messages.push(ChatMessage::system(memory.trim_end().to_string()));
         }
-        if !self.plan_items.is_empty() {
-            messages.push(ChatMessage::system(self.plan_summary()));
-        }
-        messages.extend(attachments::attachment_messages(&self.attachments)?);
-        messages.extend(self.messages.clone());
         Ok(messages)
     }
 
@@ -2168,7 +2484,7 @@ impl App {
             .map(|notes| notes.len())
             .unwrap_or_default();
         format!(
-            "Configuration\n\nConfig file : {}\nBase URL    : {}\nModel       : {}\nTemperature : {}\nAPI key     : {}\nMode        : {}\nApprovals   : {}\nAttachments : {}\nPlan items  : {}\nMemory notes: {}",
+            "Configuration\n\nConfig file : {}\nBase URL    : {}\nModel       : {}\nTemperature : {}\nAPI key     : {}\nMode        : {}\nApprovals   : {}\nAttachments : {}\nPlan items  : {}\nMemory notes: {}\nTasks file  : {}\nTasks saved : {}",
             self.config.config_path.display(),
             self.config.base_url,
             self.config.model,
@@ -2179,6 +2495,8 @@ impl App {
             self.attachments.len(),
             self.plan_items.len(),
             memory_notes,
+            task_store::tasks_path(&self.config).display(),
+            self.tasks.len(),
         )
     }
 
@@ -2191,7 +2509,7 @@ impl App {
             .map(|message| message.content.chars().count())
             .sum::<usize>();
         Ok(format!(
-            "Status\n\nWorkspace    : {}\nMode         : {}\nApprovals    : {}\nModel        : {}\nStreaming    : {}\nMessages     : {}\nSaved files  : {}\nAPI key      : {}\nAttachments  : {}\nDraft stash  : {}\nPlan items   : {}\nMemory notes : {}\nRequest chars: {}\nShell jobs   : {}\nTools        : {}",
+            "Status\n\nWorkspace    : {}\nMode         : {}\nApprovals    : {}\nModel        : {}\nStreaming    : {}\nMessages     : {}\nSaved files  : {}\nAPI key      : {}\nAttachments  : {}\nDraft stash  : {}\nPlan items   : {}\nMemory notes : {}\nRequest chars: {}\nShell jobs   : {}\nTasks        : {}\nTools        : {}",
             self.tool_context.workspace_root.display(),
             self.mode,
             approval_mode_label(self.tool_runtime.approval_mode),
@@ -2206,6 +2524,7 @@ impl App {
             memory_notes,
             request_chars,
             self.active_shell_jobs(),
+            self.tasks.len(),
             self.tool_runtime.summary(),
         ))
     }
@@ -2293,6 +2612,16 @@ impl App {
         self.assistant_index = None;
         self.scroll_to_bottom();
         self.status = "Compacted older conversation into a summary".to_string();
+    }
+
+    fn persist_tasks(&mut self) -> Result<()> {
+        task_store::sort_tasks(&mut self.tasks);
+        task_store::save_tasks(&self.config, &self.tasks)?;
+        Ok(())
+    }
+
+    fn find_task_mut(&mut self, id: &str) -> Option<&mut task_store::SavedTask> {
+        self.tasks.iter_mut().find(|task| task.id == id)
     }
 
     fn active_shell_jobs(&self) -> usize {
@@ -2557,6 +2886,34 @@ fn render_shell_result(result: &crate::tools::ShellResult) -> String {
     output
 }
 
+fn background_task_status_line(status: &AgentStatus) -> String {
+    match status {
+        AgentStatus::ToolRequested(invocation) => format!("Requested {}", invocation.summary),
+        AgentStatus::ToolStarted(invocation) => format!("Running {}", invocation.summary),
+        AgentStatus::ToolSucceeded(invocation, summary) => {
+            format!("Completed {} ({summary})", invocation.summary)
+        }
+        AgentStatus::ToolFailed(invocation, error) => {
+            format!("Failed {} ({error})", invocation.summary)
+        }
+        AgentStatus::ToolFinished(invocation, approved) => {
+            if *approved {
+                format!("Finished {}", invocation.summary)
+            } else {
+                format!("Denied {}", invocation.summary)
+            }
+        }
+    }
+}
+
+fn trim_task_log(log: &mut Vec<String>) {
+    const MAX_TASK_LOG_LINES: usize = 40;
+    if log.len() > MAX_TASK_LOG_LINES {
+        let excess = log.len() - MAX_TASK_LOG_LINES;
+        log.drain(0..excess);
+    }
+}
+
 fn approval_mode_label(mode: ApprovalMode) -> &'static str {
     match mode {
         ApprovalMode::Prompt => "prompt",
@@ -2610,6 +2967,40 @@ fn truncate_for_summary(content: &str, limit: usize) -> String {
     } else {
         shortened
     }
+}
+
+fn current_workspace_diff(workspace_root: &std::path::Path) -> Result<String> {
+    let stat = Command::new("git")
+        .current_dir(workspace_root)
+        .args(["--no-pager", "diff", "--stat"])
+        .output()
+        .context("failed to run git diff --stat")?;
+    let patch = Command::new("git")
+        .current_dir(workspace_root)
+        .args(["--no-pager", "diff", "--"])
+        .output()
+        .context("failed to run git diff")?;
+    if !stat.status.success() || !patch.status.success() {
+        return Ok("Git diff is unavailable in the current workspace.".to_string());
+    }
+
+    let stat_text = String::from_utf8_lossy(&stat.stdout).trim().to_string();
+    let patch_text = String::from_utf8_lossy(&patch.stdout).trim().to_string();
+    if stat_text.is_empty() && patch_text.is_empty() {
+        return Ok(String::new());
+    }
+
+    let mut output = String::new();
+    if !stat_text.is_empty() {
+        output.push_str(&stat_text);
+    }
+    if !patch_text.is_empty() {
+        if !output.is_empty() {
+            output.push_str("\n\n");
+        }
+        output.push_str(&patch_text);
+    }
+    Ok(output)
 }
 
 #[cfg(test)]

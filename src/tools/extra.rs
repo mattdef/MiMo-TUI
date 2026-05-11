@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::tui::project_context;
 
-use super::{ApprovalRequirement, ToolContext, ToolKind, ToolResult, ToolSpec};
+use super::{ApprovalRequirement, FileSnapshot, ToolContext, ToolKind, ToolResult, ToolSpec};
 
 const MAX_TEXT_FILE_BYTES: u64 = 256 * 1024;
 
@@ -471,6 +471,7 @@ impl ToolSpec for ApplyPatchTool {
 
     fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult> {
         let patch = required_str(&input, "patch")?;
+        let snapshot_files = patch_snapshot_files(context, patch)?;
         run_command_with_stdin(
             context.workspace_root.as_path(),
             "git",
@@ -490,6 +491,7 @@ impl ToolSpec for ApplyPatchTool {
             &["apply", "--whitespace=nowarn", "-"],
             patch,
         )?;
+        let _ = context.record_workspace_snapshot("apply_patch", snapshot_files)?;
         Ok(ToolResult::new(preview, "Applied patch"))
     }
 }
@@ -775,6 +777,54 @@ fn read_dir_sorted(path: &Path) -> Result<Vec<fs::DirEntry>> {
         .collect::<Vec<_>>();
     entries.sort_by_key(|entry| entry.file_name());
     Ok(entries)
+}
+
+fn patch_snapshot_files(context: &ToolContext, patch: &str) -> Result<Vec<FileSnapshot>> {
+    let mut snapshots = Vec::new();
+    for path in patch_target_paths(patch) {
+        let resolved = context.resolve_path(&path)?;
+        let previous_content = if resolved.exists() {
+            Some(
+                fs::read_to_string(&resolved)
+                    .with_context(|| format!("failed to read {}", resolved.display()))?,
+            )
+        } else {
+            None
+        };
+        snapshots.push(FileSnapshot {
+            path,
+            previous_content,
+        });
+    }
+    Ok(snapshots)
+}
+
+fn patch_target_paths(patch: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in patch.lines() {
+        if let Some(path) = line.strip_prefix("diff --git a/") {
+            if let Some((_, right)) = path.split_once(" b/") {
+                push_unique_path(&mut paths, right);
+            }
+        } else if let Some(path) = line.strip_prefix("+++ b/") {
+            push_unique_path(&mut paths, path);
+        } else if let Some(path) = line.strip_prefix("*** Update File: ") {
+            push_unique_path(&mut paths, path);
+        } else if let Some(path) = line.strip_prefix("*** Add File: ") {
+            push_unique_path(&mut paths, path);
+        }
+    }
+    paths
+}
+
+fn push_unique_path(paths: &mut Vec<String>, candidate: &str) {
+    let candidate = candidate.trim();
+    if candidate.is_empty() || candidate == "/dev/null" {
+        return;
+    }
+    if !paths.iter().any(|existing| existing == candidate) {
+        paths.push(candidate.to_string());
+    }
 }
 
 fn run_command(cwd: &Path, program: &str, args: &[&str]) -> Result<String> {

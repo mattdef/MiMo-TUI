@@ -4,7 +4,12 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::shell::{SharedShellManager, new_shared_shell_manager};
+use super::{
+    history::{
+        FileSnapshot, SharedWorkspaceHistory, WorkspaceSnapshot, new_shared_workspace_history,
+    },
+    shell::{SharedShellManager, new_shared_shell_manager},
+};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum ApprovalRequirement {
@@ -64,6 +69,7 @@ pub trait ToolSpec: Send + Sync {
 pub struct ToolContext {
     pub workspace_root: PathBuf,
     pub shell_manager: SharedShellManager,
+    pub workspace_history: SharedWorkspaceHistory,
 }
 
 impl ToolContext {
@@ -71,6 +77,7 @@ impl ToolContext {
         let workspace_root = workspace_root.into();
         Self {
             shell_manager: new_shared_shell_manager(workspace_root.clone()),
+            workspace_history: new_shared_workspace_history(),
             workspace_root,
         }
     }
@@ -126,6 +133,65 @@ impl ToolContext {
 
         Ok(normalized)
     }
+
+    pub fn record_workspace_snapshot(
+        &self,
+        summary: impl Into<String>,
+        files: Vec<FileSnapshot>,
+    ) -> Result<Option<WorkspaceSnapshot>> {
+        let mut history = self
+            .workspace_history
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workspace history is unavailable"))?;
+        Ok(history.record(summary, unix_timestamp(), files))
+    }
+
+    pub fn list_workspace_snapshots(&self) -> Result<Vec<WorkspaceSnapshot>> {
+        let history = self
+            .workspace_history
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workspace history is unavailable"))?;
+        Ok(history.list())
+    }
+
+    pub fn restore_workspace_snapshot(&self, id: Option<&str>) -> Result<WorkspaceSnapshot> {
+        let snapshot = {
+            let history = self
+                .workspace_history
+                .lock()
+                .map_err(|_| anyhow::anyhow!("workspace history is unavailable"))?;
+            match id {
+                Some(id) => history
+                    .find(id)
+                    .with_context(|| format!("workspace snapshot {id} not found"))?,
+                None => history
+                    .latest()
+                    .context("no workspace snapshots available")?,
+            }
+        };
+
+        for file in &snapshot.files {
+            let resolved = self.resolve_path(&file.path)?;
+            match &file.previous_content {
+                Some(content) => {
+                    if let Some(parent) = resolved.parent() {
+                        std::fs::create_dir_all(parent)
+                            .with_context(|| format!("failed to create {}", parent.display()))?;
+                    }
+                    std::fs::write(&resolved, content)
+                        .with_context(|| format!("failed to restore {}", resolved.display()))?;
+                }
+                None => {
+                    if resolved.exists() {
+                        std::fs::remove_file(&resolved)
+                            .with_context(|| format!("failed to remove {}", resolved.display()))?;
+                    }
+                }
+            }
+        }
+
+        Ok(snapshot)
+    }
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
@@ -142,6 +208,13 @@ fn normalize_path(path: &Path) -> PathBuf {
     }
 
     normalized
+}
+
+fn unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]

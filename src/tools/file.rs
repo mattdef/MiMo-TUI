@@ -3,7 +3,7 @@ use std::{fs, path::Path};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use super::{ApprovalRequirement, ToolContext, ToolKind, ToolResult, ToolSpec};
+use super::{ApprovalRequirement, FileSnapshot, ToolContext, ToolKind, ToolResult, ToolSpec};
 
 pub struct ReadFileTool;
 pub struct ListDirTool;
@@ -180,7 +180,15 @@ impl ToolSpec for WriteFileTool {
         let path = required_str(&input, "path")?;
         let content = required_str(&input, "content")?;
         let resolved = context.resolve_path(path)?;
-        let previous = fs::read_to_string(&resolved).unwrap_or_default();
+        let existed = resolved.exists();
+        let previous = if existed {
+            Some(
+                fs::read_to_string(&resolved)
+                    .with_context(|| format!("failed to read {}", resolved.display()))?,
+            )
+        } else {
+            None
+        };
 
         if let Some(parent) = resolved.parent() {
             fs::create_dir_all(parent)
@@ -190,8 +198,15 @@ impl ToolSpec for WriteFileTool {
             .with_context(|| format!("failed to write {}", resolved.display()))?;
 
         let display = relative_display(&context.workspace_root, &resolved);
+        let _ = context.record_workspace_snapshot(
+            format!("write_file {display}"),
+            vec![FileSnapshot {
+                path: display.clone(),
+                previous_content: previous.clone(),
+            }],
+        )?;
         Ok(ToolResult::new(
-            render_diff(&display, &previous, content),
+            render_diff(&display, previous.as_deref().unwrap_or_default(), content),
             format!("Wrote {}", display),
         ))
     }
@@ -262,6 +277,13 @@ impl ToolSpec for EditFileTool {
             .with_context(|| format!("failed to write {}", resolved.display()))?;
 
         let display = relative_display(&context.workspace_root, &resolved);
+        let _ = context.record_workspace_snapshot(
+            format!("edit_file {display}"),
+            vec![FileSnapshot {
+                path: display.clone(),
+                previous_content: Some(existing.clone()),
+            }],
+        )?;
         Ok(ToolResult::new(
             render_diff(&display, &existing, &updated),
             format!("Edited {} ({count} replacements)", display),

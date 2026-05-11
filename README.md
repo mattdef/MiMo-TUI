@@ -11,7 +11,7 @@ MiMo TUI is a Rust terminal client specialised for Xiaomi MiMo models. It uses a
 - Searchable help overlay, slash-command registry, slash-menu completion, command palette, multiline input editor, and bounded transcript scrolling.
 - Draft stash/history recovery (`Ctrl+S`, `Alt+R`), last-message pager (`Ctrl+L`), and interactive model/session pickers.
 - Local session save/load/export with persisted plan checklist and attached workspace context.
-- Interactive `/config`, `/status`, `/models`, `/retry`, `/mode`, `/plan`, `/jobs`, `/note`, `/memory`, `/recall`, `/compact`, and `/context` commands.
+- Interactive `/config`, `/status`, `/models`, `/retry`, `/mode`, `/plan`, `/task`, `/jobs`, `/diff`, `/undo`, `/restore`, `/note`, `/memory`, `/recall`, `/compact`, and `/context` commands.
 - Configurable MiMo API key, base URL, model, temperature, and system prompt, with doctor output that shows the winning config source for each value.
 - Defaults for `https://api.xiaomimimo.com/v1` and `mimo-v2-flash`, with bundled model suggestions for `mimo-v2-flash`, `mimo-v2.5`, and `mimo-v2.5-pro`.
 - `/models` tries to refresh the picker from the MiMo `/models` API and falls back to the bundled suggestions when the catalog cannot be loaded.
@@ -84,7 +84,9 @@ Supported environment variables:
 - `/mode [agent|plan|yolo]`: switch between prompted, read-only, and auto-approved behavior
 - `F2` or `Ctrl+Tab`: cycle between plan, agent, and yolo modes
 - `/plan [show|add <text>|done <n>|undo <n>|remove <n>|clear]`: manage the local planning checklist
+- `/task [add <prompt>|list|show <id>|cancel <id>]`: queue and inspect durable background MiMo tasks
 - `/jobs [list|show <id>|poll <id>|wait <id>|stdin <id> <input>|cancel <id>]`: inspect and control background shell jobs
+- `/diff` / `/undo` / `/restore [snapshot-id]`: inspect the current workspace diff and restore tracked file-tool snapshots
 - `/note <text>` / `/memory [show|path|clear|help]`: manage persistent user memory
 - `/recall <query>` / `/compact`: search memory + transcript or compact older messages into a summary
 - `/context`: inject a read-only workspace summary into the conversation
@@ -158,6 +160,10 @@ Use `/note <text>` to save persistent MiMo memory notes under the local config d
 ## Auto model routing
 
 Set `/model auto` to let MiMo-TUI choose a concrete MiMo model per turn. Short requests stay on `mimo-v2-flash`; larger, code-heavy, debugging, review, or planning turns are routed locally to `mimo-v2.5` or `mimo-v2.5-pro` before the request is sent.
+
+## Background tasks
+
+Use `/task add <prompt>` to launch a durable background task that is stored under the local config directory. `/task list` and `/task show <id>` inspect saved tasks, `/task cancel <id>` aborts a running one, and `/jobs` continues to manage any shell processes that those tasks started.
 
 ## Architecture snapshot
 

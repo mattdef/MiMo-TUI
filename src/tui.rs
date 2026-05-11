@@ -11,6 +11,7 @@ mod session_picker;
 pub mod session_store;
 mod slash_menu;
 mod state;
+mod task_store;
 mod tooling;
 
 use std::{io, time::Duration};

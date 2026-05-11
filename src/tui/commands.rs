@@ -27,6 +27,10 @@ pub enum SlashCommand {
     Mode { mode: Option<ModeName> },
     Plan(PlanCommand),
     Jobs(JobsCommand),
+    Task(TaskCommand),
+    Diff,
+    Undo,
+    Restore { id: Option<String> },
     Note { text: String },
     Memory(MemoryCommand),
     Recall { query: String },
@@ -71,6 +75,14 @@ pub enum JobsCommand {
     Cancel(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskCommand {
+    Add(String),
+    List,
+    Show(String),
+    Cancel(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandInfo {
     pub name: &'static str,
@@ -108,7 +120,7 @@ pub const COMMANDS: &[CommandInfo] = &[
     CommandInfo {
         name: "model",
         aliases: &[],
-        usage: "/model [id]",
+        usage: "/model [id|auto]",
         description: "Show or switch the active MiMo model.",
     },
     CommandInfo {
@@ -184,6 +196,30 @@ pub const COMMANDS: &[CommandInfo] = &[
         description: "Inspect or control background shell jobs started by tools.",
     },
     CommandInfo {
+        name: "task",
+        aliases: &["tasks"],
+        usage: "/task [add <prompt>|list|show <id>|cancel <id>]",
+        description: "Queue or inspect durable background MiMo tasks.",
+    },
+    CommandInfo {
+        name: "diff",
+        aliases: &[],
+        usage: "/diff",
+        description: "Show the current workspace diff and tracked restore snapshots.",
+    },
+    CommandInfo {
+        name: "undo",
+        aliases: &[],
+        usage: "/undo",
+        description: "Restore the latest tracked workspace snapshot.",
+    },
+    CommandInfo {
+        name: "restore",
+        aliases: &[],
+        usage: "/restore [snapshot-id]",
+        description: "Restore a tracked workspace snapshot by id, or the latest one.",
+    },
+    CommandInfo {
         name: "note",
         aliases: &[],
         usage: "/note <text>",
@@ -241,6 +277,12 @@ pub fn parse_slash_command(input: &str) -> Result<SlashCommand, CommandParseErro
         "mode" => parse_mode_command(args),
         "plan" => parse_plan_command(args),
         "jobs" | "job" => parse_jobs_command(args),
+        "task" | "tasks" => parse_task_command(args),
+        "diff" => require_no_args(args, SlashCommand::Diff, "/diff"),
+        "undo" => require_no_args(args, SlashCommand::Undo, "/undo"),
+        "restore" => Ok(SlashCommand::Restore {
+            id: non_empty(args).map(ToOwned::to_owned),
+        }),
         "note" => parse_note_command(args),
         "memory" => parse_memory_command(args),
         "recall" => parse_recall_command(args),
@@ -437,6 +479,28 @@ fn parse_jobs_command(args: &str) -> Result<SlashCommand, CommandParseError> {
     Ok(SlashCommand::Jobs(command))
 }
 
+fn parse_task_command(args: &str) -> Result<SlashCommand, CommandParseError> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("list") {
+        return Ok(SlashCommand::Task(TaskCommand::List));
+    }
+
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let action = parts.next().unwrap_or_default().to_ascii_lowercase();
+    let value = parts.next().unwrap_or_default().trim();
+    let command = match action.as_str() {
+        "add" if !value.is_empty() => TaskCommand::Add(value.to_string()),
+        "show" if !value.is_empty() => TaskCommand::Show(value.to_string()),
+        "cancel" if !value.is_empty() => TaskCommand::Cancel(value.to_string()),
+        _ => {
+            return Err(CommandParseError::Usage(
+                "/task [add <prompt>|list|show <id>|cancel <id>]",
+            ));
+        }
+    };
+    Ok(SlashCommand::Task(command))
+}
+
 fn parse_memory_command(args: &str) -> Result<SlashCommand, CommandParseError> {
     let command = match args.trim().to_ascii_lowercase().as_str() {
         "" | "show" => MemoryCommand::Show,
@@ -493,7 +557,7 @@ fn parse_index(value: &str) -> Result<usize, CommandParseError> {
 mod tests {
     use super::{
         CommandParseError, ConfigCommand, JobsCommand, MemoryCommand, ModeName, PlanCommand,
-        SlashCommand, parse_slash_command,
+        SlashCommand, TaskCommand, parse_slash_command,
     };
 
     #[test]
@@ -538,6 +602,18 @@ mod tests {
                 id: "shell-1".to_string(),
                 input: "y{enter}".to_string()
             }))
+        );
+        assert_eq!(
+            parse_slash_command("/task add Review the latest diff"),
+            Ok(SlashCommand::Task(TaskCommand::Add(
+                "Review the latest diff".to_string()
+            )))
+        );
+        assert_eq!(
+            parse_slash_command("/restore snapshot-2"),
+            Ok(SlashCommand::Restore {
+                id: Some("snapshot-2".to_string())
+            })
         );
     }
 
