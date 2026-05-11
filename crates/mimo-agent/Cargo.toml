@@ -1,0 +1,10 @@
+[package]
+name = "mimo-agent"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+mimo-client = { path = "../mimo-client" }
+mimo-protocol = { path = "../mimo-protocol" }
+mimo-tools = { path = "../mimo-tools" }

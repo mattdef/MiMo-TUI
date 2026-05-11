@@ -1,0 +1,13 @@
+[package]
+name = "mimo-client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+futures-util.workspace = true
+mimo-config = { path = "../mimo-config" }
+mimo-protocol = { path = "../mimo-protocol" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true

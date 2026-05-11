@@ -790,22 +790,123 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
-name = "mimo-tui"
+name = "mimo-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mimo-client",
+ "mimo-protocol",
+ "mimo-tools",
+]
+
+[[package]]
+name = "mimo-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "crossterm",
- "dirs",
+ "mimo-agent",
+ "mimo-client",
+ "mimo-config",
+ "mimo-core",
+ "mimo-protocol",
+ "mimo-state",
+ "mimo-tui",
+ "tokio",
+]
+
+[[package]]
+name = "mimo-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "futures-util",
- "libc",
- "ratatui",
+ "mimo-config",
+ "mimo-protocol",
+ "reqwest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "mimo-config"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "reqwest",
+ "serde",
+ "toml",
+]
+
+[[package]]
+name = "mimo-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mimo-tools",
+]
+
+[[package]]
+name = "mimo-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "mimo-state"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mimo-config",
+ "mimo-protocol",
  "reqwest",
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "mimo-tools"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "mimo-protocol",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "mimo-tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "dirs",
+ "libc",
+ "mimo-agent",
+ "mimo-client",
+ "mimo-config",
+ "mimo-core",
+ "mimo-protocol",
+ "mimo-state",
+ "mimo-tools",
+ "mimo-tui-core",
+ "ratatui",
+ "serde_json",
  "tokio",
- "toml",
+]
+
+[[package]]
+name = "mimo-tui-core"
+version = "0.1.0"
+dependencies = [
+ "ratatui",
 ]
 
 [[package]]

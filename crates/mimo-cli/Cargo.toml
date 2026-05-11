@@ -1,0 +1,20 @@
+[package]
+name = "mimo-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "mimo-tui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+mimo-agent = { path = "../mimo-agent" }
+mimo-client = { path = "../mimo-client" }
+mimo-config = { path = "../mimo-config" }
+mimo-core = { path = "../mimo-core" }
+mimo-protocol = { path = "../mimo-protocol" }
+mimo-state = { path = "../mimo-state" }
+mimo-tui = { path = "../mimo-tui" }
+tokio.workspace = true

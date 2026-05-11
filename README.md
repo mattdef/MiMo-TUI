@@ -1,20 +1,24 @@
 # MiMo TUI
 
-MiMo TUI is a Rust terminal client specialised for Xiaomi MiMo models. It uses an OpenAI-compatible chat completions API, streams responses into a keyboard-driven interface, and keeps the defaults centred on MiMo model IDs.
+> A fast, keyboard-driven terminal client for [Xiaomi MiMo](https://www.xiaomimimo.com/) models — streaming responses, agentic tool execution, and session memory, all without leaving the terminal.
 
-## Features
+---
 
-- Ratatui/crossterm terminal interface with streaming assistant responses.
-- OpenAI-compatible tool loop with workspace-bound file, search, git, web, patch, project-summary, diagnostics/test, and shell tools.
-- Approval prompt for shell execution and file writes, plus shared background shell jobs across turns.
-- `ask`, `doctor`, `models`, and `sessions` CLI commands outside the TUI.
-- Searchable help overlay, slash-command registry, slash-menu completion, command palette, multiline input editor, bounded transcript scrolling, and dedicated diagnostics/task/snapshot browsers.
-- Draft stash/history recovery (`Ctrl+S`, `Alt+R`), last-message pager (`Ctrl+L`), and interactive model/session pickers.
-- Local session save/load/export with persisted plan checklist and attached workspace context.
-- Interactive `/config`, `/status`, `/models`, `/retry`, `/mode`, `/plan`, `/task`, `/jobs`, `/diff`, `/undo`, `/restore`, `/note`, `/memory`, `/recall`, `/compact`, `/review`, `/lsp`, `/skills`, `/skill`, `/mcp`, and `/context` commands.
-- Configurable MiMo API key, base URL, model, temperature, and system prompt, with doctor output that shows the winning config source for each value.
-- Defaults for `https://api.xiaomimimo.com/v1` and `mimo-v2-flash`, with bundled model suggestions for `mimo-v2-flash`, `mimo-v2.5`, and `mimo-v2.5-pro`.
-- `/models` tries to refresh the picker from the MiMo `/models` API and falls back to the bundled suggestions when the catalog cannot be loaded.
+## What it does
+
+MiMo-TUI turns your terminal into a capable AI coding workspace. Type a prompt, get a streamed response. Ask MiMo to read your files, run shell commands, apply patches, or review your git diff — it will ask for approval before touching anything, or run fully autonomously in `yolo` mode.
+
+**Highlights:**
+
+- 🖥️ **Full-screen TUI** with streaming responses, multiline editor, and slash-command palette
+- 🔧 **Agentic tool loop** — file read/write, shell execution, git, search, and diagnostics
+- 💾 **Session persistence** — save, restore, and export conversations as Markdown
+- 🗂️ **Plan mode** — keep a live checklist alongside your conversation
+- 🧠 **Memory** — persist notes across sessions with `/note` and `/recall`
+- 🤖 **Auto model routing** — short prompts on `mimo-v2-flash`, heavy tasks on `mimo-v2.5-pro`
+- 🔌 **Skills & MCP** — install reusable prompt skills and wire up MCP server definitions
+
+---
 
 ## Quickstart
 
@@ -23,185 +27,82 @@ export MIMO_API_KEY="your-api-key"
 cargo run
 ```
 
-One-shot prompt:
+One-shot from the command line:
 
 ```bash
-cargo run -- ask "Explain what makes MiMo models useful for coding workflows"
+cargo run -- ask "What makes MiMo v2.5 good for coding?"
+cargo run -- doctor    # show resolved config and API key status
+cargo run -- models    # list available models
 ```
 
-Check configuration:
+---
+
+## Workspace layout
+
+MiMo-TUI now follows a multi-crate workspace layout inspired by DeepSeek-TUI:
+
+| Crate | Responsibility |
+|---|---|
+| `crates/mimo-cli` | CLI entrypoint and subcommand dispatcher |
+| `crates/mimo-config` | Config loading, MiMo defaults, validation, and precedence |
+| `crates/mimo-protocol` | Shared chat and tool schema types |
+| `crates/mimo-client` | MiMo HTTP client, SSE streaming, model listing, and auto-routing |
+| `crates/mimo-tools` | Tool specs, registry, file/shell/git/web/patch/diagnostics tools |
+| `crates/mimo-state` | Session, task, memory, skill, MCP, and diagnostics persistence |
+| `crates/mimo-agent` | Agent loop that executes tool calls around the MiMo client |
+| `crates/mimo-core` | Shared bootstrap helpers and project summarization |
+| `crates/mimo-tui-core` | Slash commands, keybindings, input buffer, and markdown helpers |
+| `crates/mimo-tui` | Ratatui/Crossterm runtime and interactive UI |
+
+The root `Cargo.toml` is now a virtual workspace manifest. `cargo run`, `cargo check`, and `cargo fmt --check` still work from the repository root.
+
+For the full test suite across every crate, use:
 
 ```bash
-cargo run -- doctor
+cargo test --workspace
 ```
 
-List live models or local fallbacks:
-
-```bash
-cargo run -- models
-```
-
-List saved sessions:
-
-```bash
-cargo run -- sessions
-```
+---
 
 ## Configuration
 
-Environment variables take precedence over `~/.config/mimo-tui/config.toml`. CLI flags take precedence over both.
+Create `~/.config/mimo-tui/config.toml` — or use environment variables:
 
 ```toml
-api_key = "your-api-key"
-base_url = "https://api.xiaomimimo.com/v1"
-model = "mimo-v2-flash"
-temperature = 0.2
-system_prompt = "You are MiMo TUI, a concise terminal assistant."
+api_key      = "your-api-key"
+model        = "mimo-v2-flash"          # or mimo-v2.5, mimo-v2.5-pro
+temperature  = 0.2
+# base_url defaults to https://api.xiaomimimo.com/v1
 ```
 
-Supported environment variables:
+| Env var | Purpose |
+|---|---|
+| `MIMO_API_KEY` | API key |
+| `MIMO_MODEL` | Model ID |
+| `MIMO_BASE_URL` | Override API endpoint |
+| `MIMO_TEMPERATURE` | Sampling temperature |
+| `MIMO_TUI_CONFIG` | Custom config file path |
 
-- `MIMO_API_KEY`
-- `MIMO_BASE_URL`
-- `MIMO_MODEL`
-- `MIMO_TEMPERATURE`
-- `MIMO_TUI_CONFIG`
+Config can also be edited live inside the TUI with `/config`.
 
-## TUI controls
+---
 
-- `Enter`: send prompt
-- `Shift+Enter` / `Ctrl+J`: insert a newline
-- `F1` or `?` on an empty draft: open help
-- `/help`: open command help
-- `/clear`: clear conversation history
-- `/exit` / `/quit` / `/q`: quit
-- `/model [id|auto]`: show or switch the current MiMo model, or enable local auto-routing
-- `/models`: open the MiMo model picker and refresh it from the API when available
-- `/save` / `/load` / `/sessions` / `/export`: manage local sessions
-- `/config`: inspect or update local config
-- `/status`: show runtime status
-- `/retry`: resend the last prompt
-- `/mode [agent|plan|yolo]`: switch between prompted, read-only, and auto-approved behavior
-- `F2` or `Ctrl+Tab`: cycle between plan, agent, and yolo modes
-- `/plan [show|add <text>|done <n>|undo <n>|remove <n>|clear]`: manage the local planning checklist
-- `/task [add <prompt>|list|show <id>|cancel <id>]`: queue and inspect durable background MiMo tasks
-- `/jobs [list|show <id>|poll <id>|wait <id>|stdin <id> <input>|cancel <id>]`: inspect and control background shell jobs
-- `/diff` / `/undo` / `/restore [snapshot-id]`: inspect the current workspace diff and restore tracked file-tool snapshots
-- `/note <text>` / `/memory [show|path|clear|help]`: manage persistent user memory
-- `/recall <query>` / `/compact`: search memory + transcript or compact older messages into a summary
-- `/review [workspace|staged|path <path>]`: build a lightweight review context from git state, diff summary, and cached diagnostics
-- `/lsp [status|run|show|clear|on|off]`: manage cached diagnostics and optional auto-refresh after file-tool edits
-- `/skills` / `/skill [name|install <path-or-url>|show <name>|uninstall <name>]`: manage local reusable prompt skills
-- `/mcp [list|show <name>|add stdio <name> <command> [args...]|add http <name> <url>|enable <name>|disable <name>|remove <name>]`: manage local MCP server definitions
-- `/context`: inject a read-only workspace summary into the conversation
-- `Tab`: complete a slash command from the slash menu
-- `@path` then `Tab`: attach a file or directory to the next prompt
-- `Ctrl+K`: open the command palette
-- `Ctrl+R`: open the session picker
-- `Ctrl+S`: stash the current draft
-- `Alt+R`: reopen a cleared or recent draft
-- `Ctrl+L`: open the latest message in a pager
-- `Ctrl+U`: clear prompt draft and keep it in history
-- `Left` / `Right`: move the draft cursor
-- `Home` / `End` or `Ctrl+A` / `Ctrl+E`: jump within the current line
-- `Delete` / `Backspace`: delete around the cursor, or remove the latest attachment when the draft is empty
-- `Up` / `Down`: scroll conversation or move inside open menus
-- `PageUp` / `PageDown`: scroll by page
-- `Ctrl+Home` / `Ctrl+End`: jump to transcript start/end
-- In the tool approval prompt: `Enter` / `y` approve, `Esc` / `n` deny, `a` switches to auto approvals, `r` switches to read-only mode, `p` returns to prompt mode
-- `Esc`: close help or cancel an in-progress generation
-- `Ctrl+C` / `Ctrl+D` on an empty draft: quit
+## Essential controls
 
-## Configuration from inside the TUI
+| Key / Command | Action |
+|---|---|
+| `Enter` | Send prompt |
+| `Shift+Enter` | New line in draft |
+| `F1` / `?` | Open help |
+| `Ctrl+K` | Command palette |
+| `Ctrl+R` | Session picker |
+| `Tab` | Slash-command completion |
+| `@path` + `Tab` | Attach a file or directory |
+| `Esc` | Cancel generation / close overlay |
+| `/clear` `/save` `/load` | Manage conversation |
+| `/mode [agent\|plan\|yolo]` | Switch execution mode |
+| `/model [id\|auto]` | Change or auto-route model |
+| `/plan` `/note` `/recall` | Checklist, memory, search |
+| `/review` `/lsp` | Code review and diagnostics |
 
-Examples:
-
-```text
-/config show
-/config api-key YOUR_KEY
-/config base-url https://api.xiaomimimo.com/v1
-/config model mimo-v2-flash
-/config temperature 0.2
-```
-
-The API key is written to `~/.config/mimo-tui/config.toml` and is never echoed back in the UI.
-
-## Attached workspace context
-
-Use `@path` in the draft and press `Tab` to attach a local file or directory to the next request. Attachments are shown above the prompt editor, serialized into saved sessions, exported in Markdown, and removed with `Backspace` when the draft is empty. They are now a UX shortcut on top of the real tool system, not the only way MiMo can inspect the workspace.
-
-## Tool execution and approvals
-
-MiMo-TUI now advertises local tools to the MiMo chat API using the OpenAI-compatible `tools` schema.
-
-- Read-only tools (`list_dir`, `read_file`, `exec_shell_wait`, `exec_shell_interact`) auto-run inside the launched workspace.
-- Mutating tools (`write_file`, `edit_file`, `exec_shell`, `exec_shell_cancel`) pause on an approval overlay in the TUI.
-- Shell commands can stay alive in the background and be resumed across later tool calls during the same app session.
-- Saved sessions never restart shell jobs or replay pending approvals.
-
-## Session files
-
-By default, session JSON files and Markdown exports are stored under:
-
-```text
-~/.config/mimo-tui/sessions/
-```
-
-`/save` creates a new JSON snapshot, `/load` restores the most recent saved session when no path is provided, `/sessions` opens an interactive picker, and `/export` writes a Markdown transcript.
-
-## Modes
-
-- `plan` keeps the conversation read-only and opens the checklist side panel.
-- `agent` is the default interactive mode and prompts before mutating tool calls.
-- `yolo` auto-approves tool execution for faster autonomous runs.
-
-`/mode plan` opens a dedicated plan side panel. Use `/plan add <text>` to create checklist items, then `/plan done <n>` or `/plan undo <n>` as work progresses. The checklist is included in saved sessions and added back to the request context while plan mode is active.
-
-## Memory and compaction
-
-Use `/note <text>` to save persistent MiMo memory notes under the local config directory. `/memory show` displays the current note file, `/memory clear` resets it, `/recall <query>` searches both memory and the current transcript, and `/compact` replaces older transcript messages with a local summary to keep the active context tighter.
-
-## Auto model routing
-
-Set `/model auto` to let MiMo-TUI choose a concrete MiMo model per turn. Short requests stay on `mimo-v2-flash`; larger, code-heavy, debugging, review, or planning turns are routed locally to `mimo-v2.5` or `mimo-v2.5-pro` before the request is sent.
-
-## Background tasks
-
-Use `/task add <prompt>` to launch a durable background task that is stored under the local config directory. `/task list` and `/task show <id>` inspect saved tasks, `/task cancel <id>` aborts a running one, and `/jobs` continues to manage any shell processes that those tasks started.
-
-The command palette also opens dedicated browsers for cached diagnostics, background tasks, and workspace restore snapshots so you can inspect them without pushing more system messages into the transcript.
-
-## Diagnostics and review
-
-Use `/lsp run` to capture a local diagnostics snapshot with `cargo check --message-format short`, `/lsp show` to open the cached report in a pager, and `/lsp on` to auto-refresh diagnostics after successful `write_file`, `edit_file`, or `apply_patch` tool mutations. `/review` combines git status, diff summary, and the latest cached diagnostics into a ready-to-use review context.
-
-## Skills and MCP definitions
-
-Use `/skill install <path-or-url>` to copy a reusable prompt skill into `~/.config/mimo-tui/skills/`, `/skill <name>` to toggle it for the current session, `/skill show <name>` to inspect it, and `/skills` to list installed plus active skills. Active skills are injected into new requests and saved inside session snapshots.
-
-Use `/mcp ...` to maintain a local catalog of MCP server definitions under `~/.config/mimo-tui/mcp-servers.json`. This adds persistent discovery plus palette integration for future tool/runtime wiring: stdio and HTTP endpoints can be added, listed, enabled, disabled, and removed directly from the TUI.
-
-## Architecture snapshot
-
-- `src/main.rs`: CLI entrypoint and `ask` / `doctor` / `models` / `sessions` dispatcher
-- `src/agent.rs`: tool-call loop that replays MiMo requests until a final assistant response is produced
-- `src/config.rs`: config loading, precedence tracking, validation, and persistence helpers
-- `src/client.rs`: OpenAI-compatible MiMo streaming client with SSE tool-call parsing
-- `src/tools/spec.rs`: workspace-scoped tool context, path validation, and tool traits
-- `src/tools/registry.rs`: stable tool catalog and local tool dispatch
-- `src/tools/file.rs`: `list_dir`, `read_file`, `write_file`, and `edit_file`
-- `src/tools/shell.rs`: foreground/background shell execution, polling, stdin interaction, and cancellation
-- `src/tui.rs`: ratatui shell bootstrap and event loop
-- `src/tui/app.rs`: TUI state machine, overlays, commands, and render flow
-- `src/tui/commands.rs`: slash-command registry and parsing
-- `src/tui/slash_menu.rs`: slash-command suggestions and completion
-- `src/tui/command_palette.rs`: palette actions and filtering
-- `src/tui/keybindings.rs`: user-facing keybinding catalog and footer hint
-- `src/tui/input.rs`: multiline draft editor
-- `src/tui/attachments.rs`: `@path` attachment parsing and request-context injection
-- `src/tui/diagnostics_store.rs`: cached diagnostics snapshots used by `/lsp` and `/review`
-- `src/tui/skill_store.rs`: local install/load/uninstall helpers for reusable prompt skills
-- `src/tui/mcp_store.rs`: persistent local MCP server definitions
-- `src/tui/session_store.rs`: local session persistence/export
-- `src/tui/project_context.rs`: read-only workspace summarization
-- `src/tui/tooling.rs`: approval runtime and recent tool/job state
+Type `/help` inside the TUI for the full command reference.

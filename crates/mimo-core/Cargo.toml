@@ -1,0 +1,8 @@
+[package]
+name = "mimo-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+mimo-tools = { path = "../mimo-tools" }
