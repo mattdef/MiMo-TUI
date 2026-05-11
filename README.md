@@ -5,9 +5,11 @@ MiMo TUI is a Rust terminal client specialised for Xiaomi MiMo models. It uses a
 ## Features
 
 - Ratatui/crossterm terminal interface with streaming assistant responses.
+- OpenAI-compatible tool loop with workspace-bound `list_dir`, `read_file`, `write_file`, `edit_file`, and shell tools.
+- Approval prompt for shell execution and file writes, plus shared background shell jobs across turns.
 - `ask`, `doctor`, `models`, and `sessions` CLI commands outside the TUI.
 - Searchable help overlay, slash-command registry, slash-menu completion, command palette, multiline input editor, and bounded transcript scrolling.
-- Draft stash/history recovery (`Ctrl+S`, `Alt+R`), last-message pager (`l`), and interactive model/session pickers.
+- Draft stash/history recovery (`Ctrl+S`, `Alt+R`), last-message pager (`Ctrl+L`), and interactive model/session pickers.
 - Local session save/load/export with persisted plan checklist and attached workspace context.
 - Interactive `/config`, `/status`, `/models`, `/retry`, `/mode`, `/plan`, and `/context` commands.
 - Configurable MiMo API key, base URL, model, temperature, and system prompt, with doctor output that shows the winning config source for each value.
@@ -88,7 +90,7 @@ Supported environment variables:
 - `Ctrl+R`: open the session picker
 - `Ctrl+S`: stash the current draft
 - `Alt+R`: reopen a cleared or recent draft
-- `l`: open the latest message in a pager
+- `Ctrl+L`: open the latest message in a pager
 - `Ctrl+U`: clear prompt draft and keep it in history
 - `Left` / `Right`: move the draft cursor
 - `Home` / `End` or `Ctrl+A` / `Ctrl+E`: jump within the current line
@@ -96,6 +98,7 @@ Supported environment variables:
 - `Up` / `Down`: scroll conversation or move inside open menus
 - `PageUp` / `PageDown`: scroll by page
 - `Ctrl+Home` / `Ctrl+End`: jump to transcript start/end
+- In the tool approval prompt: `Enter` / `y` approve, `Esc` / `n` deny, `a` switches to auto approvals, `r` switches to read-only mode, `p` returns to prompt mode
 - `Esc`: close help or cancel an in-progress generation
 - `Ctrl+C` / `Ctrl+D` on an empty draft: quit
 
@@ -115,7 +118,16 @@ The API key is written to `~/.config/mimo-tui/config.toml` and is never echoed b
 
 ## Attached workspace context
 
-Use `@path` in the draft and press `Tab` to attach a local file or directory to the next request. Attachments are shown above the prompt editor, serialized into saved sessions, exported in Markdown, and removed with `Backspace` when the draft is empty.
+Use `@path` in the draft and press `Tab` to attach a local file or directory to the next request. Attachments are shown above the prompt editor, serialized into saved sessions, exported in Markdown, and removed with `Backspace` when the draft is empty. They are now a UX shortcut on top of the real tool system, not the only way MiMo can inspect the workspace.
+
+## Tool execution and approvals
+
+MiMo-TUI now advertises local tools to the MiMo chat API using the OpenAI-compatible `tools` schema.
+
+- Read-only tools (`list_dir`, `read_file`, `exec_shell_wait`, `exec_shell_interact`) auto-run inside the launched workspace.
+- Mutating tools (`write_file`, `edit_file`, `exec_shell`, `exec_shell_cancel`) pause on an approval overlay in the TUI.
+- Shell commands can stay alive in the background and be resumed across later tool calls during the same app session.
+- Saved sessions never restart shell jobs or replay pending approvals.
 
 ## Session files
 
@@ -134,8 +146,13 @@ By default, session JSON files and Markdown exports are stored under:
 ## Architecture snapshot
 
 - `src/main.rs`: CLI entrypoint and `ask` / `doctor` / `models` / `sessions` dispatcher
+- `src/agent.rs`: tool-call loop that replays MiMo requests until a final assistant response is produced
 - `src/config.rs`: config loading, precedence tracking, validation, and persistence helpers
-- `src/client.rs`: OpenAI-compatible MiMo streaming client
+- `src/client.rs`: OpenAI-compatible MiMo streaming client with SSE tool-call parsing
+- `src/tools/spec.rs`: workspace-scoped tool context, path validation, and tool traits
+- `src/tools/registry.rs`: stable tool catalog and local tool dispatch
+- `src/tools/file.rs`: `list_dir`, `read_file`, `write_file`, and `edit_file`
+- `src/tools/shell.rs`: foreground/background shell execution, polling, stdin interaction, and cancellation
 - `src/tui.rs`: ratatui shell bootstrap and event loop
 - `src/tui/app.rs`: TUI state machine, overlays, commands, and render flow
 - `src/tui/commands.rs`: slash-command registry and parsing
@@ -146,4 +163,4 @@ By default, session JSON files and Markdown exports are stored under:
 - `src/tui/attachments.rs`: `@path` attachment parsing and request-context injection
 - `src/tui/session_store.rs`: local session persistence/export
 - `src/tui/project_context.rs`: read-only workspace summarization
-- `src/tui/tooling.rs`: future-facing tool/approval state skeleton
+- `src/tui/tooling.rs`: approval runtime and recent tool/job state

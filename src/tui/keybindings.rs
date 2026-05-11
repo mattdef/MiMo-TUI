@@ -7,7 +7,7 @@ pub struct KeybindingInfo {
 pub const KEYBINDINGS: &[KeybindingInfo] = &[
     KeybindingInfo {
         chord: "Enter",
-        description: "Send the draft or execute a slash command.",
+        description: "Send the draft, execute a slash command, or approve a pending tool request.",
     },
     KeybindingInfo {
         chord: "Tab",
@@ -38,7 +38,7 @@ pub const KEYBINDINGS: &[KeybindingInfo] = &[
         description: "Open the saved-session picker.",
     },
     KeybindingInfo {
-        chord: "l",
+        chord: "Ctrl+L",
         description: "Open a pager for the latest message.",
     },
     KeybindingInfo {
@@ -85,8 +85,12 @@ pub const KEYBINDINGS: &[KeybindingInfo] = &[
         chord: "Esc / Ctrl+C",
         description: "Close overlays, cancel a generation, or quit.",
     },
+    KeybindingInfo {
+        chord: "y / n / a / r / p",
+        description: "Approve, deny, or change approval mode in the tool prompt.",
+    },
 ];
 
 pub fn footer_hint() -> &'static str {
-    "Enter send | Tab complete | Ctrl+K palette | Ctrl+R sessions | Alt+R drafts | F1/? help"
+    "Enter send/approve | Tab complete | Ctrl+K palette | Ctrl+R sessions | Alt+R drafts | F1/? help"
 }

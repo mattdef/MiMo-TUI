@@ -110,6 +110,7 @@ pub fn export_markdown(
             crate::client::Role::System => "System",
             crate::client::Role::User => "You",
             crate::client::Role::Assistant => "MiMo",
+            crate::client::Role::Tool => "Tool",
         };
         output.push_str(&format!("## {role}\n\n{}\n\n", message.content.trim()));
     }

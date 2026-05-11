@@ -1,13 +1,19 @@
+mod agent;
 mod client;
 mod config;
+mod tools;
 mod tui;
 
-use std::io::{self, Write};
+use std::{
+    env,
+    io::{self, Write},
+};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use client::{ChatMessage, MimoClient};
 use config::{AppConfig, ConfigOverrides};
+use tools::{ToolContext, ToolRegistryBuilder};
 use tui::session_store;
 
 #[derive(Debug, Parser)]
@@ -72,18 +78,35 @@ async fn main() -> Result<()> {
 
 async fn ask(config: AppConfig, prompt: String) -> Result<()> {
     let client = MimoClient::new(&config)?;
-    let messages = vec![
+    let request_messages = vec![
         ChatMessage::system(config.system_prompt.clone()),
         ChatMessage::user(prompt),
     ];
+    let workspace = env::current_dir()?;
+    let tool_context = ToolContext::new(workspace);
+    let tool_registry = ToolRegistryBuilder::new()
+        .with_file_tools()
+        .with_shell_tools()
+        .build();
 
-    client
-        .stream_chat(&messages, |delta| {
+    agent::run_agent_turn(
+        &client,
+        request_messages,
+        &tool_registry,
+        &tool_context,
+        |delta| {
             print!("{delta}");
             io::stdout().flush()?;
             Ok(())
-        })
-        .await?;
+        },
+        |_| Ok(()),
+        |_invocation| async move {
+            // In CLI mode, approve all tools to enable tool execution
+            // Read-only tools are already auto-approved, mutating tools are also approved here
+            Ok(true)
+        },
+    )
+    .await?;
 
     println!();
     Ok(())

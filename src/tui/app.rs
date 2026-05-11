@@ -1,4 +1,7 @@
-use std::env;
+use std::{
+    env,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::{Context, Result};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
@@ -9,12 +12,14 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{mpsc::UnboundedSender, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::{
+    agent::{self, AgentStatus},
     client::{ChatMessage, MimoClient, Role},
     config::{AppConfig, known_mimo_models, normalize_base_url, normalize_model_name},
+    tools::{ToolContext, ToolInvocation, ToolRegistry, ToolRegistryBuilder},
 };
 
 use super::{
@@ -23,14 +28,17 @@ use super::{
     input::InputBuffer,
     keybindings, markdown, project_context, session_picker, session_store, slash_menu,
     state::{AppMode, FileAttachment, PlanItem},
-    tooling::ToolRuntime,
+    tooling::{ApprovalMode, ToolRequest, ToolRuntime, ToolStatus},
 };
 
-#[derive(Debug)]
 pub enum AppEvent {
     Delta(String),
     Finished(Result<(), String>),
     ModelsLoaded(Result<Vec<String>, String>),
+    Status(String),
+    ApprovalRequested(ToolRequest, oneshot::Sender<bool>),
+    ToolStarted(ToolRequest),
+    ToolFinished(ToolRequest),
 }
 
 impl From<ModeName> for AppMode {
@@ -107,10 +115,11 @@ struct MessagePagerState {
     scroll: u16,
 }
 
-#[derive(Debug)]
 pub struct App {
     config: AppConfig,
     messages: Vec<ChatMessage>,
+    tool_context: ToolContext,
+    tool_registry: ToolRegistry,
     input: InputBuffer,
     status: String,
     streaming: bool,
@@ -134,11 +143,19 @@ pub struct App {
     attachments: Vec<FileAttachment>,
     plan_items: Vec<PlanItem>,
     tool_runtime: ToolRuntime,
+    approval_mode_shared: Arc<Mutex<ApprovalMode>>,
     slash_menu_selected: usize,
 }
 
 impl App {
     pub fn new(config: AppConfig) -> Self {
+        let workspace_root = env::current_dir().unwrap_or_else(|_| ".".into());
+        let tool_context = ToolContext::new(workspace_root);
+        let tool_registry = ToolRegistryBuilder::new()
+            .with_file_tools()
+            .with_shell_tools()
+            .build();
+        let approval_mode_shared = Arc::new(Mutex::new(ApprovalMode::Prompt));
         let status = if config.api_key.is_some() {
             "Ready".to_string()
         } else {
@@ -148,6 +165,8 @@ impl App {
         Self {
             config,
             messages: Vec::new(),
+            tool_context,
+            tool_registry,
             input: InputBuffer::new(),
             status,
             streaming: false,
@@ -171,6 +190,7 @@ impl App {
             attachments: Vec::new(),
             plan_items: Vec::new(),
             tool_runtime: ToolRuntime::default(),
+            approval_mode_shared,
             slash_menu_selected: 0,
         }
     }
@@ -196,7 +216,9 @@ impl App {
         self.render_input(frame, chunks[2]);
         self.render_footer(frame, chunks[3]);
 
-        if self.help.open {
+        if self.tool_runtime.pending_approval.is_some() {
+            self.render_approval_overlay(frame, area);
+        } else if self.help.open {
             self.render_help_overlay(frame, area);
         } else if self.command_palette.open {
             self.render_command_palette_overlay(frame, area);
@@ -220,6 +242,9 @@ impl App {
     ) -> Result<bool> {
         match event {
             Event::Key(key) => {
+                if self.tool_runtime.pending_approval.is_some() {
+                    return Ok(self.handle_approval_key(key));
+                }
                 if self.help.open {
                     return Ok(self.handle_help_key(key));
                 }
@@ -396,6 +421,27 @@ impl App {
                 self.refresh_model_picker_catalog();
                 self.status = format!("Model refresh failed; using local suggestions ({error})");
             }
+            AppEvent::Status(status) => {
+                self.status = status;
+            }
+            AppEvent::ApprovalRequested(request, responder) => {
+                self.tool_runtime.begin_approval(request.clone(), responder);
+                self.status = format!("Approval required: {}", request.summary);
+            }
+            AppEvent::ToolStarted(request) => {
+                self.tool_runtime.start(request.clone());
+                self.status = request.summary;
+            }
+            AppEvent::ToolFinished(request) => {
+                let status = match request.status {
+                    ToolStatus::Completed => request.summary.clone(),
+                    ToolStatus::Failed => format!("Tool failed: {}", request.summary),
+                    ToolStatus::Denied => format!("Tool denied: {}", request.summary),
+                    ToolStatus::PendingApproval | ToolStatus::Running => request.summary.clone(),
+                };
+                self.tool_runtime.finish(request);
+                self.status = status;
+            }
         }
     }
 
@@ -422,6 +468,11 @@ impl App {
             Span::raw(" | attachments: "),
             Span::styled(
                 self.attachments.len().to_string(),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::raw(" | jobs: "),
+            Span::styled(
+                self.active_shell_jobs().to_string(),
                 Style::default().fg(Color::Yellow),
             ),
             Span::raw(" | "),
@@ -854,6 +905,47 @@ impl App {
         );
     }
 
+    fn render_approval_overlay(&self, frame: &mut Frame, area: Rect) {
+        let popup = centered_rect(area, 76, 38);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Block::default()
+                .title("Tool approval")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+            popup,
+        );
+
+        let Some(pending) = self.tool_runtime.pending_approval.as_ref() else {
+            return;
+        };
+
+        let kind = match pending.request.kind {
+            crate::tools::ToolKind::FileRead => "File read",
+            crate::tools::ToolKind::FileWrite => "File write",
+            crate::tools::ToolKind::Shell => "Shell",
+        };
+        let mode = match self.tool_runtime.approval_mode {
+            ApprovalMode::Prompt => "prompt",
+            ApprovalMode::ReadOnly => "read-only",
+            ApprovalMode::Auto => "auto",
+        };
+        let body = format!(
+            "Kind: {kind}\nTool: {}\nMode: {mode}\n\n{}\n\nEnter/y approve | Esc/n deny | a auto-approve future tools | r deny and switch to read-only mode | p prompt mode",
+            pending.request.name, pending.request.summary
+        );
+        frame.render_widget(
+            Paragraph::new(body)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Pending request"),
+                )
+                .wrap(Wrap { trim: false }),
+            centered_rect(popup, 94, 80),
+        );
+    }
+
     fn render_slash_menu_overlay(&mut self, frame: &mut Frame, area: Rect) {
         let popup = centered_rect(area, 72, 34);
         frame.render_widget(Clear, popup);
@@ -1052,7 +1144,7 @@ impl App {
     }
 
     fn handle_message_pager_key(&mut self, key: KeyEvent) -> bool {
-        if closes_overlay(key) || matches!(key.code, KeyCode::Char('l')) {
+        if closes_overlay(key) || opens_last_message_pager(key) {
             self.message_pager = MessagePagerState::default();
             return false;
         }
@@ -1143,17 +1235,106 @@ impl App {
         self.status = "Streaming from MiMo...".to_string();
         self.scroll_to_bottom();
         self.attachments.clear();
+        let tool_context = self.tool_context.clone();
+        let tool_registry = self.tool_registry.clone();
+        let approval_mode = Arc::clone(&self.approval_mode_shared);
 
         let stream_task = tokio::spawn(async move {
-            let result = client
-                .stream_chat(&request_messages, |delta| {
+            let result = agent::run_agent_turn(
+                &client,
+                request_messages,
+                &tool_registry,
+                &tool_context,
+                |delta| {
                     event_tx
                         .send(AppEvent::Delta(delta.to_string()))
                         .context("TUI closed")?;
                     Ok(())
-                })
-                .await
-                .map_err(|error| error.to_string());
+                },
+                |status| {
+                    match status {
+                        AgentStatus::ToolRequested(invocation) => {
+                            event_tx
+                                .send(AppEvent::Status(format!(
+                                    "Preparing {}",
+                                    invocation.summary
+                                )))
+                                .context("TUI closed")?;
+                        }
+                        AgentStatus::ToolStarted(invocation) => {
+                            let request = tool_request_from_invocation(
+                                &invocation,
+                                ToolStatus::Running,
+                                format!("Running {}", invocation.summary),
+                            );
+                            event_tx
+                                .send(AppEvent::ToolStarted(request))
+                                .context("TUI closed")?;
+                        }
+                        AgentStatus::ToolSucceeded(invocation, summary) => {
+                            let request = tool_request_from_invocation(
+                                &invocation,
+                                ToolStatus::Completed,
+                                summary,
+                            );
+                            event_tx
+                                .send(AppEvent::ToolFinished(request))
+                                .context("TUI closed")?;
+                        }
+                        AgentStatus::ToolFailed(invocation, error) => {
+                            let request = tool_request_from_invocation(
+                                &invocation,
+                                ToolStatus::Failed,
+                                error,
+                            );
+                            event_tx
+                                .send(AppEvent::ToolFinished(request))
+                                .context("TUI closed")?;
+                        }
+                        AgentStatus::ToolFinished(invocation, approved) => {
+                            if !approved {
+                                let request = tool_request_from_invocation(
+                                    &invocation,
+                                    ToolStatus::Denied,
+                                    format!("Denied {}", invocation.summary),
+                                );
+                                event_tx
+                                    .send(AppEvent::ToolFinished(request))
+                                    .context("TUI closed")?;
+                            }
+                        }
+                    }
+                    Ok(())
+                },
+                |invocation| {
+                    let event_tx = event_tx.clone();
+                    let approval_mode = Arc::clone(&approval_mode);
+                    async move {
+                        match approval_mode
+                            .lock()
+                            .map(|guard| *guard)
+                            .unwrap_or(ApprovalMode::Prompt)
+                        {
+                            ApprovalMode::Auto => Ok(true),
+                            ApprovalMode::ReadOnly => Ok(false),
+                            ApprovalMode::Prompt => {
+                                let (response_tx, response_rx) = oneshot::channel();
+                                let request = tool_request_from_invocation(
+                                    &invocation,
+                                    ToolStatus::PendingApproval,
+                                    invocation.summary.clone(),
+                                );
+                                event_tx
+                                    .send(AppEvent::ApprovalRequested(request, response_tx))
+                                    .context("TUI closed")?;
+                                response_rx.await.context("approval prompt dropped")
+                            }
+                        }
+                    }
+                },
+            )
+            .await
+            .map_err(|error| error.to_string());
 
             let _ = event_tx.send(AppEvent::Finished(result));
         });
@@ -1404,6 +1585,7 @@ impl App {
         self.assistant_index = None;
         self.last_prompt = None;
         self.scroll = 0;
+        self.tool_runtime.clear_transient();
         self.status = "Conversation cleared".to_string();
     }
 
@@ -1467,6 +1649,49 @@ impl App {
     fn handle_escape_key(&mut self) {
         if self.streaming {
             self.cancel_active_stream();
+        }
+    }
+
+    fn handle_approval_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
+                if let Some(request) = self.tool_runtime.approve_pending(true) {
+                    self.status = format!("Approved: {}", request.summary);
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('n' | 'N') => {
+                if let Some(request) = self.tool_runtime.approve_pending(false) {
+                    self.status = format!("Denied: {}", request.summary);
+                }
+            }
+            KeyCode::Char('a' | 'A') => {
+                self.set_approval_mode(ApprovalMode::Auto);
+                if let Some(request) = self.tool_runtime.approve_pending(true) {
+                    self.status = format!("Approved and enabled auto mode: {}", request.summary);
+                }
+            }
+            KeyCode::Char('r' | 'R') => {
+                self.set_approval_mode(ApprovalMode::ReadOnly);
+                if let Some(request) = self.tool_runtime.approve_pending(false) {
+                    self.status = format!(
+                        "Denied and switched to read-only approval mode: {}",
+                        request.summary
+                    );
+                }
+            }
+            KeyCode::Char('p' | 'P') => {
+                self.set_approval_mode(ApprovalMode::Prompt);
+                self.status = "Approval mode switched to prompt".to_string();
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn set_approval_mode(&mut self, mode: ApprovalMode) {
+        self.tool_runtime.approval_mode = mode;
+        if let Ok(mut shared) = self.approval_mode_shared.lock() {
+            *shared = mode;
         }
     }
 
@@ -1539,6 +1764,7 @@ impl App {
             Role::System => "System",
             Role::User => "You",
             Role::Assistant => "MiMo",
+            Role::Tool => "Tool",
         };
         self.message_pager.open = true;
         self.message_pager.title = format!("Last message — {role}");
@@ -1586,6 +1812,7 @@ impl App {
         self.plan_items = session.plan_items;
         self.attachments = session.attachments;
         self.assistant_index = None;
+        self.tool_runtime.clear_transient();
         self.scroll_to_bottom();
         self.last_prompt = self.last_user_prompt();
         self.session_picker = SessionPickerState::default();
@@ -1704,6 +1931,7 @@ impl App {
                 Role::System => ("System", Color::DarkGray),
                 Role::User => ("You", Color::Green),
                 Role::Assistant => ("MiMo", Color::Cyan),
+                Role::Tool => ("Tool", Color::Yellow),
             };
 
             lines.push(Line::styled(
@@ -1772,11 +2000,10 @@ impl App {
     }
 
     fn status_summary(&self) -> Result<String> {
-        let cwd = env::current_dir()?;
         let session_count = session_store::list_sessions(&self.config)?.len();
         Ok(format!(
-            "Status\n\nWorkspace    : {}\nMode         : {}\nModel        : {}\nStreaming    : {}\nMessages     : {}\nSaved files  : {}\nAPI key      : {}\nAttachments  : {}\nDraft stash  : {}\nPlan items   : {}\nTools        : {}",
-            cwd.display(),
+            "Status\n\nWorkspace    : {}\nMode         : {}\nModel        : {}\nStreaming    : {}\nMessages     : {}\nSaved files  : {}\nAPI key      : {}\nAttachments  : {}\nDraft stash  : {}\nPlan items   : {}\nShell jobs   : {}\nTools        : {}",
+            self.tool_context.workspace_root.display(),
             self.mode,
             self.config.model,
             if self.streaming { "yes" } else { "no" },
@@ -1786,6 +2013,7 @@ impl App {
             self.attachments.len(),
             self.draft_stash.len(),
             self.plan_items.len(),
+            self.active_shell_jobs(),
             self.tool_runtime.summary(),
         ))
     }
@@ -1801,6 +2029,20 @@ impl App {
             output.push_str(&format!("{}. [{}] {}\n", index + 1, marker, item.text));
         }
         output
+    }
+
+    fn active_shell_jobs(&self) -> usize {
+        self.tool_context
+            .shell_manager
+            .lock()
+            .ok()
+            .and_then(|mut manager| manager.list_jobs().ok())
+            .map(|jobs| {
+                jobs.into_iter()
+                    .filter(|job| job.status == crate::tools::ShellStatus::Running)
+                    .count()
+            })
+            .unwrap_or(0)
     }
 
     fn draft_browser_items(&self) -> &Vec<String> {
@@ -1878,7 +2120,7 @@ fn stashes_draft(key: KeyEvent) -> bool {
 }
 
 fn opens_last_message_pager(key: KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Char('l')) && key.modifiers == KeyModifiers::NONE
+    matches!(key.code, KeyCode::Char('l' | 'L') if key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
 fn inserts_newline(key: KeyEvent) -> bool {
@@ -2004,6 +2246,20 @@ fn remember_draft(bucket: &mut Vec<String>, draft: &str) {
     }
     bucket.insert(0, draft.to_string());
     bucket.truncate(20);
+}
+
+fn tool_request_from_invocation(
+    invocation: &ToolInvocation,
+    status: ToolStatus,
+    summary: String,
+) -> ToolRequest {
+    ToolRequest {
+        id: invocation.call_id.clone(),
+        name: invocation.name.clone(),
+        kind: invocation.kind,
+        summary,
+        status,
+    }
 }
 
 #[cfg(test)]
@@ -2159,6 +2415,18 @@ mod tests {
             KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
             false
         ));
+    }
+
+    #[test]
+    fn last_message_pager_requires_ctrl_l() {
+        assert!(!opens_last_message_pager(KeyEvent::new(
+            KeyCode::Char('l'),
+            KeyModifiers::NONE
+        )));
+        assert!(opens_last_message_pager(KeyEvent::new(
+            KeyCode::Char('l'),
+            KeyModifiers::CONTROL
+        )));
     }
 
     #[test]

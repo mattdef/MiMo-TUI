@@ -3,20 +3,26 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::config::AppConfig;
+use crate::{config::AppConfig, tools::ApiTool};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     System,
     User,
     Assistant,
+    Tool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatMessage {
     pub role: Role,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 impl ChatMessage {
@@ -24,6 +30,8 @@ impl ChatMessage {
         Self {
             role: Role::System,
             content: content.into(),
+            tool_call_id: None,
+            tool_calls: None,
         }
     }
 
@@ -31,6 +39,8 @@ impl ChatMessage {
         Self {
             role: Role::User,
             content: content.into(),
+            tool_call_id: None,
+            tool_calls: None,
         }
     }
 
@@ -38,8 +48,51 @@ impl ChatMessage {
         Self {
             role: Role::Assistant,
             content: content.into(),
+            tool_call_id: None,
+            tool_calls: None,
         }
     }
+
+    pub fn assistant_with_tool_calls(
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCall>,
+    ) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            tool_call_id: None,
+            tool_calls: Some(tool_calls),
+        }
+    }
+
+    pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: content.into(),
+            tool_call_id: Some(tool_call_id.into()),
+            tool_calls: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: ToolFunction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolFunction {
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AssistantResponse {
+    pub content: String,
+    pub tool_calls: Vec<ToolCall>,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +110,10 @@ struct ChatRequest<'a> {
     messages: &'a [ChatMessage],
     stream: bool,
     temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a [ApiTool]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'a str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,11 +124,35 @@ struct ChatChunk {
 #[derive(Debug, Deserialize)]
 struct Choice {
     delta: Delta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct Delta {
+    #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCallDelta>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ToolCallDelta {
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    #[serde(default)]
+    function: Option<ToolFunctionDelta>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ToolFunctionDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,7 +182,12 @@ impl MimoClient {
         })
     }
 
-    pub async fn stream_chat<F>(&self, messages: &[ChatMessage], mut on_delta: F) -> Result<()>
+    pub async fn stream_chat_completion<F>(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ApiTool],
+        mut on_delta: F,
+    ) -> Result<AssistantResponse>
     where
         F: FnMut(&str) -> Result<()>,
     {
@@ -111,6 +197,8 @@ impl MimoClient {
             messages,
             stream: true,
             temperature: self.temperature,
+            tools: (!tools.is_empty()).then_some(tools),
+            tool_choice: (!tools.is_empty()).then_some("auto"),
         };
 
         let response = self
@@ -131,6 +219,9 @@ impl MimoClient {
             bail!("MiMo API returned {status}: {body}");
         }
 
+        let mut content = String::new();
+        let mut tool_calls = Vec::new();
+        let mut finish_reason = None;
         let mut buffer = String::new();
         let mut stream = response.bytes_stream();
 
@@ -140,17 +231,35 @@ impl MimoClient {
 
             while let Some(newline) = buffer.find('\n') {
                 let line = buffer.drain(..=newline).collect::<String>();
-                if handle_sse_line(line.trim(), &mut on_delta)? {
-                    return Ok(());
+                if handle_sse_line(
+                    line.trim(),
+                    &mut content,
+                    &mut tool_calls,
+                    &mut finish_reason,
+                    &mut on_delta,
+                )? {
+                    return Ok(AssistantResponse {
+                        content,
+                        tool_calls,
+                    });
                 }
             }
         }
 
         if !buffer.trim().is_empty() {
-            handle_sse_line(buffer.trim(), &mut on_delta)?;
+            handle_sse_line(
+                buffer.trim(),
+                &mut content,
+                &mut tool_calls,
+                &mut finish_reason,
+                &mut on_delta,
+            )?;
         }
 
-        Ok(())
+        Ok(AssistantResponse {
+            content,
+            tool_calls,
+        })
     }
 
     pub async fn list_models(&self) -> Result<Vec<String>> {
@@ -190,7 +299,13 @@ fn model_ids_from_response(response: ModelListResponse) -> Vec<String> {
         .collect()
 }
 
-fn handle_sse_line<F>(line: &str, on_delta: &mut F) -> Result<bool>
+fn handle_sse_line<F>(
+    line: &str,
+    content: &mut String,
+    tool_calls: &mut Vec<ToolCall>,
+    finish_reason: &mut Option<String>,
+    on_delta: &mut F,
+) -> Result<bool>
 where
     F: FnMut(&str) -> Result<()>,
 {
@@ -211,17 +326,61 @@ where
         .map_err(|source| anyhow!("failed to parse MiMo stream event: {source}; data={data}"))?;
 
     for choice in chunk.choices {
-        if let Some(content) = choice.delta.content {
-            on_delta(&content)?;
+        if choice.finish_reason.is_some() {
+            *finish_reason = choice.finish_reason;
+        }
+        if let Some(delta_content) = choice.delta.content {
+            on_delta(&delta_content)?;
+            content.push_str(&delta_content);
+        }
+        merge_tool_call_deltas(tool_calls, choice.delta.tool_calls.unwrap_or_default());
+        if finish_reason.as_deref() == Some("tool_calls") {
+            return Ok(true);
         }
     }
 
     Ok(false)
 }
 
+fn merge_tool_call_deltas(tool_calls: &mut Vec<ToolCall>, deltas: Vec<ToolCallDelta>) {
+    for delta in deltas {
+        while tool_calls.len() <= delta.index {
+            tool_calls.push(ToolCall {
+                id: String::new(),
+                kind: "function".to_string(),
+                function: ToolFunction {
+                    name: String::new(),
+                    arguments: String::new(),
+                },
+            });
+        }
+
+        let call = &mut tool_calls[delta.index];
+        if let Some(id) = delta.id
+            && call.id.is_empty()
+        {
+            call.id = id;
+        }
+        if let Some(kind) = delta.kind {
+            call.kind = kind;
+        }
+        if let Some(function) = delta.function {
+            if let Some(name) = function.name {
+                call.function.name.push_str(&name);
+            }
+            if let Some(arguments) = function.arguments {
+                call.function.arguments.push_str(&arguments);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ModelListResponse, model_ids_from_response};
+    use super::{
+        ModelListResponse, ToolCall, ToolCallDelta, ToolFunction, ToolFunctionDelta,
+        handle_sse_line, merge_tool_call_deltas, model_ids_from_response,
+    };
 
     #[test]
     fn extracts_model_ids_from_openai_style_catalog() {
@@ -238,5 +397,85 @@ mod tests {
         let models = model_ids_from_response(response);
 
         assert_eq!(models, vec!["mimo-v2-flash", "mimo-v2.5-pro"]);
+    }
+
+    #[test]
+    fn merges_streamed_tool_call_deltas() {
+        let mut tool_calls = Vec::new();
+        merge_tool_call_deltas(
+            &mut tool_calls,
+            vec![
+                ToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".to_string()),
+                    kind: Some("function".to_string()),
+                    function: Some(ToolFunctionDelta {
+                        name: Some("read_file".to_string()),
+                        arguments: Some("{\"path\":\"src/".to_string()),
+                    }),
+                },
+                ToolCallDelta {
+                    index: 0,
+                    id: None,
+                    kind: None,
+                    function: Some(ToolFunctionDelta {
+                        name: None,
+                        arguments: Some("main.rs\"}".to_string()),
+                    }),
+                },
+            ],
+        );
+
+        assert_eq!(
+            tool_calls,
+            vec![ToolCall {
+                id: "call_1".to_string(),
+                kind: "function".to_string(),
+                function: ToolFunction {
+                    name: "read_file".to_string(),
+                    arguments: "{\"path\":\"src/main.rs\"}".to_string(),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn detects_tool_call_finish_reason() {
+        let mut content = String::new();
+        let mut tool_calls = Vec::new();
+        let mut finish_reason = None;
+        let done = handle_sse_line(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"src/main.rs\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            &mut content,
+            &mut tool_calls,
+            &mut finish_reason,
+            &mut |_| Ok(()),
+        )
+        .expect("line should parse");
+
+        assert!(done);
+        assert_eq!(finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn accepts_null_tool_calls_in_stream_chunks() {
+        let mut content = String::new();
+        let mut tool_calls = Vec::new();
+        let mut finish_reason = None;
+
+        let done = handle_sse_line(
+            r#"data: {"choices":[{"delta":{"role":"assistant","content":"","reasoning_content":null,"tool_calls":null},"finish_reason":null}]}"#,
+            &mut content,
+            &mut tool_calls,
+            &mut finish_reason,
+            &mut |_| Ok(()),
+        )
+        .expect("line should parse");
+
+        assert!(!done);
+        assert!(content.is_empty());
+        assert!(tool_calls.is_empty());
+        assert!(finish_reason.is_none());
     }
 }
