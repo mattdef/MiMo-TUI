@@ -306,6 +306,22 @@ fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
+/// Vérifie qu'aucun composant du chemin n'est un symlink.
+///
+/// # Sécurité
+///
+/// Cette vérification est **best-effort** et non une garantie de sécurité complète.
+/// Elle protège contre les symlinks accidentels ou malveillants présents au moment
+/// de la vérification, mais ne protège pas contre les attaques TOCTOU (Time-Of-Check
+/// Time-Of-Use) où un attaquant modifierait le filesystem entre cette vérification
+/// et l'ouverture du fichier.
+///
+/// Une protection TOCTOU-safe complète nécessiterait `openat2()` avec `RESOLVE_NO_SYMLINKS`
+/// (Linux 5.6+), qui n'est pas disponible partout. Cette approche est un compromis
+/// pragmatique qui couvre la majorité des cas d'usage.
+///
+/// La protection finale repose sur `O_NOFOLLOW` dans `read_file_safe` et `write_file_safe`
+/// qui refusent d'ouvrir un symlink comme fichier cible.
 fn ensure_no_symlink_component(path: &Path) -> Result<()> {
     let mut current = Some(path);
     while let Some(p) = current {

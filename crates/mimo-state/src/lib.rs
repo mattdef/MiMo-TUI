@@ -20,6 +20,33 @@ pub(crate) fn ensure_parent_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Écrit `contents` dans `path` de manière atomique (quand possible).
+///
+/// # Stratégie
+///
+/// 1. Écrit dans un fichier temporaire `.{filename}.tmp`
+/// 2. Renomme le fichier temporaire vers le chemin cible
+///
+/// # Limitations
+///
+/// ## Unix (Linux, macOS)
+/// L'opération est atomique grâce à `rename()` qui remplace atomiquement la cible.
+///
+/// ## Windows
+/// L'opération **n'est pas strictement atomique** : `rename()` échoue si la cible existe,
+/// donc on doit d'abord supprimer la cible (`remove_file`) puis renommer. Si le processus
+/// crashe entre ces deux opérations, le fichier cible est perdu.
+///
+/// Une vraie atomicité sur Windows nécessiterait `MoveFileEx` avec `MOVEFILE_REPLACE_EXISTING`,
+/// mais cela ajouterait une dépendance sur `windows-sys` pour un cas marginal.
+///
+/// # Garantie
+///
+/// Sur Unix : le fichier cible est soit l'ancien contenu, soit le nouveau contenu, jamais
+/// un état intermédiaire ou corrompu.
+///
+/// Sur Windows : en cas de crash pendant l'écriture, le fichier cible peut être perdu.
+/// Ce risque est acceptable car les fichiers d'état sont régénérables.
 pub(crate) fn write_string_atomic(path: &Path, contents: &str) -> Result<()> {
     ensure_parent_dir(path)?;
 

@@ -8,6 +8,28 @@ use tokio::task;
 
 const MAX_TOOL_ROUNDS: usize = 25;
 
+/// Abstraction pour un client de chat completion.
+///
+/// # Pourquoi cette complexité ?
+///
+/// Ce trait utilise des lifetimes explicites et `Pin<Box<dyn Future>>` au lieu de `async fn`
+/// pour plusieurs raisons :
+///
+/// 1. **Compatibilité avec `tokio::spawn`** : L'agent loop utilise `spawn_blocking` pour
+///    exécuter les tools, ce qui requiert que les futures soient `Send + 'static`. Les
+///    lifetimes explicites permettent de garantir cette propriété.
+///
+/// 2. **Pas de dépendance sur `async_trait`** : Bien que `async_trait` simplifierait la
+///    syntaxe, cela ajouterait une dépendance externe et générerait du code boxing automatique.
+///    L'approche manuelle donne un contrôle total sur le boxing et les lifetimes.
+///
+/// 3. **Flexibilité pour les mocks** : Les lifetimes liées à `&'a self` permettent aux
+///    implémentations de test (comme `TestClient`) de capturer des références sans cloning.
+///
+/// # Implémentation
+///
+/// Pour implémenter ce trait, wrappez votre `async fn` dans `Box::pin(async move { ... })`.
+/// Voir l'implémentation pour `MimoClient` comme exemple.
 pub trait ChatCompletionClient {
     fn stream_chat_completion<'a>(
         &'a self,

@@ -853,6 +853,21 @@ fn tail(text: &str, max_chars: usize) -> String {
         .collect::<String>()
 }
 
+/// Ajoute `chunk` à `buffer` en respectant la limite `MAX_OUTPUT_BUFFER_BYTES`.
+///
+/// # Comportement
+///
+/// - Si `buffer.len() >= MAX_OUTPUT_BUFFER_BYTES`, ne fait rien.
+/// - Si `chunk` tient dans l'espace restant, l'ajoute intégralement.
+/// - Sinon, ajoute ce qui tient puis `TRUNCATED_OUTPUT_NOTICE`.
+///
+/// # Note sur le dépassement
+///
+/// Le buffer final peut dépasser `MAX_OUTPUT_BUFFER_BYTES` de `TRUNCATED_OUTPUT_NOTICE.len()`
+/// bytes (actuellement 24 bytes). Ce dépassement mineur est acceptable car :
+/// - `TRUNCATED_OUTPUT_NOTICE` est petit et constant
+/// - Cela garantit que l'utilisateur voit toujours le message de troncature
+/// - L'impact mémoire est négligeable (24 bytes vs 8 MiB)
 fn bounded_append(buffer: &mut Vec<u8>, chunk: &[u8]) {
     if buffer.len() >= MAX_OUTPUT_BUFFER_BYTES {
         return;
