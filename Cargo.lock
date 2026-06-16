@@ -837,9 +837,9 @@ dependencies = [
  "anyhow",
  "dirs",
  "mimo-protocol",
- "reqwest",
  "serde",
  "toml",
+ "url",
 ]
 
 [[package]]

@@ -1,8 +1,8 @@
 use std::{env, fmt, fs, io::Write, path::PathBuf};
 
 use anyhow::{Context, Result};
-use reqwest::Url;
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 const DEFAULT_BASE_URL: &str = "https://api.xiaomimimo.com/v1";
 const DEFAULT_MODEL: &str = "mimo-v2-flash";
@@ -349,7 +349,7 @@ pub fn auto_route_model(messages: &[mimo_protocol::ChatMessage]) -> &'static str
 
 #[cfg(test)]
 mod tests {
-    use super::{known_mimo_models, normalize_model_name};
+    use super::{known_mimo_models, normalize_base_url, normalize_model_name};
 
     #[test]
     fn known_model_catalog_includes_mimo_25_models() {
@@ -362,5 +362,23 @@ mod tests {
     #[test]
     fn normalize_model_name_accepts_auto() {
         assert_eq!(normalize_model_name("AUTO"), Some("auto".to_string()));
+    }
+
+    #[test]
+    fn normalize_base_url_accepts_http_and_trims_trailing_slash() {
+        assert_eq!(
+            normalize_base_url("https://example.test/v1/"),
+            Some("https://example.test/v1".to_string())
+        );
+        assert_eq!(
+            normalize_base_url("http://example.test/"),
+            Some("http://example.test".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_base_url_rejects_non_http_schemes() {
+        assert_eq!(normalize_base_url("ftp://example.test"), None);
+        assert_eq!(normalize_base_url("not-a-url"), None);
     }
 }
