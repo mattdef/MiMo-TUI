@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -53,8 +53,7 @@ impl ToolSpec for ReadFileTool {
     fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult> {
         let path = required_str(&input, "path")?;
         let resolved = context.resolve_path(path)?;
-        let bytes = fs::read(&resolved)
-            .with_context(|| format!("failed to read {}", resolved.display()))?;
+        let bytes = read_file_safe(&resolved)?;
         let content = String::from_utf8(bytes)
             .map_err(|_| anyhow::anyhow!("{} is not valid UTF-8 text", resolved.display()))?;
         Ok(ToolResult::new(
@@ -295,6 +294,26 @@ impl ToolSpec for EditFileTool {
     }
 }
 
+/// Reads a file while refusing to follow a symlink on the final component.
+/// This is defense-in-depth: `resolve_path` already rejects paths that
+/// contain symlinks, but a race could still replace the target with a symlink.
+fn read_file_safe(path: &std::path::Path) -> Result<Vec<u8>> {
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = opts
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    Ok(bytes)
+}
+
 fn write_file_safe(path: &std::path::Path, content: &str) -> Result<()> {
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
@@ -338,6 +357,39 @@ mod tests {
 
     use super::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool};
     use crate::{ToolContext, ToolSpec};
+
+    #[cfg(unix)]
+    #[test]
+    fn read_file_safe_rejects_symlink_paths() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let target = workspace.path().join("target.txt");
+        let link = workspace.path().join("link.txt");
+        fs::write(&target, "hello").expect("write");
+        symlink(&target, &link).expect("symlink");
+
+        let error = super::read_file_safe(&link).expect_err("symlink read should fail");
+        assert!(error.to_string().contains("failed to open"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_file_tool_rejects_symlink_inside_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let target = workspace.path().join("target.txt");
+        let link = workspace.path().join("link.txt");
+        fs::write(&target, "hello").expect("write");
+        symlink(&target, &link).expect("symlink");
+        let context = ToolContext::new(workspace.path());
+
+        let error = ReadFileTool
+            .execute(json!({ "path": "link.txt" }), &context)
+            .expect_err("read_file should reject symlink path");
+        assert!(error.to_string().contains("symlink"));
+    }
 
     #[test]
     fn reads_utf8_file() {

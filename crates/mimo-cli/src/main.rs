@@ -2,12 +2,12 @@ use std::io::{self, Write};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use mimo_agent::run_agent_turn;
+use mimo_agent::{AgentStatus, run_agent_turn};
 use mimo_client::MimoClient;
 use mimo_config::{AppConfig, ConfigOverrides, known_mimo_models};
 use mimo_protocol::ChatMessage;
 use mimo_state::session_store;
-use mimo_tools::{ToolContext, ToolRegistryBuilder, default_workspace_root};
+use mimo_tools::{ApprovalRequirement, ToolContext, ToolRegistryBuilder, default_workspace_root};
 
 #[derive(Debug, Parser)]
 #[command(name = "mimo-tui")]
@@ -89,11 +89,21 @@ async fn ask(config: AppConfig, prompt: String) -> Result<()> {
             io::stdout().flush()?;
             Ok(())
         },
-        |_| Ok(()),
-        |_invocation| async move {
-            // In CLI mode, approve all tools to enable tool execution
-            // Read-only tools are already auto-approved, mutating tools are also approved here
-            Ok(true)
+        |status| {
+            if let AgentStatus::ToolRequested(invocation) = status
+                && !should_auto_approve_non_interactive_cli(invocation.approval_requirement)
+            {
+                eprintln!(
+                    "warning: denying '{}' in non-interactive ask mode; rerun in the TUI to approve mutating tools",
+                    invocation.summary
+                );
+            }
+            Ok(())
+        },
+        |invocation| async move {
+            Ok(should_auto_approve_non_interactive_cli(
+                invocation.approval_requirement,
+            ))
         },
     )
     .await?;
@@ -200,4 +210,24 @@ fn list_sessions(config: &AppConfig) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn should_auto_approve_non_interactive_cli(requirement: ApprovalRequirement) -> bool {
+    matches!(requirement, ApprovalRequirement::Auto)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_auto_approve_non_interactive_cli;
+    use mimo_tools::ApprovalRequirement;
+
+    #[test]
+    fn non_interactive_cli_only_auto_approves_read_only_tools() {
+        assert!(should_auto_approve_non_interactive_cli(
+            ApprovalRequirement::Auto
+        ));
+        assert!(!should_auto_approve_non_interactive_cli(
+            ApprovalRequirement::Prompt
+        ));
+    }
 }

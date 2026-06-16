@@ -19,8 +19,8 @@ use super::{
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum ApprovalRequirement {
-    #[default]
     Auto,
+    #[default]
     Prompt,
 }
 
@@ -123,6 +123,9 @@ impl ToolContext {
         } else {
             workspace.join(trimmed)
         };
+
+        ensure_no_symlink_component(&candidate)
+            .with_context(|| format!("path contains a symlink: {}", candidate.display()))?;
 
         let normalized = if candidate.exists() {
             candidate
@@ -301,6 +304,24 @@ fn normalize_path(path: &Path) -> PathBuf {
     }
 
     normalized
+}
+
+fn ensure_no_symlink_component(path: &Path) -> Result<()> {
+    let mut current = Some(path);
+    while let Some(p) = current {
+        match p.symlink_metadata() {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                bail!("path contains a symlink: {}", p.display());
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to inspect {}", p.display()));
+            }
+        }
+        current = p.parent();
+    }
+    Ok(())
 }
 
 fn unix_timestamp() -> u64 {

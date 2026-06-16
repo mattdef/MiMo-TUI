@@ -17,7 +17,17 @@ const MAX_SKILL_SIZE_BYTES: u64 = 256 * 1024;
 static SKILL_HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| {
     Client::builder()
         .timeout(Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::limited(3))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 3 {
+                return attempt.error(std::io::Error::other("too many redirects"));
+            }
+            if let Some(host) = attempt.url().host_str()
+                && !is_allowed_skill_host(host)
+            {
+                return attempt.error(std::io::Error::other("redirected to a disallowed host"));
+            }
+            attempt.follow()
+        }))
         .build()
         .expect("failed to build shared HTTP client")
 });
@@ -207,17 +217,21 @@ pub fn normalize_skill_name(value: &str) -> String {
 }
 
 fn is_allowed_skill_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return false;
+    mimo_protocol::is_allowed_remote_host(host)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_allowed_skill_host;
+
+    #[test]
+    fn rejects_private_and_local_skill_hosts() {
+        assert!(!is_allowed_skill_host("localhost"));
+        assert!(!is_allowed_skill_host("127.0.0.1"));
+        assert!(!is_allowed_skill_host("10.1.2.3"));
+        assert!(!is_allowed_skill_host("::1"));
+        assert!(!is_allowed_skill_host("fe80::1"));
+        assert!(!is_allowed_skill_host("fd12::1"));
+        assert!(is_allowed_skill_host("example.com"));
     }
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return !ip.is_loopback()
-            && !ip.is_unspecified()
-            && !ip.is_multicast()
-            && match ip {
-                std::net::IpAddr::V4(v4) => !v4.is_private() && !v4.is_link_local(),
-                std::net::IpAddr::V6(_) => true,
-            };
-    }
-    true
 }

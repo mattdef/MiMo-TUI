@@ -98,6 +98,31 @@ pub struct ApiToolFunction {
     pub parameters: serde_json::Value,
 }
 
+/// Returns `false` if `host` is `localhost` or resolves to a loopback,
+/// private, link-local, unique-local, multicast, or unspecified IP address.
+/// This is intentionally conservative: plain hostnames are allowed because
+/// DNS resolution is not performed here.
+pub fn is_allowed_remote_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return false;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return !ip.is_loopback()
+            && !ip.is_unspecified()
+            && !ip.is_multicast()
+            && match ip {
+                std::net::IpAddr::V4(v4) => !v4.is_private() && !v4.is_link_local(),
+                std::net::IpAddr::V6(v6) => {
+                    let octets = v6.octets();
+                    let is_unique_local = matches!(octets[0], 0xfc | 0xfd);
+                    let is_link_or_site_local = octets[0] == 0xfe;
+                    !is_unique_local && !is_link_or_site_local
+                }
+            };
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,6 +212,23 @@ mod tests {
             "\"assistant\""
         );
         assert_eq!(serde_json::to_string(&Role::Tool).unwrap(), "\"tool\"");
+    }
+
+    #[test]
+    fn rejects_local_and_private_hosts() {
+        assert!(!is_allowed_remote_host("localhost"));
+        assert!(!is_allowed_remote_host("127.0.0.1"));
+        assert!(!is_allowed_remote_host("10.0.0.5"));
+        assert!(!is_allowed_remote_host("169.254.1.10"));
+        assert!(!is_allowed_remote_host("::1"));
+        assert!(!is_allowed_remote_host("fe80::1"));
+        assert!(!is_allowed_remote_host("fd00::1"));
+    }
+
+    #[test]
+    fn allows_public_hosts() {
+        assert!(is_allowed_remote_host("example.com"));
+        assert!(is_allowed_remote_host("2606:2800:220:1:248:1893:25c8:1946"));
     }
 
     #[test]

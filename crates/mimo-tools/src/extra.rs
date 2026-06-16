@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use mimo_protocol::is_allowed_remote_host;
 use reqwest::{Url, blocking::Client};
 use serde_json::{Value, json};
 
@@ -19,7 +20,17 @@ use super::{
 static HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| {
     Client::builder()
         .timeout(Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::limited(3))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 3 {
+                return attempt.error(std::io::Error::other("too many redirects"));
+            }
+            if let Some(host) = attempt.url().host_str()
+                && !is_allowed_remote_host(host)
+            {
+                return attempt.error(std::io::Error::other("redirected to a disallowed host"));
+            }
+            attempt.follow()
+        }))
         .build()
         .expect("failed to build shared HTTP client")
 });
@@ -424,7 +435,7 @@ impl ToolSpec for WebFetchTool {
             bail!("only http(s) URLs are supported");
         }
         if let Some(host) = parsed.host_str() {
-            if !is_allowed_web_fetch_host(host) {
+            if !is_allowed_remote_host(host) {
                 bail!("internal/private hosts are not allowed: {host}");
             }
         }
@@ -902,22 +913,6 @@ fn bounded_usize(input: &Value, field: &str, default: usize, upper_bound: usize)
         .clamp(1, upper_bound)
 }
 
-fn is_allowed_web_fetch_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return false;
-    }
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return !ip.is_loopback()
-            && !ip.is_unspecified()
-            && !ip.is_multicast()
-            && match ip {
-                std::net::IpAddr::V4(v4) => !v4.is_private() && !v4.is_link_local(),
-                std::net::IpAddr::V6(_) => true,
-            };
-    }
-    true
-}
-
 fn summarize_path(path: &Path, max_depth: usize, max_entries: usize) -> Result<String> {
     let mut lines = vec![format!("Workspace: {}", path.display())];
     let mut entries_left = max_entries;
@@ -976,7 +971,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{FindPathsTool, SearchTextTool};
+    use super::{FindPathsTool, SearchTextTool, is_allowed_remote_host};
     use crate::{ToolContext, ToolSpec};
 
     #[test]
@@ -1007,5 +1002,18 @@ mod tests {
             .execute(json!({ "query": "todo" }), &context)
             .expect("search result");
         assert!(result.content.contains("\"line\": 2"));
+    }
+
+    #[test]
+    fn rejects_private_and_local_web_fetch_hosts() {
+        assert!(!is_allowed_remote_host("localhost"));
+        assert!(!is_allowed_remote_host("127.0.0.1"));
+        assert!(!is_allowed_remote_host("10.0.0.5"));
+        assert!(!is_allowed_remote_host("169.254.1.10"));
+        assert!(!is_allowed_remote_host("::1"));
+        assert!(!is_allowed_remote_host("fe80::1"));
+        assert!(!is_allowed_remote_host("fd00::1"));
+        assert!(is_allowed_remote_host("example.com"));
+        assert!(is_allowed_remote_host("2606:2800:220:1:248:1893:25c8:1946"));
     }
 }

@@ -951,7 +951,7 @@ impl App {
     }
 
     fn footer_summary(&self) -> String {
-        match self.footer_context_chars() {
+        let summary = match self.footer_context_chars() {
             Ok(used_chars) => {
                 let max_chars = estimated_max_context_chars(&self.config.model);
                 let used_percent = ((used_chars as f64 / max_chars as f64) * 100.0).min(100.0);
@@ -961,6 +961,12 @@ impl App {
                 )
             }
             Err(_) => "context unavailable · F1/? help".to_string(),
+        };
+
+        if self.mode == AppMode::Yolo {
+            format!("{summary} · YOLO auto-approves mutating tools")
+        } else {
+            summary
         }
     }
 
@@ -4419,6 +4425,15 @@ mod tests {
         let screen = render_screen(&mut app);
         assert!(screen.contains("Conversation"));
         assert!(screen.contains("Plan"));
+    }
+
+    #[test]
+    fn yolo_mode_shows_persistent_safety_warning() {
+        let mut app = test_app();
+        app.mode = AppMode::Yolo;
+
+        let screen = render_screen(&mut app);
+        assert!(screen.contains("YOLO auto-approves mutating tools"));
     }
 
     #[test]
