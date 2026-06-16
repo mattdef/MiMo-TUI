@@ -301,8 +301,14 @@ impl ToolSpec for EditFileTool {
 }
 
 /// Reads a file while refusing to follow a symlink on the final component.
+///
 /// This is defense-in-depth: `resolve_path` already rejects paths that
 /// contain symlinks, but a race could still replace the target with a symlink.
+///
+/// # Platform support
+///
+/// - **Unix (Linux, macOS):** Uses `O_NOFOLLOW` to refuse symlinks.
+/// - **Windows:** No equivalent flag is available; behaves like `fs::read`.
 fn read_file_safe(path: &std::path::Path) -> Result<Vec<u8>> {
     let mut opts = fs::OpenOptions::new();
     opts.read(true);

@@ -166,7 +166,7 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use anyhow::{Result, bail};
+    use anyhow::{Context, Result, anyhow, bail};
     use mimo_client::AssistantResponse;
     use mimo_protocol::{ApiTool, ChatMessage, Role, ToolCall, ToolFunction};
     use mimo_tools::{
@@ -217,12 +217,15 @@ mod tests {
             let snapshot = messages.to_vec();
 
             Box::pin(async move {
-                seen_messages.lock().expect("seen messages").push(snapshot);
+                seen_messages
+                    .lock()
+                    .map_err(|poison| anyhow!("test mutex poisoned: {poison}"))?
+                    .push(snapshot);
                 let round = rounds
                     .lock()
-                    .expect("rounds")
+                    .map_err(|poison| anyhow!("test mutex poisoned: {poison}"))?
                     .pop_front()
-                    .expect("expected queued round");
+                    .context("expected queued round")?;
                 for delta in &round.deltas {
                     on_delta(delta)?;
                 }

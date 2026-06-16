@@ -93,6 +93,7 @@ Config can also be edited live inside the TUI with `/config`.
 - **plan** — read-only workflow: mutating tools are denied.
 - **agent** — normal workflow: mutating tools require approval.
 - **yolo** — all tool requests are auto-approved.
+  ⚠️ **Warning:** `yolo` mode executes shell commands, file writes, and network requests without confirmation. Use only in trusted environments.
 
 For one-shot CLI use, `cargo run -- ask "..."` only auto-approves read-only tools and denies mutating ones.
 

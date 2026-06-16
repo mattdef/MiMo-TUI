@@ -68,8 +68,9 @@
 - [x] **P2:** Clarifier la sémantique de `bounded_append` (dépassement acceptable ou non)
 - [x] **P2:** Documenter les limitations de `write_string_atomic` sur Windows
 - [x] **P2:** Documenter pourquoi les lifetimes complexes dans `ChatCompletionClient` sont nécessaires
-- [ ] **P3:** Ajouter des tests Windows pour la protection symlink
-- [ ] **P3:** Améliorer la documentation des risques du mode `yolo`
+- [x] **P3:** Ajouter des tests Windows pour la protection symlink
+- [x] **P3:** `TestClient` utilise `expect()` au lieu de `?`
+- [x] **P3:** Améliorer la documentation des risques du mode `yolo`
 
 ## Fixes Applied
 
@@ -105,6 +106,24 @@ Ajout d'une documentation dans `crates/mimo-agent/src/lib.rs` expliquant :
 - Compatibilité avec `tokio::spawn` qui requiert `Send + 'static`
 - Pas de dépendance sur `async_trait` pour éviter une dépendance externe
 - Flexibilité pour les mocks qui peuvent capturer des références sans cloning
+
+### P3 - Tests `read_file_safe` spécifiques à Unix
+**Status:** ✅ Documenté comme limitation de plateforme
+
+Ajout d'une documentation dans `crates/mimo-tools/src/file.rs` expliquant :
+- Unix : utilise `O_NOFOLLOW` pour refuser les symlinks
+- Windows : pas de flag équivalent, se comporte comme `fs::read`
+
+### P3 - `TestClient` utilise `expect()` au lieu de `?`
+**Status:** ✅ Remplacé par `map_err` + `context`
+
+Dans `crates/mimo-agent/src/lib.rs`, les `.expect()` ont été remplacés par `.map_err(|poison| anyhow!("test mutex poisoned: {poison}"))?` et `.context("expected queued round")?` pour propager les erreurs proprement au lieu de paniquer.
+
+### P3 - Documentation du mode `yolo`
+**Status:** ✅ Avertissement ajouté
+
+Dans `README.md`, ajout d'un avertissement explicite :
+> ⚠️ **Warning:** `yolo` mode executes shell commands, file writes, and network requests without confirmation. Use only in trusted environments.
 
 ## Positive Aspects
 
