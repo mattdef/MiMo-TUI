@@ -1,4 +1,7 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 
@@ -81,7 +84,7 @@ pub fn search_memory(config: &AppConfig, query: &str, max_results: usize) -> Res
         .collect())
 }
 
-fn write_notes(path: &PathBuf, notes: &[String]) -> Result<()> {
+fn write_notes(path: &Path, notes: &[String]) -> Result<()> {
     let mut output = String::new();
     for note in notes {
         output.push_str("- ");

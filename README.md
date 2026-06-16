@@ -60,6 +60,7 @@ For the full test suite across every crate, use:
 
 ```bash
 cargo test --workspace
+cargo clippy --workspace -- -D warnings
 ```
 
 ---

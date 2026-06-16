@@ -75,10 +75,10 @@ pub fn install_skill(config: &AppConfig, spec: &str) -> Result<InstalledSkill> {
         if !matches!(parsed.scheme(), "http" | "https") {
             bail!("only http(s) URLs are supported for skill installation");
         }
-        if let Some(host) = parsed.host_str() {
-            if !is_allowed_skill_host(host) {
-                bail!("internal/private hosts are not allowed for skill installation: {host}");
-            }
+        if let Some(host) = parsed.host_str()
+            && !is_allowed_skill_host(host)
+        {
+            bail!("internal/private hosts are not allowed for skill installation: {host}");
         }
         let response = SKILL_HTTP_CLIENT
             .get(spec)

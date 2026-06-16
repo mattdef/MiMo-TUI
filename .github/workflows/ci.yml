@@ -8,8 +8,38 @@ on:
   pull_request:
 
 jobs:
-  rust:
+  lint-and-test:
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --quiet
+
+  cross-platform-check:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,9 +52,3 @@ jobs:
 
       - name: cargo check
         run: cargo check --quiet
-
-      - name: cargo fmt
-        run: cargo fmt --check
-
-      - name: cargo test
-        run: cargo test --workspace --quiet

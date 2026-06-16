@@ -8,7 +8,8 @@
 
 ```bash
 cargo check              # fast compile check
-cargo fmt --check        # formatting verification (the only lint step)
+cargo fmt --check        # formatting verification
+cargo clippy --workspace -- -D warnings  # lint step enforced by CI
 cargo test --workspace   # full workspace suite
 cargo run                # launch TUI
 cargo run -- doctor      # print resolved config

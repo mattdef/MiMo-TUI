@@ -3,7 +3,8 @@
 ## Build, test, and verification commands
 
 - `cargo check` — fast compile check for the whole crate
-- `cargo fmt --check` — formatting check used as the closest thing to a lint step in this repo
+- `cargo fmt --check` — formatting verification for the whole workspace
+- `cargo clippy --workspace -- -D warnings` — lint step enforced by CI
 - `cargo test --workspace` — run the full workspace test suite
 - `cargo test <test_name>` — run a single test or a filtered subset by name
 - `cargo run` — launch the TUI

@@ -1,4 +1,5 @@
 use std::{
+    cmp::Reverse,
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -40,6 +41,7 @@ pub struct SessionEntry {
     pub message_count: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn save_session(
     config: &AppConfig,
     model: &str,
@@ -86,6 +88,7 @@ pub fn load_session(config: &AppConfig, path: Option<&str>) -> Result<(SavedSess
     Ok((session, path))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn export_markdown(
     config: &AppConfig,
     model: &str,
@@ -174,7 +177,7 @@ pub fn list_sessions(config: &AppConfig) -> Result<Vec<SessionEntry>> {
             })
         })
         .collect::<Vec<_>>();
-    entries.sort_by(|left, right| right.modified_epoch.cmp(&left.modified_epoch));
+    entries.sort_by_key(|entry| Reverse(entry.modified_epoch));
     Ok(entries)
 }
 

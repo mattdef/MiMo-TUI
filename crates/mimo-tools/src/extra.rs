@@ -434,10 +434,10 @@ impl ToolSpec for WebFetchTool {
         if !matches!(parsed.scheme(), "http" | "https") {
             bail!("only http(s) URLs are supported");
         }
-        if let Some(host) = parsed.host_str() {
-            if !is_allowed_remote_host(host) {
-                bail!("internal/private hosts are not allowed: {host}");
-            }
+        if let Some(host) = parsed.host_str()
+            && !is_allowed_remote_host(host)
+        {
+            bail!("internal/private hosts are not allowed: {host}");
         }
         let max_chars = bounded_usize(&input, "max_chars", 12_000, 50_000);
         let response = HTTP_CLIENT
