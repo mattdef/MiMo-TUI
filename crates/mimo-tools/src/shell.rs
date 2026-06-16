@@ -19,6 +19,9 @@ use crate::spec::CancellationFlag;
 
 use super::{ApprovalRequirement, ToolContext, ToolKind, ToolResult, ToolSpec, required_str};
 
+const MAX_OUTPUT_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+const TRUNCATED_OUTPUT_NOTICE: &[u8] = b"\n... output truncated ...\n";
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ShellStatus {
     Running,
@@ -850,6 +853,19 @@ fn tail(text: &str, max_chars: usize) -> String {
         .collect::<String>()
 }
 
+fn bounded_append(buffer: &mut Vec<u8>, chunk: &[u8]) {
+    if buffer.len() >= MAX_OUTPUT_BUFFER_BYTES {
+        return;
+    }
+    let remaining = MAX_OUTPUT_BUFFER_BYTES.saturating_sub(buffer.len());
+    if chunk.len() <= remaining {
+        buffer.extend_from_slice(chunk);
+    } else {
+        buffer.extend_from_slice(&chunk[..remaining]);
+        buffer.extend_from_slice(TRUNCATED_OUTPUT_NOTICE);
+    }
+}
+
 fn take_buffer_delta(buffer: &Arc<Mutex<Vec<u8>>>, cursor: &mut usize) -> Vec<u8> {
     let data = buffer.lock().unwrap_or_else(|poison| poison.into_inner());
     let delta = data.get(*cursor..).unwrap_or_default().to_vec();
@@ -935,7 +951,7 @@ where
                 Ok(0) => break,
                 Ok(bytes) => {
                     if let Ok(mut output) = buffer.lock() {
-                        output.extend_from_slice(&chunk[..bytes]);
+                        bounded_append(&mut output, &chunk[..bytes]);
                     }
                 }
                 Err(_) => break,
@@ -971,8 +987,24 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{ExecShellTool, ShellCancelTool, ShellInteractTool, ShellWaitTool};
+    use super::{
+        ExecShellTool, MAX_OUTPUT_BUFFER_BYTES, ShellCancelTool, ShellInteractTool, ShellWaitTool,
+        TRUNCATED_OUTPUT_NOTICE, bounded_append,
+    };
     use crate::{ToolContext, ToolSpec};
+
+    #[test]
+    fn shell_output_buffer_is_bounded() {
+        let mut buffer = Vec::new();
+        let big = vec![b'x'; MAX_OUTPUT_BUFFER_BYTES + 1024];
+        bounded_append(&mut buffer, &big);
+        assert!(buffer.len() <= MAX_OUTPUT_BUFFER_BYTES + TRUNCATED_OUTPUT_NOTICE.len());
+        assert!(
+            buffer
+                .windows(TRUNCATED_OUTPUT_NOTICE.len())
+                .any(|w| w == TRUNCATED_OUTPUT_NOTICE)
+        );
+    }
 
     #[test]
     fn runs_foreground_shell_command() {

@@ -274,8 +274,14 @@ impl ToolSpec for EditFileTool {
         if count == 0 {
             bail!("search text not found in {}", resolved.display());
         }
+        if count > 1 {
+            bail!(
+                "search text matches {count} times in {}; provide a unique occurrence",
+                resolved.display()
+            );
+        }
 
-        let updated = existing.replace(search, replace);
+        let updated = existing.replacen(search, replace, 1);
         write_file_safe(&resolved, &updated)
             .with_context(|| format!("failed to write {}", resolved.display()))?;
 
@@ -452,5 +458,20 @@ mod tests {
             fs::read_to_string(workspace.path().join("notes.txt")).expect("read"),
             "hello MiMo"
         );
+    }
+
+    #[test]
+    fn edit_file_rejects_multiple_matches() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        fs::write(workspace.path().join("notes.txt"), "foo bar foo").expect("write");
+        let context = ToolContext::new(workspace.path());
+
+        let error = EditFileTool
+            .execute(
+                json!({ "path": "notes.txt", "search": "foo", "replace": "baz" }),
+                &context,
+            )
+            .expect_err("edit should fail with multiple matches");
+        assert!(error.to_string().contains("2 times"));
     }
 }

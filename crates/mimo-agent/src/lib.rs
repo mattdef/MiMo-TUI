@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use mimo_client::MimoClient;
 use mimo_protocol::ChatMessage;
 use mimo_tools::{ApprovalRequirement, ToolContext, ToolInvocation, ToolRegistry};
+use tokio::task;
 
 const MAX_TOOL_ROUNDS: usize = 25;
 
@@ -61,9 +62,16 @@ where
             }
 
             on_status(AgentStatus::ToolStarted(invocation.clone()))?;
-            let result = registry
-                .execute(&invocation, context)
-                .with_context(|| format!("tool '{}' failed", invocation.name));
+            let exec_invocation = invocation.clone();
+            let exec_registry = registry.clone();
+            let exec_context = context.clone();
+            let result = task::spawn_blocking(move || {
+                exec_registry
+                    .execute(&exec_invocation, &exec_context)
+                    .with_context(|| format!("tool '{}' failed", exec_invocation.name))
+            })
+            .await
+            .context("tool execution panicked")?;
             match result {
                 Ok(output) => {
                     let summary = output.summary.clone();
