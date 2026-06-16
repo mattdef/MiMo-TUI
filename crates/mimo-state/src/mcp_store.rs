@@ -161,15 +161,10 @@ fn mutate_servers<T>(
     mut mutate: impl FnMut(&mut Vec<McpServerConfig>) -> Result<T>,
 ) -> Result<T> {
     let path = mcp_servers_path(config);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
     let mut servers = load_servers(config)?;
     let value = mutate(&mut servers)?;
     servers.sort_by(|left, right| left.name.cmp(&right.name));
-    fs::write(&path, serde_json::to_string_pretty(&servers)?)
-        .with_context(|| format!("failed to write {}", path.display()))?;
+    crate::write_string_atomic(&path, &serde_json::to_string_pretty(&servers)?)?;
     Ok(value)
 }
 
@@ -199,4 +194,58 @@ fn normalize_server_name(value: &str) -> String {
         }
     }
     normalized.trim_matches('-').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use mimo_config::{AppConfig, ConfigValueSource};
+
+    use super::{
+        McpTransport, add_http_server, add_stdio_server, load_servers, remove_server, set_enabled,
+    };
+
+    fn test_config(dir: &tempfile::TempDir) -> AppConfig {
+        AppConfig {
+            api_key: None,
+            base_url: "https://example.test/v1".to_string(),
+            model: "mimo-v2-flash".to_string(),
+            temperature: 0.2,
+            system_prompt: "test".to_string(),
+            config_path: dir.path().join("config.toml"),
+            api_key_source: ConfigValueSource::Default,
+            base_url_source: ConfigValueSource::Default,
+            model_source: ConfigValueSource::Default,
+            temperature_source: ConfigValueSource::Default,
+            system_prompt_source: ConfigValueSource::Default,
+        }
+    }
+
+    #[test]
+    fn persists_and_updates_servers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(&dir);
+
+        let http =
+            add_http_server(&config, "Docs", "https://example.com/mcp").expect("add http server");
+        assert_eq!(http.transport, McpTransport::Http);
+
+        let stdio = add_stdio_server(
+            &config,
+            "Local",
+            "npx",
+            vec!["-y".to_string(), "server".to_string()],
+        )
+        .expect("add stdio server");
+        assert_eq!(stdio.transport, McpTransport::Stdio);
+
+        let servers = load_servers(&config).expect("load servers");
+        assert_eq!(servers.len(), 2);
+
+        let updated = set_enabled(&config, "docs", false).expect("disable server");
+        assert!(!updated.enabled);
+
+        let removed = remove_server(&config, "local").expect("remove server");
+        assert_eq!(removed.name, "local");
+        assert_eq!(load_servers(&config).expect("reload servers").len(), 1);
+    }
 }

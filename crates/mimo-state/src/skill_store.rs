@@ -119,8 +119,7 @@ pub fn install_skill(config: &AppConfig, spec: &str) -> Result<InstalledSkill> {
 
     let name = infer_skill_name(&content, &fallback_name);
     let path = skill_path(config, &name);
-    ensure_skills_dir(config)?;
-    fs::write(&path, content).with_context(|| format!("failed to write {}", path.display()))?;
+    crate::write_string_atomic(&path, &content)?;
     load_skill_path(&path)
 }
 
@@ -156,11 +155,6 @@ fn load_skill_path(path: &Path) -> Result<InstalledSkill> {
         path: path.to_path_buf(),
         content,
     })
-}
-
-fn ensure_skills_dir(config: &AppConfig) -> Result<()> {
-    fs::create_dir_all(skills_dir(config))
-        .with_context(|| format!("failed to create {}", skills_dir(config).display()))
 }
 
 fn skills_dir(config: &AppConfig) -> PathBuf {
@@ -222,7 +216,27 @@ fn is_allowed_skill_host(host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_allowed_skill_host;
+    use std::fs;
+
+    use mimo_config::{AppConfig, ConfigValueSource};
+
+    use super::{install_skill, is_allowed_skill_host, load_skill, uninstall_skill};
+
+    fn test_config(dir: &tempfile::TempDir) -> AppConfig {
+        AppConfig {
+            api_key: None,
+            base_url: "https://example.test/v1".to_string(),
+            model: "mimo-v2-flash".to_string(),
+            temperature: 0.2,
+            system_prompt: "test".to_string(),
+            config_path: dir.path().join("config.toml"),
+            api_key_source: ConfigValueSource::Default,
+            base_url_source: ConfigValueSource::Default,
+            model_source: ConfigValueSource::Default,
+            temperature_source: ConfigValueSource::Default,
+            system_prompt_source: ConfigValueSource::Default,
+        }
+    }
 
     #[test]
     fn rejects_private_and_local_skill_hosts() {
@@ -233,5 +247,27 @@ mod tests {
         assert!(!is_allowed_skill_host("fe80::1"));
         assert!(!is_allowed_skill_host("fd12::1"));
         assert!(is_allowed_skill_host("example.com"));
+    }
+
+    #[test]
+    fn installs_loads_and_uninstalls_local_skill() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(&dir);
+        let source = dir.path().join("skill.md");
+        fs::write(
+            &source,
+            "# Rust Helper\n\nPrefer concise Rust diffs and safe file edits.\n",
+        )
+        .expect("write source skill");
+
+        let installed =
+            install_skill(&config, source.to_str().expect("utf8 path")).expect("install skill");
+        assert_eq!(installed.name, "rust-helper");
+
+        let loaded = load_skill(&config, "rust-helper").expect("load skill");
+        assert!(loaded.content.contains("Prefer concise Rust diffs"));
+
+        let removed = uninstall_skill(&config, "rust-helper").expect("uninstall skill");
+        assert!(!removed.exists());
     }
 }

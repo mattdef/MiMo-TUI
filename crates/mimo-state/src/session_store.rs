@@ -55,7 +55,6 @@ pub fn save_session(
         Some(path) => resolve_user_path(path)?,
         None => default_session_path(config, "session", "json"),
     };
-    ensure_parent_dir(&path)?;
     let session = SavedSession {
         saved_at_epoch: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -71,7 +70,7 @@ pub fn save_session(
         messages: messages.to_vec(),
     };
     let contents = serde_json::to_string_pretty(&session)?;
-    fs::write(&path, contents).with_context(|| format!("failed to write {}", path.display()))?;
+    crate::write_string_atomic(&path, &contents)?;
     Ok(path)
 }
 
@@ -102,7 +101,6 @@ pub fn export_markdown(
         Some(path) => resolve_user_path(path)?,
         None => default_session_path(config, "conversation", "md"),
     };
-    ensure_parent_dir(&path)?;
     let mut output = format!("# MiMo TUI conversation\n\n- Model: {model}\n- Mode: {mode}\n");
     if !attachments.is_empty() {
         output.push_str("- Attachments:\n");
@@ -137,7 +135,7 @@ pub fn export_markdown(
         };
         output.push_str(&format!("## {role}\n\n{}\n\n", message.content.trim()));
     }
-    fs::write(&path, output).with_context(|| format!("failed to write {}", path.display()))?;
+    crate::write_string_atomic(&path, &output)?;
     Ok(path)
 }
 
@@ -212,14 +210,6 @@ fn resolve_user_path(path: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(trimmed))
 }
 
-fn ensure_parent_dir(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    Ok(())
-}
-
 fn derive_title(messages: &[ChatMessage]) -> String {
     let title = messages
         .iter()
@@ -235,4 +225,72 @@ fn derive_title(messages: &[ChatMessage]) -> String {
         title = "Untitled session".to_string();
     }
     title
+}
+
+#[cfg(test)]
+mod tests {
+    use mimo_config::{AppConfig, ConfigValueSource};
+    use mimo_protocol::ChatMessage;
+
+    use super::{export_markdown, load_session, save_session};
+
+    fn test_config(dir: &tempfile::TempDir) -> AppConfig {
+        AppConfig {
+            api_key: None,
+            base_url: "https://example.test/v1".to_string(),
+            model: "mimo-v2-flash".to_string(),
+            temperature: 0.2,
+            system_prompt: "test".to_string(),
+            config_path: dir.path().join("config.toml"),
+            api_key_source: ConfigValueSource::Default,
+            base_url_source: ConfigValueSource::Default,
+            model_source: ConfigValueSource::Default,
+            temperature_source: ConfigValueSource::Default,
+            system_prompt_source: ConfigValueSource::Default,
+        }
+    }
+
+    #[test]
+    fn saves_loads_and_exports_sessions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(&dir);
+        let messages = vec![ChatMessage::user("hello"), ChatMessage::assistant("world")];
+
+        let path = save_session(
+            &config,
+            "mimo-v2-flash",
+            crate::AppMode::Agent,
+            &[],
+            false,
+            &[],
+            &[],
+            &messages,
+            None,
+        )
+        .expect("save session");
+
+        let (loaded, loaded_path) =
+            load_session(&config, Some(path.to_str().expect("utf8 path"))).expect("load session");
+        assert_eq!(loaded_path, path);
+        assert_eq!(loaded.title, "hello");
+        assert_eq!(loaded.messages.len(), 2);
+
+        let export_path = dir.path().join("conversation.md");
+        export_markdown(
+            &config,
+            "mimo-v2-flash",
+            crate::AppMode::Agent,
+            &[],
+            false,
+            &[],
+            &[],
+            &messages,
+            Some(export_path.to_str().expect("utf8 path")),
+        )
+        .expect("export markdown");
+
+        let exported = std::fs::read_to_string(export_path).expect("read export");
+        assert!(exported.contains("## You"));
+        assert!(exported.contains("## MiMo"));
+    }
 }

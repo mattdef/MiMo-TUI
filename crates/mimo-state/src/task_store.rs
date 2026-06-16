@@ -68,12 +68,8 @@ pub fn load_tasks(config: &AppConfig) -> Result<Vec<SavedTask>> {
 
 pub fn save_tasks(config: &AppConfig, tasks: &[SavedTask]) -> Result<PathBuf> {
     let path = tasks_path(config);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
     let content = serde_json::to_string_pretty(tasks).context("failed to encode task store")?;
-    fs::write(&path, content).with_context(|| format!("failed to write {}", path.display()))?;
+    crate::write_string_atomic(&path, &content)?;
     Ok(path)
 }
 

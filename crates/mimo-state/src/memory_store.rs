@@ -45,11 +45,6 @@ pub fn show_memory(config: &AppConfig) -> Result<String> {
 
 pub fn append_note(config: &AppConfig, note: &str) -> Result<PathBuf> {
     let path = memory_path(config);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-
     let mut notes = load_notes(config)?;
     let note = note.trim();
     if note.is_empty() {
@@ -69,10 +64,6 @@ pub fn append_note(config: &AppConfig, note: &str) -> Result<PathBuf> {
 
 pub fn clear_memory(config: &AppConfig) -> Result<PathBuf> {
     let path = memory_path(config);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
     write_notes(&path, &[])?;
     Ok(path)
 }
@@ -97,7 +88,7 @@ fn write_notes(path: &PathBuf, notes: &[String]) -> Result<()> {
         output.push_str(note.trim());
         output.push('\n');
     }
-    fs::write(path, output).with_context(|| format!("failed to write {}", path.display()))
+    crate::write_string_atomic(path, &output)
 }
 
 fn parse_notes(content: &str) -> Vec<String> {

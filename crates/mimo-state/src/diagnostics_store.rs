@@ -50,9 +50,8 @@ pub fn load_snapshot(config: &AppConfig) -> Result<Option<DiagnosticsSnapshot>> 
 
 pub fn save_snapshot(config: &AppConfig, snapshot: &DiagnosticsSnapshot) -> Result<PathBuf> {
     let path = diagnostics_path(config);
-    ensure_parent_dir(&path)?;
     let contents = serde_json::to_string_pretty(snapshot)?;
-    fs::write(&path, contents).with_context(|| format!("failed to write {}", path.display()))?;
+    crate::write_string_atomic(&path, &contents)?;
     Ok(path)
 }
 
@@ -79,35 +78,24 @@ pub fn now_epoch() -> u64 {
         .as_secs()
 }
 
-fn ensure_parent_dir(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::path::PathBuf;
 
     use mimo_config::{AppConfig, ConfigValueSource};
 
     use super::{
-        DiagnosticsSnapshot, DiagnosticsStatus, clear_snapshot, load_snapshot, now_epoch,
-        save_snapshot,
+        DiagnosticsSnapshot, DiagnosticsStatus, clear_snapshot, load_snapshot, save_snapshot,
     };
 
-    fn test_config() -> AppConfig {
-        let base = std::env::temp_dir().join(format!("mimo-tui-diagnostics-test-{}", now_epoch()));
-        let _ = fs::remove_dir_all(&base);
+    fn test_config(dir: &tempfile::TempDir) -> AppConfig {
         AppConfig {
             api_key: None,
             base_url: "https://example.test/v1".to_string(),
             model: "mimo-v2-flash".to_string(),
             temperature: 0.2,
             system_prompt: "test".to_string(),
-            config_path: PathBuf::from(&base).join("config.toml"),
+            config_path: PathBuf::from(dir.path()).join("config.toml"),
             api_key_source: ConfigValueSource::Default,
             base_url_source: ConfigValueSource::Default,
             model_source: ConfigValueSource::Default,
@@ -118,7 +106,8 @@ mod tests {
 
     #[test]
     fn persists_and_clears_snapshot() {
-        let config = test_config();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(&dir);
         let snapshot = DiagnosticsSnapshot {
             updated_at_epoch: 1,
             command: "cargo check".to_string(),
@@ -140,6 +129,5 @@ mod tests {
                 .expect("reload after clear")
                 .is_none()
         );
-        let _ = fs::remove_dir_all(config.config_path.parent().expect("config parent"));
     }
 }
