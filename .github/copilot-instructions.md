@@ -37,4 +37,4 @@
 - The default config file is `~/.config/mimo-tui/config.toml`.
 - `MIMO_TUI_CONFIG` overrides the config file location.
 - `MIMO_API_KEY`, `MIMO_BASE_URL`, `MIMO_MODEL`, and `MIMO_TEMPERATURE` are the supported environment variables.
-- The repository is now a Cargo workspace with separate crates for CLI, config, protocol, client, tools, state, agent, core, TUI-core, and TUI runtime.
+- The repository is now a Cargo workspace with separate crates for CLI, config, protocol, client, tools, state, agent, TUI-core, and TUI runtime.

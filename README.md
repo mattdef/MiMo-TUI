@@ -6,7 +6,7 @@
 
 ## What it does
 
-MiMo-TUI turns your terminal into a capable AI coding workspace. Type a prompt, get a streamed response. Ask MiMo to read your files, run shell commands, apply patches, or review your git diff — it will ask for approval before touching anything, or run fully autonomously in `yolo` mode.
+MiMo-TUI turns your terminal into a capable AI coding workspace. Type a prompt, get a streamed response. In the TUI, MiMo can read your files, run shell commands, apply patches, or review your git diff — it asks for approval before mutating actions unless you switch to `yolo` mode. The non-interactive `ask` command only auto-approves read-only tools.
 
 **Highlights:**
 
@@ -33,6 +33,7 @@ One-shot from the command line:
 cargo run -- ask "What makes MiMo v2.5 good for coding?"
 cargo run -- doctor    # show resolved config and API key status
 cargo run -- models    # list available models
+cargo run -- sessions  # list saved sessions
 ```
 
 ---
@@ -50,7 +51,6 @@ MiMo-TUI now follows a multi-crate workspace layout inspired by DeepSeek-TUI:
 | `crates/mimo-tools` | Tool specs, registry, file/shell/git/web/patch/diagnostics tools |
 | `crates/mimo-state` | Session, task, memory, skill, MCP, and diagnostics persistence |
 | `crates/mimo-agent` | Agent loop that executes tool calls around the MiMo client |
-| `crates/mimo-core` | Shared bootstrap helpers and project summarization |
 | `crates/mimo-tui-core` | Slash commands, keybindings, input buffer, and markdown helpers |
 | `crates/mimo-tui` | Ratatui/Crossterm runtime and interactive UI |
 
@@ -88,22 +88,39 @@ Config can also be edited live inside the TUI with `/config`.
 
 ---
 
+## Execution modes and approvals
+
+- **plan** — read-only workflow: mutating tools are denied.
+- **agent** — normal workflow: mutating tools require approval.
+- **yolo** — all tool requests are auto-approved.
+
+For one-shot CLI use, `cargo run -- ask "..."` only auto-approves read-only tools and denies mutating ones.
+
+---
+
 ## Essential controls
 
 | Key / Command | Action |
 |---|---|
 | `Enter` | Send prompt |
-| `Shift+Enter` | New line in draft |
+| `Ctrl+J` / `Shift+Enter` | New line in draft |
 | `F1` / `?` | Open help |
+| `F2` / `Ctrl+Tab` | Cycle plan / agent / yolo modes |
 | `Ctrl+K` | Command palette |
 | `Ctrl+R` | Session picker |
+| `Ctrl+L` | Open the latest-message pager |
+| `Ctrl+S` | Stash the current draft |
+| `Alt+R` | Browse draft history / cleared drafts |
 | `Tab` | Slash-command completion |
 | `@path` + `Tab` | Attach a file or directory |
 | `Esc` | Cancel generation / close overlay |
+| `y / n / a / r / p` | Approve, deny, or change approval mode in a tool prompt |
 | `/clear` `/save` `/load` | Manage conversation |
 | `/mode [agent\|plan\|yolo]` | Switch execution mode |
 | `/model [id\|auto]` | Change or auto-route model |
 | `/plan` `/note` `/recall` | Checklist, memory, search |
 | `/review` `/lsp` | Code review and diagnostics |
+| `/jobs` `/task` | Background shell jobs and saved tasks |
+| `/skills` `/skill` `/mcp` | Skills and MCP management |
 
 Type `/help` inside the TUI for the full command reference.
