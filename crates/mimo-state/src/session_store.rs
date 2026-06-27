@@ -10,6 +10,7 @@ use mimo_config::AppConfig;
 use mimo_protocol::{ChatMessage, Role};
 use serde::{Deserialize, Serialize};
 
+use crate::branch::ConversationTree;
 use crate::{AppMode, FileAttachment, PlanItem};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +29,8 @@ pub struct SavedSession {
     #[serde(default)]
     pub attachments: Vec<FileAttachment>,
     pub messages: Vec<ChatMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_tree: Option<ConversationTree>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +42,7 @@ pub struct SessionEntry {
     pub model: String,
     pub mode: AppMode,
     pub message_count: usize,
+    pub branch_count: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -51,6 +55,7 @@ pub fn save_session(
     plan_items: &[PlanItem],
     attachments: &[FileAttachment],
     messages: &[ChatMessage],
+    conversation_tree: Option<&ConversationTree>,
     path: Option<&str>,
 ) -> Result<PathBuf> {
     let path = match path {
@@ -70,6 +75,7 @@ pub fn save_session(
         plan_items: plan_items.to_vec(),
         attachments: attachments.to_vec(),
         messages: messages.to_vec(),
+        conversation_tree: conversation_tree.cloned(),
     };
     let contents = serde_json::to_string_pretty(&session)?;
     crate::write_string_atomic(&path, &contents)?;
@@ -174,6 +180,10 @@ pub fn list_sessions(config: &AppConfig) -> Result<Vec<SessionEntry>> {
                 model: session.model,
                 mode: session.mode,
                 message_count: session.messages.len(),
+                branch_count: session
+                    .conversation_tree
+                    .as_ref()
+                    .map_or(1, ConversationTree::branch_count),
             })
         })
         .collect::<Vec<_>>();
@@ -232,10 +242,11 @@ fn derive_title(messages: &[ChatMessage]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::branch::ConversationTree;
     use mimo_config::{AppConfig, ConfigValueSource};
     use mimo_protocol::ChatMessage;
 
-    use super::{export_markdown, load_session, save_session};
+    use super::{export_markdown, list_sessions, load_session, save_session};
 
     fn test_config(dir: &tempfile::TempDir) -> AppConfig {
         AppConfig {
@@ -269,6 +280,7 @@ mod tests {
             &[],
             &messages,
             None,
+            None,
         )
         .expect("save session");
 
@@ -277,6 +289,7 @@ mod tests {
         assert_eq!(loaded_path, path);
         assert_eq!(loaded.title, "hello");
         assert_eq!(loaded.messages.len(), 2);
+        assert!(loaded.conversation_tree.is_none());
 
         let export_path = dir.path().join("conversation.md");
         export_markdown(
@@ -295,5 +308,45 @@ mod tests {
         let exported = std::fs::read_to_string(export_path).expect("read export");
         assert!(exported.contains("## You"));
         assert!(exported.contains("## MiMo"));
+    }
+
+    #[test]
+    fn saves_and_lists_branch_trees() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(&dir);
+        let messages = vec![ChatMessage::user("hello"), ChatMessage::assistant("world")];
+        let mut tree = ConversationTree::from_flat_messages(messages.clone());
+        tree.create_branch_from_message("msg-1")
+            .expect("branch should be created");
+        tree.add_message_to_current(ChatMessage::assistant("branched"));
+
+        let path = save_session(
+            &config,
+            "mimo-v2-flash",
+            crate::AppMode::Agent,
+            &[],
+            false,
+            &[],
+            &[],
+            &tree.current_messages(),
+            Some(&tree),
+            None,
+        )
+        .expect("save session");
+
+        let (loaded, loaded_path) =
+            load_session(&config, Some(path.to_str().expect("utf8 path"))).expect("load session");
+        assert_eq!(loaded_path, path);
+        assert_eq!(
+            loaded
+                .conversation_tree
+                .as_ref()
+                .map(ConversationTree::branch_count),
+            Some(2)
+        );
+
+        let sessions = list_sessions(&config).expect("list sessions");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].branch_count, 2);
     }
 }

@@ -17,8 +17,12 @@ pub fn session_lines(entries: &[SessionEntry], selected: usize) -> Vec<Line<'sta
             }
             Line::styled(
                 format!(
-                    "{prefix}{}  [{} | {} messages | saved {}]",
-                    entry.title, entry.model, entry.message_count, entry.saved_at_epoch
+                    "{prefix}{}  [{} | {} messages | {} branches | saved {}]",
+                    entry.title,
+                    entry.model,
+                    entry.message_count,
+                    entry.branch_count,
+                    entry.saved_at_epoch
                 ),
                 style,
             )

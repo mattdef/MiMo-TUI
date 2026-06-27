@@ -42,6 +42,10 @@ pub const KEYBINDINGS: &[KeybindingInfo] = &[
         description: "Open a pager for the latest message.",
     },
     KeybindingInfo {
+        chord: "Ctrl+B",
+        description: "Select a message to create a conversation branch.",
+    },
+    KeybindingInfo {
         chord: "F2 / Ctrl+Tab",
         description: "Cycle between plan, agent, and yolo modes.",
     },

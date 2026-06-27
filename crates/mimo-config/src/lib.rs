@@ -1,4 +1,8 @@
-use std::{env, fmt, fs, io::Write, path::PathBuf};
+use std::{
+    env, fmt, fs,
+    io::{self, Read, Write},
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -12,6 +16,8 @@ const KNOWN_MIMO_MODELS: &[&str] = &["mimo-v2-flash", "mimo-v2.5", "mimo-v2.5-pr
 const DEFAULT_SYSTEM_PROMPT: &str = r#"You are MiMo TUI, a terminal assistant specialised for Xiaomi MiMo models.
 Answer concisely, preserve technical accuracy, and adapt to developer workflows.
 When the user asks for code, prefer small, practical changes and explain tradeoffs."#;
+const WORKSPACE_INSTRUCTIONS_MAX_BYTES: usize = 32 * 1024;
+const WORKSPACE_INSTRUCTION_FILENAMES: [&str; 3] = ["AGENTS.md", "CLAUDE.md", "README.md"];
 
 #[derive(Debug, Clone, Default)]
 pub struct ConfigOverrides {
@@ -26,6 +32,7 @@ pub enum ConfigValueSource {
     Cli,
     Env,
     File,
+    WorkspaceInstructions,
     Default,
 }
 
@@ -35,6 +42,7 @@ impl fmt::Display for ConfigValueSource {
             Self::Cli => formatter.write_str("cli"),
             Self::Env => formatter.write_str("env"),
             Self::File => formatter.write_str("config file"),
+            Self::WorkspaceInstructions => formatter.write_str("workspace instructions"),
             Self::Default => formatter.write_str("default"),
         }
     }
@@ -67,6 +75,13 @@ struct FileConfig {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     system_prompt: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DiscoveredInstructions {
+    path: PathBuf,
+    content: String,
+    truncated: bool,
 }
 
 impl AppConfig {
@@ -104,9 +119,14 @@ impl AppConfig {
         ]);
         let temperature = temperature.unwrap_or(DEFAULT_TEMPERATURE);
 
-        let (system_prompt, system_prompt_source) =
+        let (base_system_prompt, base_system_prompt_source) =
             pick_string([(ConfigValueSource::File, file_config.system_prompt)]);
-        let system_prompt = system_prompt.unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
+        let workspace_root = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let (system_prompt, system_prompt_source) = resolve_system_prompt(
+            base_system_prompt,
+            base_system_prompt_source,
+            &workspace_root,
+        )?;
 
         Ok(Self {
             api_key,
@@ -195,6 +215,138 @@ pub fn normalize_base_url(base_url: &str) -> Option<String> {
     let base_url = base_url.trim();
     let parsed = Url::parse(base_url).ok()?;
     matches!(parsed.scheme(), "http" | "https").then(|| base_url.trim_end_matches('/').to_string())
+}
+
+fn resolve_system_prompt(
+    base_system_prompt: Option<String>,
+    base_system_prompt_source: ConfigValueSource,
+    workspace_root: &Path,
+) -> Result<(String, ConfigValueSource)> {
+    let base_system_prompt =
+        base_system_prompt.unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
+    match discover_workspace_instructions(workspace_root)? {
+        Some(instructions) => Ok((
+            append_workspace_instructions(base_system_prompt, &instructions),
+            ConfigValueSource::WorkspaceInstructions,
+        )),
+        None => Ok((base_system_prompt, base_system_prompt_source)),
+    }
+}
+
+fn append_workspace_instructions(
+    base_system_prompt: String,
+    instructions: &DiscoveredInstructions,
+) -> String {
+    let filename = instructions
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace instructions");
+
+    let mut system_prompt = base_system_prompt;
+    system_prompt.push_str("\n\n---\n\n# Project instructions from ");
+    system_prompt.push_str(filename);
+    system_prompt.push_str("\n\n");
+    system_prompt.push_str(&instructions.content);
+    if instructions.truncated {
+        system_prompt.push_str("\n\n(Note: workspace instructions truncated to 32 KiB.)");
+    }
+    system_prompt
+}
+
+fn discover_workspace_instructions(root: &Path) -> Result<Option<DiscoveredInstructions>> {
+    for filename in WORKSPACE_INSTRUCTION_FILENAMES {
+        let path = root.join(filename);
+        if let Some(instructions) = discover_workspace_instruction(&path)? {
+            return Ok(Some(instructions));
+        }
+    }
+    Ok(None)
+}
+
+fn discover_workspace_instruction(path: &Path) -> Result<Option<DiscoveredInstructions>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    };
+
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() || !file_type.is_file() {
+        return Ok(None);
+    }
+
+    let file = match open_workspace_instruction_file(path) {
+        Ok(file) => file,
+        Err(error) if is_symlink_open_error(&error) => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to open {}", path.display()));
+        }
+    };
+
+    let (bytes, truncated) = read_workspace_instruction_bytes(file, path)?;
+    let content = decode_workspace_instruction_bytes(&bytes, truncated);
+    if content.trim().is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(DiscoveredInstructions {
+        path: path.to_path_buf(),
+        content,
+        truncated,
+    }))
+}
+
+fn open_workspace_instruction_file(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
+fn is_symlink_open_error(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::ELOOP)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+fn read_workspace_instruction_bytes(file: fs::File, path: &Path) -> Result<(Vec<u8>, bool)> {
+    let mut bytes = Vec::new();
+    let mut reader = file.take((WORKSPACE_INSTRUCTIONS_MAX_BYTES + 1) as u64);
+    reader
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let truncated = bytes.len() > WORKSPACE_INSTRUCTIONS_MAX_BYTES;
+    Ok((bytes, truncated))
+}
+
+fn decode_workspace_instruction_bytes(bytes: &[u8], truncated: bool) -> String {
+    let slice = if truncated {
+        &bytes[..WORKSPACE_INSTRUCTIONS_MAX_BYTES]
+    } else {
+        bytes
+    };
+
+    match std::str::from_utf8(slice) {
+        Ok(text) => text.to_owned(),
+        Err(error) => match std::str::from_utf8(&slice[..error.valid_up_to()]) {
+            Ok(text) => text.to_owned(),
+            Err(_) => String::new(),
+        },
+    }
 }
 
 fn config_path() -> PathBuf {
@@ -349,7 +501,13 @@ pub fn auto_route_model(messages: &[mimo_protocol::ChatMessage]) -> &'static str
 
 #[cfg(test)]
 mod tests {
-    use super::{known_mimo_models, normalize_base_url, normalize_model_name};
+    use std::fs;
+
+    use super::{
+        ConfigValueSource, DEFAULT_SYSTEM_PROMPT, WORKSPACE_INSTRUCTIONS_MAX_BYTES,
+        discover_workspace_instructions, known_mimo_models, normalize_base_url,
+        normalize_model_name, resolve_system_prompt,
+    };
 
     #[test]
     fn known_model_catalog_includes_mimo_25_models() {
@@ -380,5 +538,191 @@ mod tests {
     fn normalize_base_url_rejects_non_http_schemes() {
         assert_eq!(normalize_base_url("ftp://example.test"), None);
         assert_eq!(normalize_base_url("not-a-url"), None);
+    }
+
+    #[test]
+    fn workspace_instructions_display_label_is_human_readable() {
+        assert_eq!(
+            ConfigValueSource::WorkspaceInstructions.to_string(),
+            "workspace instructions"
+        );
+    }
+
+    #[test]
+    fn discovers_workspace_instructions_in_priority_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("AGENTS.md"), "AGENTS").expect("write AGENTS");
+        fs::write(dir.path().join("CLAUDE.md"), "CLAUDE").expect("write CLAUDE");
+        fs::write(dir.path().join("README.md"), "README").expect("write README");
+
+        let discovered = discover_workspace_instructions(dir.path())
+            .expect("discover instructions")
+            .expect("instructions found");
+
+        assert_eq!(
+            discovered.path.file_name().and_then(|name| name.to_str()),
+            Some("AGENTS.md")
+        );
+        assert_eq!(discovered.content, "AGENTS");
+        assert!(!discovered.truncated);
+    }
+
+    #[test]
+    fn falls_back_to_claude_when_agents_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("CLAUDE.md"), "CLAUDE").expect("write CLAUDE");
+
+        let discovered = discover_workspace_instructions(dir.path())
+            .expect("discover instructions")
+            .expect("instructions found");
+
+        assert_eq!(
+            discovered.path.file_name().and_then(|name| name.to_str()),
+            Some("CLAUDE.md")
+        );
+        assert_eq!(discovered.content, "CLAUDE");
+    }
+
+    #[test]
+    fn falls_back_to_readme_when_only_readme_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("README.md"), "README").expect("write README");
+
+        let discovered = discover_workspace_instructions(dir.path())
+            .expect("discover instructions")
+            .expect("instructions found");
+
+        assert_eq!(
+            discovered.path.file_name().and_then(|name| name.to_str()),
+            Some("README.md")
+        );
+        assert_eq!(discovered.content, "README");
+    }
+
+    #[test]
+    fn ignores_whitespace_only_workspace_instructions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("AGENTS.md"), "   \n\n").expect("write AGENTS");
+
+        assert!(
+            discover_workspace_instructions(dir.path())
+                .expect("discover instructions")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn returns_none_when_no_workspace_instruction_files_exist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        assert!(
+            discover_workspace_instructions(dir.path())
+                .expect("discover instructions")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn appends_workspace_instructions_after_default_prompt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("AGENTS.md"), "Keep it short.").expect("write AGENTS");
+
+        let (system_prompt, source) =
+            resolve_system_prompt(None, ConfigValueSource::Default, dir.path())
+                .expect("resolve prompt");
+
+        assert!(system_prompt.starts_with(DEFAULT_SYSTEM_PROMPT));
+        assert!(
+            system_prompt
+                .contains("\n\n---\n\n# Project instructions from AGENTS.md\n\nKeep it short.")
+        );
+        assert_eq!(source, ConfigValueSource::WorkspaceInstructions);
+    }
+
+    #[test]
+    fn appends_workspace_instructions_after_config_prompt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("CLAUDE.md"), "Use the config prompt first.")
+            .expect("write CLAUDE");
+
+        let (system_prompt, source) = resolve_system_prompt(
+            Some("Configured prompt".to_string()),
+            ConfigValueSource::File,
+            dir.path(),
+        )
+        .expect("resolve prompt");
+
+        assert!(system_prompt.starts_with("Configured prompt"));
+        assert!(system_prompt.contains(
+            "\n\n---\n\n# Project instructions from CLAUDE.md\n\nUse the config prompt first."
+        ));
+        assert_eq!(source, ConfigValueSource::WorkspaceInstructions);
+    }
+
+    #[test]
+    fn keeps_existing_source_when_no_workspace_instructions_exist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let (system_prompt, source) = resolve_system_prompt(
+            Some("Configured prompt".to_string()),
+            ConfigValueSource::File,
+            dir.path(),
+        )
+        .expect("resolve prompt");
+
+        assert_eq!(system_prompt, "Configured prompt");
+        assert_eq!(source, ConfigValueSource::File);
+    }
+
+    #[test]
+    fn uses_default_prompt_when_no_workspace_instructions_exist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let (system_prompt, source) =
+            resolve_system_prompt(None, ConfigValueSource::Default, dir.path())
+                .expect("resolve prompt");
+
+        assert_eq!(system_prompt, DEFAULT_SYSTEM_PROMPT);
+        assert_eq!(source, ConfigValueSource::Default);
+    }
+
+    #[test]
+    fn truncates_workspace_instructions_to_32_kib() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let content = "a".repeat(WORKSPACE_INSTRUCTIONS_MAX_BYTES + 512);
+        fs::write(dir.path().join("AGENTS.md"), content.as_bytes()).expect("write AGENTS");
+
+        let (system_prompt, source) =
+            resolve_system_prompt(None, ConfigValueSource::Default, dir.path())
+                .expect("resolve prompt");
+
+        let truncated_prefix = "a".repeat(WORKSPACE_INSTRUCTIONS_MAX_BYTES);
+        let overflow_prefix = "a".repeat(WORKSPACE_INSTRUCTIONS_MAX_BYTES + 1);
+        assert_eq!(source, ConfigValueSource::WorkspaceInstructions);
+        assert!(system_prompt.contains(&truncated_prefix));
+        assert!(system_prompt.contains("(Note: workspace instructions truncated to 32 KiB.)"));
+        assert!(!system_prompt.contains(&overflow_prefix));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_agents_file_and_falls_back() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("target.md");
+        fs::write(&target, "SYMLINK TARGET").expect("write target");
+        symlink(&target, dir.path().join("AGENTS.md")).expect("create symlink");
+        fs::write(dir.path().join("CLAUDE.md"), "CLAUDE").expect("write CLAUDE");
+
+        let discovered = discover_workspace_instructions(dir.path())
+            .expect("discover instructions")
+            .expect("instructions found");
+
+        assert_eq!(
+            discovered.path.file_name().and_then(|name| name.to_str()),
+            Some("CLAUDE.md")
+        );
+        assert_eq!(discovered.content, "CLAUDE");
     }
 }

@@ -1,438 +1,260 @@
-# Plan: Améliorations prioritaires du projet MiMo-TUI
+# Plan: Workspace Instruction Auto-Discovery
 
 ## Objective
 
-Produire un plan d’implémentation détaillé et exécutable pour les 8 axes d’amélioration identifiés sur MiMo-TUI, en privilégiant d’abord la sécurité, la robustesse et la testabilité, puis le refactoring structurel, la CI, la documentation et l’allègement des dépendances.
+Implement startup-time discovery of workspace instruction files for MiMo-TUI. When `AppConfig::load()` resolves the effective `system_prompt`, it should append the first supported workspace instruction file found at the workspace root, enforce a 32 KiB instruction-content cap, reject symlinked instruction files, and expose the contribution through `ConfigValueSource::WorkspaceInstructions` so `cargo run -- doctor` reports the source.
 
 ## Requirements Snapshot
 
-- **R1:** Sécuriser l’exécution agentique côté CLI/TUI et outils, sans casser les usages légitimes actuels.
-- **R2:** Réduire les risques techniques dans les outils (shell, édition de fichiers, exécution synchrone, réseau).
-- **R3:** Fiabiliser la persistance locale (sessions, tâches, mémoire, MCP, diagnostics) et réduire les risques de corruption ou d’états partiels.
-- **R4:** Renforcer la couverture de tests sur les zones les plus critiques et rendre la boucle agent testable.
-- **R5:** Réduire la dette technique du TUI, en particulier le fichier `crates/mimo-tui/src/app.rs`.
-- **R6:** Renforcer la qualité continue via la CI et des vérifications adaptées au workspace Rust 2024 multi-crates.
-- **R7:** Corriger les incohérences de documentation et améliorer l’explicitation des comportements réels.
-- **R8:** Simplifier certaines dépendances sans modifier le comportement fonctionnel attendu.
+- **R1:** Discover workspace instruction files from the workspace root only, in priority order: `AGENTS.md`, then `CLAUDE.md`, then `README.md` as a weak fallback.
+- **R2:** Append discovered instruction content after the existing base prompt: a `system_prompt` from config file when present, otherwise `DEFAULT_SYSTEM_PROMPT`, using a clear separator.
+- **R3:** Limit loaded workspace instruction content to 32 KiB and handle truncation safely.
+- **R4:** Reject symlinked instruction files consistently with the existing `mimo-tools/src/file.rs` `O_NOFOLLOW` defense-in-depth pattern.
+- **R5:** Add `ConfigValueSource::WorkspaceInstructions` and ensure `doctor` displays that source through the existing `system_prompt_source` output.
+- **R6:** Preserve existing workspace layout, Edition 2024, root cargo commands, reqwest rustls-only setup, base URL normalization, and current CLI/TUI request flow.
 
 ## Scope
 
-- Sécurité et garde-fous des outils agentiques.
-- Robustesse d’exécution shell/fichier/réseau.
-- Persistance locale et helpers communs.
-- Stratégie de tests unitaires/intégration ciblée.
-- Refactoring structurel progressif du TUI.
-- Renforcement de la CI.
-- Mise à jour README/docs associées.
-- Réduction d’une dépendance lourde dans `mimo-config`.
+- Modify `crates/mimo-config/src/lib.rs` to add discovery constants/helpers, safe file reading, prompt merging, source tracking, and unit tests.
+- Modify `crates/mimo-config/Cargo.toml` only if needed for `libc` and test-only `tempfile` dependencies.
+- Review `crates/mimo-cli/src/main.rs` doctor output and adjust only if the new source is not displayed automatically.
+- Do not change `crates/mimo-tui/src/app.rs` or `ask()` request construction unless compilation reveals a direct need; both already consume `config.system_prompt`.
 
 ## Assumptions and Constraints
 
-- Le workspace reste en **edition 2024**.
-- Les commandes racine doivent continuer à fonctionner : `cargo check`, `cargo fmt --check`, `cargo test --workspace`, `cargo run`.
-- La règle de précédence de configuration doit rester : **CLI > env > file > built-in**.
-- `reqwest` doit rester en mode `rustls-tls` là où il est réellement nécessaire.
-- Les changements doivent rester compatibles avec l’architecture multi-crates existante.
-- Le comportement public ne doit pas être cassé sans justification explicite.
+- No `.opencode/task.md` exists; this plan is based on the user-provided requirements.
+- Use `std::env::current_dir()` inside `mimo-config` for the workspace root. Do not add a `mimo-config -> mimo-tools` dependency just to call `default_workspace_root()`.
+- Do not introduce a new user-facing workspace-root config setting in this change. If a configured workspace root is added later, it must be threaded through `ConfigOverrides -> AppConfig::load` and follow config precedence.
+- Treat workspace instructions as an additive prompt contribution, not a replacement for config-file or built-in prompts.
+- Because `system_prompt_source` is a single enum value, set it to `WorkspaceInstructions` when workspace content is appended; otherwise keep the existing `File` or `Default` source.
+- For normal symlink candidates, “reject” means do not load the symlink target. Prefer skipping the rejected candidate and continuing to the next lower-priority file; still use `O_NOFOLLOW` on Unix to guard against race-time symlink replacement.
 
 ## Risks and Areas Requiring Care
 
-- Réduire les permissions ou ajouter des confirmations peut changer l’expérience utilisateur du CLI/TUI.
-- Les protections symlink/path traversal doivent être renforcées sans bloquer les cas valides dans le workspace.
-- Le refactoring de `app.rs` peut introduire des régressions UI si les extractions ne sont pas progressives.
-- Ajouter des tests sur l’agent demandera probablement une abstraction du client HTTP.
-- Les écritures atomiques doivent être cohérentes entre Unix et Windows.
-- Les changements CI peuvent faire émerger de la dette existante (clippy, portabilité).
+- The repository root already contains `AGENTS.md`; after this change, running `cargo run -- doctor` from the repo root should show `workspace instructions` as the system prompt source.
+- Avoid global `current_dir` mutations in tests where possible; test helper functions that accept an explicit root path.
+- Do not use `Path::exists()` for discovery because it follows symlinks. Use `symlink_metadata()` to classify candidates.
+- Do not read unbounded `README.md` content before truncating; read only up to the configured cap plus enough to detect truncation.
+- Ensure byte truncation does not panic or create invalid prompt content for UTF-8 markdown files.
+- Adding `libc` to `mimo-config` is acceptable because it is already a workspace dependency; do not alter reqwest features.
 
-## Core concepts
+## Core Concepts
 
-### 1. Sécurité outil = validation + exécution contrainte + approbation explicite
-
-Exemple de direction pour isoler la logique d’approbation :
-
-```rust
-enum ToolPermission {
-    Auto,
-    Prompt,
-    Deny,
-}
-
-fn resolve_permission(mode: AppMode, tool_kind: ToolKind, source: InvocationSource) -> ToolPermission {
-    match (mode, tool_kind, source) {
-        (AppMode::Plan, ToolKind::FileWrite | ToolKind::Shell | ToolKind::Network, _) => ToolPermission::Deny,
-        (AppMode::Agent, ToolKind::FileWrite | ToolKind::Shell | ToolKind::Network, _) => ToolPermission::Prompt,
-        (AppMode::Yolo, ToolKind::Shell, InvocationSource::CliAsk) => ToolPermission::Prompt,
-        _ => ToolPermission::Auto,
-    }
-}
-```
-
-L’idée est de centraliser la politique, au lieu d’avoir plusieurs comportements implicites dans le CLI, l’agent et le TUI.
-
-### 2. Testabilité de l’agent via abstraction du client
-
-Exemple d’abstraction pour mocker la boucle `run_agent_turn` :
-
-```rust
-#[async_trait::async_trait]
-pub trait ChatClient {
-    async fn stream_chat_completion<F>(
-        &self,
-        messages: &[ChatMessage],
-        tools: &[ApiTool],
-        on_delta: F,
-    ) -> anyhow::Result<AssistantResponse>
-    where
-        F: FnMut(&str) -> anyhow::Result<()> + Send;
-}
-```
-
-Ensuite `MimoClient` implémente ce trait, et les tests injectent un faux client qui renvoie des réponses prévisibles.
-
-### 3. Refactoring sûr d’un gros module
-
-Pour `app.rs`, il faut éviter une réécriture massive. La bonne approche est :
-
-1. extraire des types/états sans changer la logique,
-2. déplacer des fonctions pures de rendu,
-3. déplacer les handlers d’événements,
-4. seulement ensuite simplifier les interfaces.
+- **Base prompt:** The existing selected prompt from config file, or `DEFAULT_SYSTEM_PROMPT` when no non-empty config value exists.
+- **Workspace instructions:** The first non-symlink, regular, non-empty supported instruction file in the workspace root by priority.
+- **Effective prompt:** `base prompt + separator + workspace instruction block` when instructions are found; otherwise exactly the previous base prompt.
+- **Source reporting:** `system_prompt_source` remains `File` or `Default` when no instruction file contributes. It becomes `WorkspaceInstructions` when an instruction block is appended.
 
 ## Sub-Tasks
 
-### Sub-Task 1: Sécuriser l’exécution agentique et les politiques d’approbation
+### Sub-Task 1: Extend config source metadata and dependencies
 
 - **Status:** Pending
-- **Objective:** Corriger les écarts de sécurité les plus sensibles autour des approbations d’outils, des lectures hors workspace et des fetchs réseau.
-- **Related Requirements:** R1
-- **Dependencies and Preconditions:** Comprendre le comportement actuel de `mimo-cli`, `mimo-agent`, `mimo-tools`, `mimo-state`, `mimo-tui`.
+- **Objective:** Add the new source variant and any crate dependencies required for no-follow file opening and tests.
+- **Related Requirements:** R4, R5, R6
+- **Dependencies and Preconditions:** None.
 - **In Scope for This Sub-Task:**
-  - Revoir le comportement de `cargo run -- ask ...` qui auto-approuve tous les outils.
-  - Définir une politique claire pour CLI one-shot, mode Agent, mode Plan et mode YOLO.
-  - Renforcer la lecture de fichiers contre les symlinks sortant du workspace.
-  - Compléter les protections SSRF sur IPv6 et redirections.
-  - Ajouter un warning UX persistant ou une confirmation supplémentaire pour YOLO.
+  - `crates/mimo-config/src/lib.rs`
+  - `crates/mimo-config/Cargo.toml`
 - **Out of Scope for This Sub-Task:**
-  - Refonte complète UX du TUI.
-  - Système avancé de sandbox OS.
+  - Prompt discovery logic.
+  - CLI flags or config-file schema changes.
 - **Instructions:**
-  1. Inventorier les points d’entrée d’exécution d’outils : `mimo-cli::ask`, `mimo-agent::run_agent_turn`, overlay d’approbation TUI.
-  2. Décider du comportement cible pour le CLI one-shot :
-     - option A recommandée : lecture/recherche auto, écriture/réseau/shell avec confirmation ou drapeau explicite `--yolo` futur.
-     - option B transitoire : désactiver les outils mutables en CLI si aucun mécanisme d’approbation n’existe encore.
-  3. Extraire ou centraliser la politique d’approbation pour éviter les divergences CLI/TUI.
-  4. Dans `ReadFileTool`, empêcher les lectures via symlink externe (usage de `O_NOFOLLOW` ou vérification canonique finale atomique).
-  5. Harmoniser et dédupliquer les helpers de filtrage d’hôte (`web_fetch`, skill install).
-  6. Étendre le filtrage SSRF aux IPv6 link-local / adresses spéciales et revoir les redirections.
-  7. Ajouter une protection UX sur le basculement YOLO.
+  1. Add `WorkspaceInstructions` to `ConfigValueSource` in `crates/mimo-config/src/lib.rs`.
+  2. Update the `fmt::Display` implementation so the variant prints a concise human-readable label such as `workspace instructions`.
+  3. Add `libc.workspace = true` to `crates/mimo-config/Cargo.toml` if the Unix `O_NOFOLLOW` helper uses `libc::O_NOFOLLOW` directly.
+  4. Add `[dev-dependencies] tempfile.workspace = true` to `crates/mimo-config/Cargo.toml` if tests use temporary directories.
 - **Acceptance Criteria:**
-  - Les outils mutables ne sont plus implicitement autorisés partout.
-  - Une lecture via symlink hors workspace échoue clairement.
-  - Les fetchs vers hôtes internes/locaux sont refusés pour IPv4 et IPv6.
-  - Le comportement YOLO est explicite et visible.
+  - `ConfigValueSource` exhaustive matches compile.
+  - `ConfigValueSource::WorkspaceInstructions.to_string()` can be asserted in tests.
+  - No workspace edition or reqwest dependency settings are changed.
 - **Cautionary Points (Risks & Edge Cases):**
-  - Attention à ne pas casser les lectures de fichiers valides à l’intérieur du workspace.
-  - Vérifier les comportements différents Unix/Windows autour des symlinks.
-  - Attention aux DNS/résolutions indirectes si la validation reste basée sur le host texte seulement.
+  - Keep the existing display strings for `Cli`, `Env`, `File`, and `Default` unchanged.
+  - Do not add new environment variables or config TOML keys.
 - **Implementation Suggestions:**
-  - Introduire un helper commun de politique d’approbation.
-  - Introduire un helper commun `is_allowed_remote_host(...)` partagé entre crates, ou le déplacer dans un crate adapté.
-  - Si aucune UX CLI interactive n’est souhaitée, documenter explicitement la restriction.
+  - Place the new variant alongside the existing enum variants and update the match immediately to keep compiler errors obvious.
 - **Testing Suggestions:**
-  - Ajouter tests unitaires sur politique d’approbation.
-  - Ajouter test symlink hors workspace dans `mimo-tools`.
-  - Ajouter tests IPv4/IPv6 privés, loopback, link-local sur les validateurs réseau.
-  - Vérifier `cargo test --workspace`.
+  - Add or extend a small unit test in `mimo-config` for the display label.
+  - Run `cargo check` after this sub-task if implementing incrementally.
 - **Done When:**
-  - Les risques de sécurité identifiés sont couverts par du code et des tests, avec comportement documenté.
+  - The config crate can represent and display the workspace instruction source.
 
-### Sub-Task 2: Renforcer la robustesse des outils shell, édition et exécutions bloquantes
+### Sub-Task 2: Add safe workspace instruction discovery helpers
 
 - **Status:** Pending
-- **Objective:** Réduire les risques OOM, les remplacements de texte trop larges et les blocages liés aux appels systèmes synchrones.
-- **Related Requirements:** R2
-- **Dependencies and Preconditions:** Peut commencer après ou en parallèle de la sous-tâche 1, si les zones modifiées ne se chevauchent pas trop.
+- **Objective:** Implement root-only discovery, priority selection, symlink rejection, and 32 KiB bounded reading in `mimo-config`.
+- **Related Requirements:** R1, R3, R4, R6
+- **Dependencies and Preconditions:** Sub-Task 1 completed if `libc` is needed.
 - **In Scope for This Sub-Task:**
-  - Borner les buffers stdout/stderr du shell.
-  - Clarifier la stratégie de troncation de sortie.
-  - Corriger `EditFileTool` pour ne pas remplacer toutes les occurrences par défaut.
-  - Migrer les appels `Command::output` sensibles vers `spawn_blocking` ou `tokio::process` selon le contexte.
+  - New private constants in `crates/mimo-config/src/lib.rs`:
+    - `WORKSPACE_INSTRUCTIONS_MAX_BYTES` set to `32 * 1024`.
+    - A filename priority list for `AGENTS.md`, `CLAUDE.md`, `README.md`.
+  - New private helper data structure for discovered instruction metadata, if useful.
+  - New private helper functions for discovery, candidate classification, safe open/read, and truncation.
 - **Out of Scope for This Sub-Task:**
-  - Refonte complète du shell manager.
-  - Diff unifié riche si cela gonfle trop le scope.
+  - Parent-directory walking.
+  - Recursive workspace scanning.
+  - Parsing markdown semantics.
 - **Instructions:**
-  1. Définir une limite mémoire raisonnable par buffer shell (ex. 4–8 MiB par flux).
-  2. Choisir la politique en cas de dépassement : troncature circulaire, troncature tête, ou arrêt contrôlé du job.
-  3. Faire évoluer `EditFileTool` pour un comportement plus sûr :
-     - remplacer une seule occurrence par défaut,
-     - ou échouer si plusieurs occurrences existent sans précision supplémentaire.
-  4. Revoir `run_command` / `run_command_with_stdin` et autres exécutions synchrones déclenchées depuis du code async.
-  5. Identifier les endroits où une exécution bloquante est acceptable et ceux où elle doit être isolée.
+  1. Add a helper that accepts a workspace root path and checks only `root/AGENTS.md`, `root/CLAUDE.md`, and `root/README.md` in that order.
+  2. Use `fs::symlink_metadata()` for each candidate:
+     - missing file: continue to the next candidate;
+     - symlink: reject it and continue to the next candidate;
+     - directory or other non-regular file: ignore it and continue;
+     - regular file: attempt to read it safely.
+  3. For Unix builds, open the regular candidate using `OpenOptions` plus `O_NOFOLLOW`, matching the defense-in-depth pattern in `crates/mimo-tools/src/file.rs:312`.
+  4. For non-Unix builds, still rely on `symlink_metadata()` to reject symlink candidates before opening.
+  5. Read only up to `WORKSPACE_INSTRUCTIONS_MAX_BYTES + 1` bytes, so truncation can be detected without loading an entire large README.
+  6. Convert the bounded bytes into prompt text safely. Prefer UTF-8-preserving truncation; if using lossy conversion, ensure tests cover the ASCII truncation contract.
+  7. Treat empty or whitespace-only instruction content as no discovered instruction and continue to the next candidate.
+  8. Return discovered metadata including at least filename/path, content, and whether truncation occurred.
 - **Acceptance Criteria:**
-  - Une commande verbeuse n’entraîne plus une croissance mémoire non bornée.
-  - Les remplacements de texte deviennent prédictibles.
-  - Les appels bloquants critiques sont isolés du runtime async.
+  - Discovery chooses only one file: the first valid candidate by priority.
+  - Symlinked candidates are never followed.
+  - Loaded instruction content is capped at 32 KiB before prompt assembly.
+  - Helper functions are testable without changing the process current directory.
 - **Cautionary Points (Risks & Edge Cases):**
-  - La troncature ne doit pas empêcher le diagnostic utilisateur.
-  - `EditFileTool` doit rester simple à consommer pour le modèle.
-  - Attention aux écarts de comportement shell entre plateformes.
+  - `Path::exists()` and `fs::metadata()` follow symlinks; avoid them for candidate classification.
+  - If a file is replaced by a symlink between metadata and open on Unix, `O_NOFOLLOW` should cause open to fail instead of following it.
+  - Be deliberate about unreadable regular files: include path context in any propagated error so startup failures are diagnosable.
 - **Implementation Suggestions:**
-  - Préférer une structure “tail buffer” pour conserver les dernières sorties utiles.
-  - Envisager `replacen(..., 1)` comme comportement par défaut minimal.
-  - Pour les commandes ponctuelles non streamées, `spawn_blocking` peut suffire.
+  - Keep helpers private to `mimo-config` unless tests need `pub(crate)` visibility.
+  - Include the source filename in the returned metadata so the prompt separator can say which file was used.
 - **Testing Suggestions:**
-  - Tests shell sur troncature/limite de buffer.
-  - Tests `EditFileTool` pour 0, 1 et plusieurs occurrences.
-  - Validation `cargo test --workspace`.
+  - Unit test priority: create all three files in a tempdir and assert `AGENTS.md` is selected.
+  - Unit test fallback: create only `CLAUDE.md`, then only `README.md`, and assert each can be selected.
+  - Unit test truncation with ASCII content larger than 32 KiB.
+  - Unix-only unit test symlink rejection using a symlinked `AGENTS.md`; assert the symlink target content is not loaded and a lower-priority regular file can be used.
 - **Done When:**
-  - Les principaux risques de robustesse des tools sont couverts et testés.
+  - Discovery is bounded, root-only, priority-aware, and symlink-safe.
 
-### Sub-Task 3: Fiabiliser la persistance locale et factoriser les écritures atomiques
+### Sub-Task 3: Wire discovery into `AppConfig::load()` prompt resolution
 
 - **Status:** Pending
-- **Objective:** Réduire les risques de corruption de fichiers d’état et homogénéiser la couche de persistance.
-- **Related Requirements:** R3
-- **Dependencies and Preconditions:** Idéalement après audit des stores dans `mimo-state`.
+- **Objective:** Merge discovered workspace instructions into the resolved system prompt while preserving existing config precedence for the base prompt.
+- **Related Requirements:** R1, R2, R5, R6
+- **Dependencies and Preconditions:** Sub-Task 2 completed.
 - **In Scope for This Sub-Task:**
-  - Identifier tous les stores qui écrivent via `fs::write` direct.
-  - Introduire un helper partagé d’écriture atomique et de création de parents.
-  - Réutiliser ce helper pour sessions, tasks, memory, MCP, diagnostics, skills si pertinent.
-  - Réduire la duplication `ensure_parent_dir`.
+  - `crates/mimo-config/src/lib.rs`, specifically `AppConfig::load()` and nearby prompt helper functions.
 - **Out of Scope for This Sub-Task:**
-  - Migration de format de stockage.
-  - Chiffrement local des fichiers.
+  - Changes to `mimo-client`, `mimo-agent`, or TUI message construction.
+  - New CLI options for system prompts.
 - **Instructions:**
-  1. Cartographier les fichiers persistés par crate.
-  2. Définir un helper commun soit dans `mimo-state`, soit dans un petit module partagé approprié.
-  3. Gérer :
-     - création du parent,
-     - écriture dans fichier temporaire,
-     - flush/sync si jugé nécessaire,
-     - rename atomique.
-  4. Uniformiser les messages d’erreur `Context(...)`.
-  5. Évaluer si les permissions Unix doivent être harmonisées sur tous les fichiers de config/state.
+  1. Keep the existing file/default base prompt behavior:
+     - non-empty `file_config.system_prompt` remains the base prompt;
+     - otherwise use `DEFAULT_SYSTEM_PROMPT`.
+  2. Resolve the workspace root with `std::env::current_dir()` inside `AppConfig::load()`; fall back to `.` if matching the existing `default_workspace_root()` behavior is preferred over startup failure.
+  3. Call the discovery helper after the base prompt is selected.
+  4. If no instruction content is discovered, leave both `system_prompt` and `system_prompt_source` exactly as before.
+  5. If instruction content is discovered, append it to the base prompt using a clear separator that includes the source filename, for example a heading-style block naming `AGENTS.md`, `CLAUDE.md`, or `README.md`.
+  6. If the content was truncated, include a concise truncation note in the workspace instruction block.
+  7. Set `system_prompt_source` to `ConfigValueSource::WorkspaceInstructions` when an instruction block is appended.
 - **Acceptance Criteria:**
-  - Les writes des stores critiques passent par un chemin plus sûr et homogène.
-  - La duplication évidente de helpers est réduite.
+  - With no workspace instruction files, effective prompt output and source are unchanged.
+  - With a workspace `AGENTS.md`, effective prompt contains the base prompt first, then a separator, then AGENTS content.
+  - With a config-file `system_prompt` and workspace instructions, the config prompt remains first and workspace instructions are appended after it.
+  - `base_url.trim_end_matches('/')` behavior remains untouched.
 - **Cautionary Points (Risks & Edge Cases):**
-  - Les garanties d’atomicité varient selon filesystem/OS.
-  - Il faut éviter d’introduire des dépendances circulaires entre crates.
+  - Do not accidentally trim or rewrite the built-in default prompt.
+  - Do not allow `README.md` to override `AGENTS.md` or `CLAUDE.md`.
+  - Avoid duplicate separators when instruction content is empty.
 - **Implementation Suggestions:**
-  - Conserver une API simple du style `write_string_atomic(path, contents)`.
-  - Si besoin, ajouter un helper `ensure_parent_dir(path)` unique et privé au crate adapté.
+  - Keep prompt assembly in a small helper such as `append_workspace_instructions(...)` so tests can assert the separator and ordering directly.
 - **Testing Suggestions:**
-  - Ajouter tests de roundtrip sur chaque store modifié.
-  - Vérifier création automatique des répertoires parents.
-  - Vérifier `cargo test --workspace`.
+  - Unit test prompt assembly with default base prompt.
+  - Unit test prompt assembly with a custom config-style base prompt.
+  - Unit test no-discovery path keeps the previous source.
 - **Done When:**
-  - Les stores critiques utilisent une stratégie d’écriture cohérente et testée.
+  - `AppConfig::load()` produces the correct effective prompt and source for discovered and non-discovered cases.
 
-### Sub-Task 4: Renforcer la couverture de tests et rendre l’agent testable
+### Sub-Task 4: Ensure `doctor` reports the new source
 
 - **Status:** Pending
-- **Objective:** Cibler les zones à fort risque avec des tests utiles, notamment la boucle agent et les stores peu couverts.
-- **Related Requirements:** R4
-- **Dependencies and Preconditions:** Peut dépendre partiellement des sous-tâches 1 à 3 si elles modifient les interfaces.
+- **Objective:** Confirm the CLI `doctor` output displays `WorkspaceInstructions` through `system_prompt_source`.
+- **Related Requirements:** R5, R6
+- **Dependencies and Preconditions:** Sub-Task 1 and Sub-Task 3 completed.
 - **In Scope for This Sub-Task:**
-  - Ajouter des tests sur `session_store`, `skill_store`, `mcp_store`.
-  - Rendre `run_agent_turn` testable via abstraction de client.
-  - Couvrir refus/acceptation tool, erreur tool, tours multiples, limite de rounds.
-  - Ajouter au moins un test d’intégration ciblé de flux agentique si faisable sans surcomplexifier.
+  - `crates/mimo-cli/src/main.rs:115-147`, especially the `System prompt` line.
 - **Out of Scope for This Sub-Task:**
-  - Harness E2E complet du TUI interactif.
-  - Tests réseau réels vers l’API MiMo.
+  - Printing full prompt contents.
+  - Adding a new doctor section for full instruction-file paths unless needed for debugging.
 - **Instructions:**
-  1. Introduire l’abstraction minimale nécessaire pour mocker le client de chat.
-  2. Adapter `run_agent_turn` pour dépendre d’une interface et non du type concret `MimoClient` quand c’est possible.
-  3. Écrire des tests agent pour :
-     - réponse simple sans tool,
-     - demande de tool approuvée,
-     - demande refusée,
-     - erreur de tool,
-     - dépassement `MAX_TOOL_ROUNDS`.
-  4. Ajouter tests stores pour save/load/list/remove et cas invalides.
-  5. Remplacer les tests temporaires fragiles par `tempfile` quand pertinent.
+  1. Inspect the existing `doctor()` implementation. It already prints `config.system_prompt_source` via `Display`.
+  2. If that remains true after adding the enum variant, no code change is required in `mimo-cli` beyond any formatting cleanup requested by `cargo fmt`.
+  3. If the implementation changes during development, ensure the output still includes the source beside the system prompt preview.
 - **Acceptance Criteria:**
-  - La logique centrale de l’agent est couverte par des tests déterministes.
-  - Les stores peu couverts ont des tests de roundtrip et d’erreur.
+  - From a directory containing a valid `AGENTS.md`, `cargo run -- doctor` shows the system prompt source as `workspace instructions`.
+  - From a directory without instruction files, `doctor` still shows `default` or `config file` as before.
 - **Cautionary Points (Risks & Edge Cases):**
-  - L’abstraction du client ne doit pas complexifier inutilement l’API publique.
-  - Attention à ne pas sur-mocker au point de perdre le bénéfice des tests.
+  - The doctor preview prints only the first line of the effective prompt; this is acceptable and should not be expanded in this task.
+  - Do not change `ask()` request construction; it already sends `config.system_prompt` as the system message.
 - **Implementation Suggestions:**
-  - Préférer une interface locale au crate `mimo-agent` si possible.
-  - Garder les tests centrés sur le comportement observable, pas les détails internes.
+  - Prefer relying on `ConfigValueSource` `Display` over adding CLI-specific source string logic.
 - **Testing Suggestions:**
-  - `cargo test --workspace`
-  - si nécessaire, tests filtrés par crate pendant le développement.
+  - Manual check: run `cargo run -- doctor` from the repo root; because this repo has `AGENTS.md`, it should report `workspace instructions`.
 - **Done When:**
-  - Les modules critiques disposent d’une couverture utile et les régressions majeures sont capturées.
+  - Doctor output reflects the new source without broader CLI behavior changes.
 
-### Sub-Task 5: Réduire la dette technique du TUI par refactoring progressif de `app.rs`
+### Sub-Task 5: Add tests and run workspace validation
 
 - **Status:** Pending
-- **Objective:** Décomposer le module TUI principal sans casser le comportement existant ni lancer une réécriture totale.
-- **Related Requirements:** R5
-- **Dependencies and Preconditions:** Recommandé après sécurisation et premiers tests, pour réduire le risque de régression.
+- **Objective:** Cover discovery behavior, prompt assembly, source reporting, truncation, and symlink rejection without destabilizing the workspace.
+- **Related Requirements:** R1, R2, R3, R4, R5, R6
+- **Dependencies and Preconditions:** Sub-Tasks 1-4 completed.
 - **In Scope for This Sub-Task:**
-  - Extraire des structures d’état secondaires.
-  - Extraire les fonctions de rendu pures.
-  - Extraire les handlers d’événements / slash commands par domaine.
-  - Réduire la taille et la responsabilité de `App`.
+  - Unit tests in `crates/mimo-config/src/lib.rs`.
+  - Existing root cargo validation commands.
 - **Out of Scope for This Sub-Task:**
-  - Refonte UX complète.
-  - Changement profond de framework TUI.
+  - End-to-end tests that require a live MiMo API key.
+  - Snapshot tests for full doctor output unless such infrastructure already exists.
 - **Instructions:**
-  1. Définir une stratégie par petites étapes, chacune compilable et testable.
-  2. Commencer par extraire les fonctions sans dépendance forte : helpers de rendu, formatage, petits états.
-  3. Regrouper ensuite les champs de `App` en sous-structures (`ConversationState`, `OverlayState`, `TaskState`, etc.) si cela simplifie réellement.
-  4. Déplacer les handlers de slash commands par thème : config, plan, skills, MCP, jobs, tasks.
-  5. Déplacer les handlers d’overlays/clavier spécialisés hors du corps principal.
-  6. Vérifier après chaque étape que les tests TUI existants restent verts.
+  1. Add unit tests for discovery priority and fallback behavior.
+  2. Add unit tests for no-file behavior returning no instructions.
+  3. Add unit tests for prompt assembly order and separator presence.
+  4. Add a unit test for `ConfigValueSource::WorkspaceInstructions` display text.
+  5. Add a truncation test proving only 32 KiB of instruction content is included before any separator/metadata overhead.
+  6. Add a Unix-only symlink rejection test. If `AGENTS.md` is a symlink and `CLAUDE.md` is a regular file, assert the symlink target content is not used and the regular fallback can be selected.
+  7. Avoid tests that mutate the process current directory; test helper functions with explicit temporary roots instead.
 - **Acceptance Criteria:**
-  - `app.rs` diminue sensiblement.
-  - Les responsabilités sont mieux séparées.
-  - Aucun changement fonctionnel involontaire n’est introduit.
+  - `cargo test -p mimo-config` passes.
+  - `cargo test --workspace` passes.
+  - `cargo fmt --check` passes.
+  - `cargo clippy --workspace -- -D warnings` passes.
 - **Cautionary Points (Risks & Edge Cases):**
-  - Ne pas casser les invariants de streaming (`assistant_index`, `streaming`, mise à jour delta).
-  - Attention aux emprunts/mutabilités lors de l’extraction en Rust.
+  - Tempdir-based tests should not depend on the real repository `AGENTS.md`.
+  - Symlink tests should be gated with `#[cfg(unix)]` unless a reliable Windows test path is added.
+  - If lossy UTF-8 conversion is used, keep truncation assertions byte-oriented for ASCII fixtures to avoid ambiguous character counts.
 - **Implementation Suggestions:**
-  - Préférer d’abord l’extraction de fonctions/modules avant d’introduire beaucoup de nouvelles abstractions.
-  - Ne créer de nouveaux types que s’ils clarifient réellement l’état.
+  - Reuse the existing test module in `mimo-config`; expand its `use super::{...}` list as needed.
+  - Keep helper functions small enough that tests can exercise behavior directly without constructing a full `AppConfig`.
 - **Testing Suggestions:**
-  - Conserver/étendre les tests ratatui existants.
-  - `cargo test --workspace`
-  - `cargo check`
+  - Run, in order:
+    1. `cargo test -p mimo-config`
+    2. `cargo fmt --check`
+    3. `cargo check`
+    4. `cargo clippy --workspace -- -D warnings`
+    5. `cargo test --workspace`
+  - Manual smoke test: `cargo run -- doctor` from `/mnt/Data/Dev/rust/MiMo-TUI` should show `System prompt` with source `workspace instructions`.
 - **Done When:**
-  - Le TUI est sensiblement plus navigable et maintenable, avec comportement inchangé.
-
-### Sub-Task 6: Renforcer la CI et les vérifications de qualité
-
-- **Status:** Pending
-- **Objective:** Faire évoluer la CI pour détecter plus tôt les problèmes d’idiomatisme, de portabilité et de régression.
-- **Related Requirements:** R6
-- **Dependencies and Preconditions:** Les tests et le code doivent être suffisamment stables pour ne pas introduire une avalanche de bruit inutile.
-- **In Scope for This Sub-Task:**
-  - Ajouter `cargo clippy` au pipeline.
-  - Étudier une matrice multi-plateforme minimale.
-  - Évaluer l’ajout de `cargo audit` ou `cargo deny`.
-  - Vérifier que les commandes documentées restent valides au niveau root.
-- **Out of Scope for This Sub-Task:**
-  - Mise en place d’une infra CI complexe ou coûteuse inutilement.
-- **Instructions:**
-  1. Faire évoluer `.github/workflows/ci.yml` par étapes.
-  2. Ajouter d’abord `cargo clippy --workspace -- -D warnings` si acceptable pour le repo.
-  3. Ajouter ensuite une matrice OS si le coût reste raisonnable.
-  4. Décider si l’audit sécurité est bloquant ou informatif.
-  5. Documenter toute nouvelle exigence développeur si nécessaire.
-- **Acceptance Criteria:**
-  - La CI couvre le formatage, la compilation, les tests, et au moins un niveau de linting.
-  - Les divergences plateforme évidentes sont plus tôt détectées.
-- **Cautionary Points (Risks & Edge Cases):**
-  - `clippy -D warnings` peut nécessiter une phase de remise à niveau préalable.
-  - La matrice multi-OS augmente le temps de CI.
-- **Implementation Suggestions:**
-  - Si besoin, commencer par Linux + clippy, puis ajouter les autres OS ensuite.
-  - Garder la CI lisible et cohérente avec les commandes du projet.
-- **Testing Suggestions:**
-  - Vérifier localement, selon disponibilité :
-    - `cargo fmt --check`
-    - `cargo check`
-    - `cargo test --workspace`
-    - `cargo clippy --workspace -- -D warnings`
-- **Done When:**
-  - La CI est plus complète sans devenir disproportionnée par rapport au projet.
-
-### Sub-Task 7: Corriger la documentation et aligner README / comportement réel
-
-- **Status:** Pending
-- **Objective:** Réduire les écarts entre la documentation, l’architecture réelle et les comportements effectifs du produit.
-- **Related Requirements:** R7
-- **Dependencies and Preconditions:** Mieux après les sous-tâches 1 et 6 si elles changent le comportement ou la CI.
-- **In Scope for This Sub-Task:**
-  - Corriger le README sur la liste réelle des crates.
-  - Documenter les raccourcis existants non listés.
-  - Clarifier le comportement d’approbation des tools selon les modes.
-  - Clarifier les contraintes utiles (température, limites, commandes disponibles).
-- **Out of Scope for This Sub-Task:**
-  - Refonte marketing complète de la documentation.
-- **Instructions:**
-  1. Auditer le README par rapport au workspace réel et aux commandes CLI disponibles.
-  2. Corriger la table des crates et la section commandes/contrôles.
-  3. Ajouter un court paragraphe sur les modes `agent`, `plan`, `yolo` et leurs implications.
-  4. Vérifier la cohérence avec `.github/copilot-instructions.md` et `AGENTS.md`.
-  5. Si utile, ajouter une section “Known limits / safety model”.
-- **Acceptance Criteria:**
-  - Le README décrit correctement le projet tel qu’il fonctionne réellement.
-  - Les principales commandes et raccourcis sont alignés avec le code.
-- **Cautionary Points (Risks & Edge Cases):**
-  - Ne pas documenter des comportements futurs non encore implémentés.
-  - Garder la doc concise et fiable.
-- **Implementation Suggestions:**
-  - Utiliser les tests/commandes comme source de vérité secondaire.
-  - Prioriser la correction des points qui impactent la sécurité et l’onboarding.
-- **Testing Suggestions:**
-  - Relecture croisée avec `mimo-cli/src/main.rs`, `mimo-tui-core/src/commands.rs`, `app.rs`, workflow CI.
-  - Si besoin, lancer `cargo run -- --help` ou équivalent au moment de l’implémentation.
-- **Done When:**
-  - La doc ne contient plus d’écarts évidents avec l’état du code.
-
-### Sub-Task 8: Alléger `mimo-config` en remplaçant `reqwest::Url` par une dépendance plus ciblée
-
-- **Status:** Pending
-- **Objective:** Réduire le poids conceptuel et technique de `mimo-config` en supprimant une dépendance réseau non nécessaire.
-- **Related Requirements:** R8
-- **Dependencies and Preconditions:** Peut être fait assez tôt, mais idéalement après les travaux de sécurité pour éviter les conflits sur la validation d’URL.
-- **In Scope for This Sub-Task:**
-  - Remplacer `reqwest::Url` par `url::Url` ou équivalent.
-  - Mettre à jour `Cargo.toml` du workspace/crate concerné.
-  - Vérifier que `normalize_base_url` garde exactement le comportement attendu.
-- **Out of Scope for This Sub-Task:**
-  - Refonte complète des règles de validation des URLs de config.
-- **Instructions:**
-  1. Introduire la dépendance la plus légère adaptée (`url`).
-  2. Modifier `mimo-config` pour n’utiliser que ce parseur.
-  3. Vérifier que les schémas autorisés restent `http` et `https` uniquement.
-  4. Ajouter des tests sur `normalize_base_url` si absents.
-- **Acceptance Criteria:**
-  - `mimo-config` n’importe plus `reqwest` pour parser les URLs.
-  - Le comportement de validation/normalisation reste inchangé pour les cas valides/invalides connus.
-- **Cautionary Points (Risks & Edge Cases):**
-  - Attention aux subtilités de parsing entre crates.
-  - Vérifier les cas avec slash terminal, espaces et schémas invalides.
-- **Implementation Suggestions:**
-  - Ajouter tests explicites avant ou pendant le changement pour figer le comportement.
-- **Testing Suggestions:**
-  - Tests unitaires `normalize_base_url`.
-  - `cargo test --workspace`
-  - `cargo check`
-- **Done When:**
-  - La dépendance superflue est supprimée sans régression fonctionnelle.
+  - Automated tests and manual doctor smoke test validate the requested behavior.
 
 ## Final Integration & Verification
 
 - **System-Wide Test:**
-  1. `cargo fmt --check`
-  2. `cargo check`
-  3. `cargo test --workspace`
-  4. si ajouté : `cargo clippy --workspace -- -D warnings`
-  5. test manuel minimal :
-     - `cargo run -- doctor`
-     - `cargo run -- models`
-     - `cargo run`
-     - vérification TUI des modes Agent / Plan / YOLO
-     - vérification d’une demande outil read-only et d’une demande outil mutante
-
+  1. Create or use a workspace containing `AGENTS.md`; run `cargo run -- doctor` and verify `System prompt` reports `workspace instructions`.
+  2. Temporarily test a workspace with only `CLAUDE.md`, then only `README.md`, and verify fallback behavior.
+  3. Temporarily test a workspace with no supported files and verify the source remains `default` or `config file`.
+  4. Confirm `cargo run -- ask "test prompt"` still builds a request successfully when credentials are configured; no live API assertion is required without an API key.
 - **Completion Checklist:**
-  - [ ] Les politiques d’approbation sont cohérentes et sûres.
-  - [ ] Les outils critiques sont plus robustes et couverts par des tests.
-  - [ ] Les stores persistants utilisent des écritures plus sûres.
-  - [ ] La boucle agent est testable et testée.
-  - [ ] `app.rs` est significativement mieux découpé.
-  - [ ] La CI reflète mieux les standards du projet.
-  - [ ] Le README et les docs sont réalignés.
-  - [ ] `mimo-config` est allégé sans changement de comportement.
+  - [ ] `ConfigValueSource::WorkspaceInstructions` exists and displays clearly.
+  - [ ] Discovery searches only the workspace root and uses the required priority order.
+  - [ ] Symlinked candidates are rejected and not followed.
+  - [ ] Instruction content is capped at 32 KiB.
+  - [ ] Effective prompt appends instructions after the base prompt with a clear separator.
+  - [ ] Doctor displays the new source when workspace instructions are appended.
+  - [ ] No changes violate Edition 2024, workspace layout, reqwest rustls-only, or base URL normalization constraints.
+  - [ ] `cargo fmt --check`, `cargo check`, `cargo clippy --workspace -- -D warnings`, and `cargo test --workspace` pass.
 
 ## Open Questions
 
-- Faut-il conserver un mode CLI `ask` pleinement autonome, ou le restreindre tant qu’un mécanisme d’approbation CLI explicite n’existe pas ?
-- Souhaite-t-on traiter le refactoring de `app.rs` en plusieurs PRs dédiées, indépendantes des correctifs sécurité/tests ?
+- None blocking. If maintainers prefer symlink candidates to fail startup instead of being skipped, update Sub-Task 2 tests and behavior consistently before implementation.

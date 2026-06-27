@@ -13,8 +13,9 @@ use mimo_config::{
 };
 use mimo_protocol::{ChatMessage, Role};
 use mimo_state::{
-    AppMode, FileAttachment, PlanItem, diagnostics_store, mcp_store, memory_store, session_store,
-    skill_store, task_store,
+    AppMode, FileAttachment, PlanItem,
+    branch::{ConversationTree, MessageId},
+    diagnostics_store, mcp_store, memory_store, session_store, skill_store, task_store,
 };
 use mimo_tools::{
     ApprovalRequirement, ShellResult, ShellStatus, ToolContext, ToolInvocation, ToolKind,
@@ -116,6 +117,12 @@ struct CommandPaletteState {
     scroll: u16,
 }
 
+#[derive(Debug, Default)]
+struct BranchSelectionState {
+    open: bool,
+    selected: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DraftBrowserKind {
     History,
@@ -177,12 +184,14 @@ impl Default for InspectorBrowserState {
 pub struct App {
     config: AppConfig,
     messages: Vec<ChatMessage>,
+    conversation_tree: ConversationTree,
     tool_context: ToolContext,
     tool_registry: ToolRegistry,
     input: InputBuffer,
     status: String,
     streaming: bool,
     assistant_index: Option<usize>,
+    assistant_message_id: Option<MessageId>,
     scroll: u16,
     conversation_view_height: u16,
     input_scroll: u16,
@@ -190,6 +199,7 @@ pub struct App {
     model_picker: ModelPickerState,
     session_picker: SessionPickerState,
     command_palette: CommandPaletteState,
+    branch_selection: BranchSelectionState,
     draft_browser: DraftBrowserState,
     message_pager: MessagePagerState,
     inspector_browser: InspectorBrowserState,
@@ -240,12 +250,14 @@ impl App {
         Self {
             config,
             messages: Vec::new(),
+            conversation_tree: ConversationTree::new(),
             tool_context,
             tool_registry,
             input: InputBuffer::new(),
             status,
             streaming: false,
             assistant_index: None,
+            assistant_message_id: None,
             scroll: 0,
             conversation_view_height: 1,
             input_scroll: 0,
@@ -253,6 +265,7 @@ impl App {
             model_picker: ModelPickerState::default(),
             session_picker: SessionPickerState::default(),
             command_palette: CommandPaletteState::default(),
+            branch_selection: BranchSelectionState::default(),
             draft_browser: DraftBrowserState::default(),
             message_pager: MessagePagerState::default(),
             inspector_browser: InspectorBrowserState::default(),
@@ -464,6 +477,9 @@ impl App {
                 if self.message_pager.open {
                     return Ok(self.handle_message_pager_key(key));
                 }
+                if self.branch_selection.open {
+                    return self.handle_branch_selection_key(key);
+                }
 
                 if opens_help(key, self.input.is_empty()) {
                     self.open_help(None);
@@ -491,6 +507,10 @@ impl App {
                 }
                 if toggles_mode_shortcut(key) {
                     self.toggle_mode();
+                    return Ok(false);
+                }
+                if opens_branch_selection(key) {
+                    self.open_branch_selection();
                     return Ok(false);
                 }
 
@@ -581,11 +601,7 @@ impl App {
     pub fn handle_app_event(&mut self, event: AppEvent) {
         match event {
             AppEvent::Delta(delta) => {
-                if let Some(index) = self.assistant_index
-                    && let Some(message) = self.messages.get_mut(index)
-                {
-                    message.content.push_str(&delta);
-                }
+                self.append_streaming_assistant_delta(&delta);
                 self.scroll_to_bottom();
             }
             AppEvent::Finished(Ok(())) => {
@@ -593,6 +609,7 @@ impl App {
                 self.stream_context = None;
                 self.streaming = false;
                 self.assistant_index = None;
+                self.assistant_message_id = None;
                 if self.status != "Generation cancelled" {
                     self.status = "Ready".to_string();
                 }
@@ -602,13 +619,15 @@ impl App {
                 self.stream_task = None;
                 self.stream_context = None;
                 self.streaming = false;
-                if let Some(index) = self.assistant_index
-                    && let Some(message) = self.messages.get_mut(index)
-                    && message.content.is_empty()
-                {
-                    message.content = format!("Request failed: {error}");
+                let should_write_error = self
+                    .assistant_index
+                    .and_then(|index| self.messages.get(index))
+                    .is_some_and(|message| message.content.is_empty());
+                if should_write_error {
+                    self.set_streaming_assistant_content(format!("Request failed: {error}"));
                 }
                 self.assistant_index = None;
+                self.assistant_message_id = None;
                 self.status = error;
                 self.scroll_to_bottom();
             }
@@ -803,6 +822,14 @@ impl App {
     }
 
     fn render_conversation(&self, frame: &mut Frame, area: Rect) {
+        let title = if self.branch_selection.open {
+            "Select branch point — Enter create | Esc cancel".to_string()
+        } else {
+            format!(
+                "Conversation — {}",
+                self.conversation_tree.current_branch_id()
+            )
+        };
         let text = if self.messages.is_empty() {
             Text::from(vec![
                 Line::styled(
@@ -823,7 +850,7 @@ impl App {
             Paragraph::new(text)
                 .block(
                     Block::default()
-                        .title("Conversation")
+                        .title(title)
                         .borders(Borders::ALL)
                         .border_style(panel_border_style()),
                 )
@@ -933,6 +960,7 @@ impl App {
             && !self.model_picker.open
             && !self.session_picker.open
             && !self.command_palette.open
+            && !self.branch_selection.open
             && !self.draft_browser.open
             && !self.message_pager.open
             && !self.inspector_browser.open
@@ -953,6 +981,10 @@ impl App {
     }
 
     fn footer_summary(&self) -> String {
+        if self.branch_selection.open {
+            return "Select a message · ↑/↓ move · Enter create · Esc cancel".to_string();
+        }
+
         let summary = match self.footer_context_chars() {
             Ok(used_chars) => {
                 let max_chars = estimated_max_context_chars(&self.config.model);
@@ -965,11 +997,17 @@ impl App {
             Err(_) => "context unavailable · F1/? help".to_string(),
         };
 
-        if self.mode == AppMode::Yolo {
+        let summary = if self.mode == AppMode::Yolo {
             format!("{summary} · YOLO auto-approves mutating tools")
         } else {
             summary
-        }
+        };
+
+        format!(
+            "{summary} · branch {}/{} · Ctrl+B branch",
+            self.conversation_tree.current_branch_id(),
+            self.conversation_tree.branch_count()
+        )
     }
 
     fn footer_context_chars(&self) -> Result<usize> {
@@ -1786,10 +1824,12 @@ impl App {
         remember_draft(&mut self.draft_history, &prompt);
         self.last_prompt = Some(prompt.clone());
         self.input.clear();
-        self.messages.push(ChatMessage::user(prompt));
+        self.push_conversation_message(ChatMessage::user(prompt));
         let assistant_index = self.messages.len();
-        self.messages.push(ChatMessage::assistant(String::new()));
+        let assistant_message_id =
+            self.push_conversation_message(ChatMessage::assistant(String::new()));
         self.assistant_index = Some(assistant_index);
+        self.assistant_message_id = Some(assistant_message_id);
         self.streaming = true;
         self.status = if self.config.model == AUTO_MODEL {
             format!("Auto routed to {routed_model}; streaming from MiMo...")
@@ -1966,6 +2006,7 @@ impl App {
                     &self.plan_items,
                     &self.attachments,
                     &self.messages,
+                    Some(&self.conversation_tree),
                     path.as_deref(),
                 )?;
                 self.status = format!("Saved session to {}", saved_path.display());
@@ -2023,9 +2064,21 @@ impl App {
             }
             SlashCommand::Context => {
                 let summary = mimo_tools::summarize_workspace(2, 60)?;
-                self.messages.push(ChatMessage::system(summary));
+                self.push_system_message(summary);
                 self.scroll_to_bottom();
                 self.status = "Project context added to the conversation".to_string();
+                Ok(false)
+            }
+            SlashCommand::Branch { message_index } => {
+                self.handle_branch_command(message_index)?;
+                Ok(false)
+            }
+            SlashCommand::Branches => {
+                self.show_branches();
+                Ok(false)
+            }
+            SlashCommand::Switch { branch_id } => {
+                self.switch_branch(&branch_id)?;
                 Ok(false)
             }
             SlashCommand::Mode { mode } => {
@@ -2101,6 +2154,270 @@ impl App {
                 Ok(false)
             }
         }
+    }
+
+    fn handle_branch_command(&mut self, message_index: Option<usize>) -> Result<()> {
+        if self.streaming {
+            self.status = "Cannot branch while MiMo is responding".to_string();
+            return Ok(());
+        }
+
+        if self.messages.is_empty() {
+            self.status = "No conversation messages available to branch".to_string();
+            return Ok(());
+        }
+
+        let selected_index = match message_index {
+            Some(0) => {
+                self.status = "Message numbers start at 1".to_string();
+                return Ok(());
+            }
+            Some(index) => index,
+            None => {
+                let Some(index) = self.default_branch_source_index() else {
+                    self.status =
+                        "No branchable messages are available in this conversation".to_string();
+                    return Ok(());
+                };
+                index
+            }
+        };
+
+        let Some(branch_id) = self.create_branch_from_visible_index(selected_index)? else {
+            return Ok(());
+        };
+
+        self.status = format!(
+            "Created branch {branch_id} from message {selected_index}; type a new prompt to continue."
+        );
+        Ok(())
+    }
+
+    fn default_branch_source_index(&self) -> Option<usize> {
+        self.messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, message)| matches!(message.role, Role::User))
+            .map(|(index, _)| index + 1)
+            .or_else(|| {
+                self.messages
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(_, message)| !matches!(message.role, Role::System))
+                    .map(|(index, _)| index + 1)
+            })
+    }
+
+    fn open_branch_selection(&mut self) {
+        if self.streaming {
+            self.status = "Cannot branch while MiMo is responding".to_string();
+            return;
+        }
+
+        let Some(selected) = self.default_branch_source_index() else {
+            self.status = "No branchable messages are available in this conversation".to_string();
+            return;
+        };
+
+        self.branch_selection.open = true;
+        self.branch_selection.selected = selected.saturating_sub(1);
+        self.ensure_branch_selection_visible();
+    }
+
+    fn handle_branch_selection_key(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc => self.cancel_branch_selection(),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cancel_branch_selection()
+            }
+            KeyCode::Enter => self.confirm_branch_selection()?,
+            KeyCode::Up => self.move_branch_selection(-1),
+            KeyCode::Down => self.move_branch_selection(1),
+            KeyCode::Home => {
+                if let Some(index) = self.first_branchable_index() {
+                    self.branch_selection.selected = index;
+                    self.ensure_branch_selection_visible();
+                }
+            }
+            KeyCode::End => {
+                if let Some(index) = self.last_branchable_index() {
+                    self.branch_selection.selected = index;
+                    self.ensure_branch_selection_visible();
+                }
+            }
+            _ => {}
+        }
+
+        Ok(false)
+    }
+
+    fn move_branch_selection(&mut self, delta: i32) {
+        if self.messages.is_empty() || delta == 0 {
+            return;
+        }
+
+        let step = delta.signum();
+        let last_index = self.messages.len().saturating_sub(1) as i32;
+        let mut next_index = self.branch_selection.selected as i32;
+
+        loop {
+            let candidate = (next_index + step).clamp(0, last_index);
+            if candidate == next_index {
+                break;
+            }
+
+            next_index = candidate;
+            if self.is_branchable_message(next_index as usize) {
+                self.branch_selection.selected = next_index as usize;
+                self.ensure_branch_selection_visible();
+                break;
+            }
+        }
+    }
+
+    fn confirm_branch_selection(&mut self) -> Result<()> {
+        let selected_index = self.branch_selection.selected + 1;
+        let Some(branch_id) = self.create_branch_from_visible_index(selected_index)? else {
+            return Ok(());
+        };
+
+        self.branch_selection = BranchSelectionState::default();
+        self.status = format!(
+            "Created branch {branch_id} from message {selected_index}; type a new prompt to continue."
+        );
+        Ok(())
+    }
+
+    fn cancel_branch_selection(&mut self) {
+        self.branch_selection = BranchSelectionState::default();
+    }
+
+    fn create_branch_from_visible_index(
+        &mut self,
+        selected_index: usize,
+    ) -> Result<Option<String>> {
+        let Some(message_id) = self
+            .visible_message_id(selected_index)
+            .map(ToOwned::to_owned)
+        else {
+            self.status = format!("Message {selected_index} is out of range");
+            return Ok(None);
+        };
+
+        let Some(message) = self.messages.get(selected_index - 1) else {
+            self.status = format!("Message {selected_index} is out of range");
+            return Ok(None);
+        };
+        if matches!(message.role, Role::System) {
+            self.status = format!("Cannot branch from system message {selected_index}");
+            return Ok(None);
+        }
+
+        let branch_id = self
+            .conversation_tree
+            .create_branch_from_message(&message_id)?;
+        self.sync_messages_from_tree();
+        self.assistant_index = None;
+        self.assistant_message_id = None;
+        self.scroll_to_bottom();
+        Ok(Some(branch_id))
+    }
+
+    fn is_branchable_message(&self, index: usize) -> bool {
+        self.messages
+            .get(index)
+            .is_some_and(|message| !matches!(message.role, Role::System))
+    }
+
+    fn first_branchable_index(&self) -> Option<usize> {
+        self.messages
+            .iter()
+            .position(|message| !matches!(message.role, Role::System))
+    }
+
+    fn last_branchable_index(&self) -> Option<usize> {
+        self.messages
+            .iter()
+            .rposition(|message| !matches!(message.role, Role::System))
+    }
+
+    fn ensure_branch_selection_visible(&mut self) {
+        if !self.branch_selection.open {
+            return;
+        }
+
+        let Some(label_offset) = self
+            .message_label_line_offsets()
+            .get(self.branch_selection.selected)
+            .copied()
+        else {
+            return;
+        };
+
+        self.scroll = adjust_selection_scroll(
+            label_offset,
+            self.scroll,
+            self.conversation_view_height.max(1) as usize,
+        );
+    }
+
+    fn message_label_line_offsets(&self) -> Vec<usize> {
+        let mut offsets = Vec::with_capacity(self.messages.len());
+        let mut line_offset = 0;
+
+        for message in &self.messages {
+            offsets.push(line_offset);
+            line_offset += 1;
+            line_offset += if message.content.is_empty() {
+                1
+            } else {
+                markdown::render_markdown_lines(&message.content).len()
+            };
+            line_offset += 1;
+        }
+
+        offsets
+    }
+
+    fn show_branches(&mut self) {
+        let mut output = String::from("Conversation branches\n\n");
+        for summary in self.conversation_tree.branch_summaries() {
+            let marker = if summary.is_current { "*" } else { "-" };
+            let source = summary
+                .created_from_message_number
+                .map(|index| format!("message {index}"))
+                .unwrap_or_else(|| "root".to_string());
+            output.push_str(&format!(
+                "{marker} {} | {} messages | from {} | {}\n",
+                summary.id, summary.message_count, source, summary.last_message_preview
+            ));
+        }
+
+        self.push_system_message(output.trim_end().to_string());
+        self.status = "Conversation branches shown".to_string();
+    }
+
+    fn switch_branch(&mut self, branch_id: &str) -> Result<()> {
+        if self.streaming {
+            self.status = "Cannot switch branches while MiMo is responding".to_string();
+            return Ok(());
+        }
+
+        if let Err(error) = self.conversation_tree.switch_branch(branch_id) {
+            self.status = error.to_string();
+            return Ok(());
+        }
+
+        self.sync_messages_from_tree();
+        self.assistant_index = None;
+        self.assistant_message_id = None;
+        self.tool_runtime.clear_transient();
+        self.branch_selection = BranchSelectionState::default();
+        self.scroll_to_bottom();
+        self.status = format!("Switched to branch {branch_id}");
+        Ok(())
     }
 
     fn handle_skill_command(&mut self, command: SkillCommand) -> Result<()> {
@@ -2558,7 +2875,10 @@ impl App {
         }
 
         self.messages.clear();
+        self.conversation_tree = ConversationTree::new();
         self.assistant_index = None;
+        self.assistant_message_id = None;
+        self.branch_selection = BranchSelectionState::default();
         self.last_prompt = None;
         self.scroll = 0;
         self.tool_runtime.clear_transient();
@@ -2585,8 +2905,63 @@ impl App {
         self.status = "Draft stashed".to_string();
     }
 
+    fn sync_messages_from_tree(&mut self) {
+        self.messages = self.conversation_tree.current_messages();
+        self.last_prompt = self.last_user_prompt();
+    }
+
+    fn push_conversation_message(&mut self, message: ChatMessage) -> MessageId {
+        let message_id = self
+            .conversation_tree
+            .add_message_to_current(message.clone());
+        self.messages.push(message);
+        self.last_prompt = self.last_user_prompt();
+        message_id
+    }
+
+    fn append_streaming_assistant_delta(&mut self, delta: &str) {
+        if let Some(index) = self.assistant_index
+            && let Some(message) = self.messages.get_mut(index)
+        {
+            message.content.push_str(delta);
+        }
+
+        if let Some(message_id) = self.assistant_message_id.clone()
+            && let Some(message) = self.conversation_tree.message_mut(&message_id)
+        {
+            message.content.push_str(delta);
+        }
+    }
+
+    fn set_streaming_assistant_content(&mut self, content: String) {
+        if let Some(index) = self.assistant_index
+            && let Some(message) = self.messages.get_mut(index)
+        {
+            message.content = content.clone();
+        }
+
+        if let Some(message_id) = self.assistant_message_id.clone()
+            && let Some(message) = self.conversation_tree.message_mut(&message_id)
+        {
+            message.content = content;
+        }
+    }
+
+    fn visible_message_id(&self, one_based_index: usize) -> Option<&str> {
+        one_based_index
+            .checked_sub(1)
+            .and_then(|index| self.conversation_tree.message_id_at_current_index(index))
+    }
+
+    fn reset_conversation_from_messages(&mut self, messages: Vec<ChatMessage>) {
+        self.conversation_tree = ConversationTree::from_flat_messages(messages);
+        self.sync_messages_from_tree();
+        self.assistant_index = None;
+        self.assistant_message_id = None;
+    }
+
     fn push_system_message(&mut self, content: String) {
-        self.messages.push(ChatMessage::system(content));
+        self.push_conversation_message(ChatMessage::system(content));
         self.scroll_to_bottom();
     }
 
@@ -2596,7 +2971,7 @@ impl App {
             messages.push(ChatMessage::system(self.plan_summary()));
         }
         messages.extend(attachments::attachment_messages(&self.attachments)?);
-        messages.extend(self.messages.clone());
+        messages.extend(self.conversation_tree.current_messages());
         Ok(messages)
     }
 
@@ -2647,13 +3022,15 @@ impl App {
         }
         self.stream_context = None;
         self.streaming = false;
-        if let Some(index) = self.assistant_index
-            && let Some(message) = self.messages.get_mut(index)
-            && message.content.trim().is_empty()
-        {
-            message.content = "Request cancelled.".to_string();
+        let should_mark_cancelled = self
+            .assistant_index
+            .and_then(|index| self.messages.get(index))
+            .is_some_and(|message| message.content.trim().is_empty());
+        if should_mark_cancelled {
+            self.set_streaming_assistant_content("Request cancelled.".to_string());
         }
         self.assistant_index = None;
+        self.assistant_message_id = None;
         self.status = "Generation cancelled".to_string();
         self.scroll_to_bottom();
     }
@@ -2859,19 +3236,61 @@ impl App {
     }
 
     fn apply_loaded_session(&mut self, session: session_store::SavedSession, source: String) {
-        self.messages = session.messages;
-        self.set_mode(session.mode);
-        self.config.model = session.model;
-        self.active_skills = session.active_skills;
-        self.diagnostics_auto_run = session.lsp_auto_run;
-        self.plan_items = session.plan_items;
-        self.attachments = session.attachments;
+        if let Some(stream_task) = self.stream_task.take() {
+            if let Some(tool_context) = &self.stream_context {
+                tool_context.cancel();
+            }
+            stream_task.abort();
+        }
+        self.stream_context = None;
+        self.streaming = false;
+
+        let session_store::SavedSession {
+            mode,
+            model,
+            active_skills,
+            lsp_auto_run,
+            plan_items,
+            attachments,
+            messages,
+            conversation_tree,
+            ..
+        } = session;
+        let warning_suffix = if let Some(mut conversation_tree) = conversation_tree {
+            match conversation_tree.validate_or_repair() {
+                Ok(()) => {
+                    if conversation_tree.current_messages().is_empty() && !messages.is_empty() {
+                        self.reset_conversation_from_messages(messages.clone());
+                        " (branch data ignored: empty active branch)".to_string()
+                    } else {
+                        self.conversation_tree = conversation_tree;
+                        self.sync_messages_from_tree();
+                        String::new()
+                    }
+                }
+                Err(error) => {
+                    self.reset_conversation_from_messages(messages.clone());
+                    format!(" (branch data ignored: {error})")
+                }
+            }
+        } else {
+            self.reset_conversation_from_messages(messages.clone());
+            String::new()
+        };
+
+        self.set_mode(mode);
+        self.config.model = model;
+        self.active_skills = active_skills;
+        self.diagnostics_auto_run = lsp_auto_run;
+        self.plan_items = plan_items;
+        self.attachments = attachments;
         self.assistant_index = None;
+        self.assistant_message_id = None;
         self.tool_runtime.clear_transient();
+        self.branch_selection = BranchSelectionState::default();
         self.scroll_to_bottom();
-        self.last_prompt = self.last_user_prompt();
         self.session_picker = SessionPickerState::default();
-        self.status = format!("Loaded session from {source}");
+        self.status = format!("Loaded session from {source}{warning_suffix}");
     }
 
     fn apply_selected_draft(&mut self) {
@@ -3041,17 +3460,37 @@ impl App {
 
     fn message_lines(&self) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        for message in &self.messages {
+        for (index, message) in self.messages.iter().enumerate() {
+            let marker = self
+                .conversation_tree
+                .message_id_at_current_index(index)
+                .filter(|message_id| self.conversation_tree.is_branch_point(message_id))
+                .map(|_| " ◇")
+                .unwrap_or("");
+            let prefix = if self.branch_selection.open && self.branch_selection.selected == index {
+                "> "
+            } else {
+                ""
+            };
             let (label, color) = match message.role {
                 Role::System => ("System", Color::DarkGray),
                 Role::User => ("You", Color::Green),
                 Role::Assistant => ("MiMo", Color::Cyan),
                 Role::Tool => ("Tool", Color::Yellow),
             };
+            let label_style =
+                if self.branch_selection.open && self.branch_selection.selected == index {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(color).add_modifier(Modifier::BOLD)
+                };
 
             lines.push(Line::styled(
-                format!("{label}:"),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
+                format!("{prefix}#{:>1} {label}:{marker}", index + 1),
+                label_style,
             ));
 
             if message.content.is_empty() {
@@ -3159,13 +3598,15 @@ impl App {
             .map(|message| message.content.chars().count())
             .sum::<usize>();
         Ok(format!(
-            "Status\n\nWorkspace         : {}\nMode              : {}\nApprovals         : {}\nModel             : {}\nStreaming         : {}\nMessages          : {}\nSaved files       : {}\nAPI key           : {}\nAttachments       : {}\nDraft stash       : {}\nPlan items        : {}\nMemory notes      : {}\nSkills active     : {}\nSkills installed  : {}\nMCP enabled       : {}\nMCP servers       : {}\nDiagnostics auto  : {}\nDiagnostics state : {}\nRequest chars     : {}\nShell jobs        : {}\nTasks             : {}\nTools             : {}",
+            "Status\n\nWorkspace         : {}\nMode              : {}\nApprovals         : {}\nModel             : {}\nStreaming         : {}\nMessages          : {}\nActive branch     : {}\nBranches          : {}\nSaved files       : {}\nAPI key           : {}\nAttachments       : {}\nDraft stash       : {}\nPlan items        : {}\nMemory notes      : {}\nSkills active     : {}\nSkills installed  : {}\nMCP enabled       : {}\nMCP servers       : {}\nDiagnostics auto  : {}\nDiagnostics state : {}\nRequest chars     : {}\nShell jobs        : {}\nTasks             : {}\nTools             : {}",
             self.tool_context.workspace_root.display(),
             self.mode,
             approval_mode_label(self.tool_runtime.approval_mode),
             self.config.model,
             if self.streaming { "yes" } else { "no" },
             self.messages.len(),
+            self.conversation_tree.current_branch_id(),
+            self.conversation_tree.branch_count(),
             session_count,
             self.config.masked_api_key(),
             self.attachments.len(),
@@ -3266,10 +3707,13 @@ impl App {
 
         let split_index = self.messages.len() - KEEP_RECENT_MESSAGES;
         let summary = compacted_summary(&self.messages[..split_index]);
-        let mut recent = self.messages.split_off(split_index);
-        self.messages = vec![ChatMessage::system(summary)];
-        self.messages.append(&mut recent);
+        let mut new_messages = vec![ChatMessage::system(summary)];
+        new_messages.extend(self.messages[split_index..].iter().cloned());
+        self.conversation_tree
+            .replace_current_branch_messages(new_messages);
+        self.sync_messages_from_tree();
         self.assistant_index = None;
+        self.assistant_message_id = None;
         self.scroll_to_bottom();
         self.status = "Compacted older conversation into a summary".to_string();
     }
@@ -3385,7 +3829,9 @@ impl App {
     }
 
     fn slash_menu_visible(&self) -> bool {
-        slash_menu::is_active(self.input.trim()) && !self.slash_menu_entries().is_empty()
+        !self.branch_selection.open
+            && slash_menu::is_active(self.input.trim())
+            && !self.slash_menu_entries().is_empty()
     }
 
     fn clamp_slash_menu_selection(&mut self) {
@@ -3444,6 +3890,10 @@ fn stashes_draft(key: KeyEvent) -> bool {
 
 fn opens_last_message_pager(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('l' | 'L') if key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn opens_branch_selection(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('b' | 'B') if key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
 fn toggles_mode_shortcut(key: KeyEvent) -> bool {
@@ -3948,14 +4398,19 @@ mod tests {
     #[test]
     fn clears_conversation_state() {
         let mut app = test_app();
-        app.messages.push(ChatMessage::user("hello"));
-        app.messages.push(ChatMessage::assistant("world"));
+        app.reset_conversation_from_messages(vec![
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("world"),
+        ]);
         app.assistant_index = Some(1);
+        app.assistant_message_id = Some("msg-2".to_string());
         app.scroll = 3;
 
         app.clear_conversation();
         assert!(app.messages.is_empty());
+        assert!(app.conversation_tree.is_empty());
         assert_eq!(app.assistant_index, None);
+        assert_eq!(app.assistant_message_id, None);
         assert_eq!(app.scroll, 0);
         assert_eq!(app.last_prompt, None);
     }
@@ -3966,6 +4421,227 @@ mod tests {
         let summary = app.status_summary().expect("status summary");
         assert!(summary.contains("Mode"));
         assert!(summary.contains("agent"));
+    }
+
+    #[test]
+    fn request_messages_reads_from_the_conversation_tree() {
+        let mut app = test_app();
+        app.reset_conversation_from_messages(vec![ChatMessage::user("hello")]);
+        app.messages.push(ChatMessage::assistant("stale cache"));
+
+        let request_messages = app.request_messages().expect("request messages");
+
+        assert!(
+            request_messages
+                .iter()
+                .any(|message| message.content == "hello")
+        );
+        assert!(
+            !request_messages
+                .iter()
+                .any(|message| message.content == "stale cache")
+        );
+    }
+
+    #[test]
+    fn stream_deltas_update_the_tree_backed_assistant_message() {
+        let mut app = test_app();
+        app.push_conversation_message(ChatMessage::user("hello"));
+        let assistant_message_id =
+            app.push_conversation_message(ChatMessage::assistant(String::new()));
+        app.assistant_index = Some(1);
+        app.assistant_message_id = Some(assistant_message_id.clone());
+
+        app.handle_app_event(AppEvent::Delta("hi".to_string()));
+
+        assert_eq!(app.messages[1].content, "hi");
+        assert_eq!(
+            app.conversation_tree
+                .message_mut(&assistant_message_id)
+                .expect("assistant message should exist")
+                .content
+                .as_str(),
+            "hi"
+        );
+    }
+
+    #[test]
+    fn branch_command_creates_branch_from_explicit_index() {
+        let mut app = test_app();
+        app.reset_conversation_from_messages(vec![
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi"),
+            ChatMessage::user("follow up"),
+            ChatMessage::assistant("answer"),
+        ]);
+
+        app.handle_branch_command(Some(2))
+            .expect("branch command should succeed");
+
+        assert_eq!(app.conversation_tree.branch_count(), 2);
+        assert_eq!(app.conversation_tree.current_branch_id(), "branch-2");
+        assert_eq!(app.messages.len(), 2);
+        assert!(
+            app.status
+                .contains("Created branch branch-2 from message 2")
+        );
+    }
+
+    #[test]
+    fn branch_command_defaults_to_last_user_message() {
+        let mut app = test_app();
+        app.reset_conversation_from_messages(vec![
+            ChatMessage::system("summary"),
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi"),
+            ChatMessage::user("follow up"),
+            ChatMessage::assistant("answer"),
+        ]);
+
+        app.handle_branch_command(None)
+            .expect("branch command should succeed");
+
+        assert_eq!(app.messages.len(), 4);
+        assert_eq!(
+            app.messages.last().map(|message| message.content.as_str()),
+            Some("follow up")
+        );
+        assert!(app.status.contains("message 4"));
+    }
+
+    #[test]
+    fn branch_command_rejects_invalid_index() {
+        let mut app = test_app();
+        app.reset_conversation_from_messages(vec![ChatMessage::user("hello")]);
+
+        app.handle_branch_command(Some(9))
+            .expect("invalid branch command should not error");
+
+        assert_eq!(app.conversation_tree.branch_count(), 1);
+        assert_eq!(app.status, "Message 9 is out of range");
+    }
+
+    #[test]
+    fn branch_command_rejects_system_messages() {
+        let mut app = test_app();
+        app.reset_conversation_from_messages(vec![
+            ChatMessage::system("summary"),
+            ChatMessage::user("hello"),
+        ]);
+
+        app.handle_branch_command(Some(1))
+            .expect("invalid branch command should not error");
+
+        assert_eq!(app.conversation_tree.branch_count(), 1);
+        assert_eq!(app.status, "Cannot branch from system message 1");
+    }
+
+    #[test]
+    fn branches_command_lists_current_branch_and_ids() {
+        let mut app = test_app();
+        app.reset_conversation_from_messages(vec![
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi"),
+            ChatMessage::user("follow up"),
+            ChatMessage::assistant("answer"),
+        ]);
+        app.handle_branch_command(Some(2))
+            .expect("branch command should succeed");
+
+        app.show_branches();
+
+        let output = &app
+            .messages
+            .last()
+            .expect("system message should exist")
+            .content;
+        assert!(output.contains("branch-1"));
+        assert!(output.contains("branch-2"));
+        assert!(output.contains("* branch-2"));
+    }
+
+    #[test]
+    fn switch_branch_changes_visible_messages() {
+        let mut app = test_app();
+        app.reset_conversation_from_messages(vec![
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi"),
+            ChatMessage::user("follow up"),
+            ChatMessage::assistant("answer"),
+        ]);
+        app.handle_branch_command(Some(2))
+            .expect("branch command should succeed");
+        app.push_conversation_message(ChatMessage::user("branched question"));
+        app.push_conversation_message(ChatMessage::assistant("branched answer"));
+
+        app.switch_branch("branch-1")
+            .expect("switch should succeed");
+        assert_eq!(app.messages.len(), 4);
+        assert_eq!(
+            app.messages.last().map(|message| message.content.as_str()),
+            Some("answer")
+        );
+
+        app.switch_branch("branch-2")
+            .expect("switch should succeed");
+        assert_eq!(app.messages.len(), 4);
+        assert_eq!(
+            app.messages.last().map(|message| message.content.as_str()),
+            Some("branched answer")
+        );
+    }
+
+    #[test]
+    fn switching_branches_updates_last_prompt_for_retry() {
+        let mut app = test_app();
+        app.reset_conversation_from_messages(vec![
+            ChatMessage::user("root prompt"),
+            ChatMessage::assistant("root answer"),
+            ChatMessage::user("original prompt"),
+            ChatMessage::assistant("original answer"),
+        ]);
+        app.handle_branch_command(Some(1))
+            .expect("branch command should succeed");
+        app.push_conversation_message(ChatMessage::user("branch prompt"));
+        app.push_conversation_message(ChatMessage::assistant("branch answer"));
+
+        app.switch_branch("branch-1")
+            .expect("switch should succeed");
+        assert_eq!(app.last_prompt.as_deref(), Some("original prompt"));
+
+        app.switch_branch("branch-2")
+            .expect("switch should succeed");
+        assert_eq!(app.last_prompt.as_deref(), Some("branch prompt"));
+    }
+
+    #[test]
+    fn compact_only_changes_the_active_branch() {
+        let mut app = test_app();
+        app.reset_conversation_from_messages(vec![
+            ChatMessage::user("one"),
+            ChatMessage::assistant("two"),
+            ChatMessage::user("three"),
+            ChatMessage::assistant("four"),
+            ChatMessage::user("five"),
+            ChatMessage::assistant("six"),
+            ChatMessage::user("seven"),
+            ChatMessage::assistant("eight"),
+        ]);
+        app.handle_branch_command(Some(6))
+            .expect("branch command should succeed");
+        app.push_conversation_message(ChatMessage::user("branched prompt"));
+        app.push_conversation_message(ChatMessage::assistant("branched answer"));
+
+        app.compact_conversation();
+        assert!(matches!(
+            app.messages.first().map(|message| &message.role),
+            Some(&Role::System)
+        ));
+
+        app.switch_branch("branch-1")
+            .expect("switch should succeed");
+        assert_eq!(app.messages.len(), 8);
+        assert_eq!(app.messages[0].content, "one");
     }
 
     #[test]
@@ -4074,18 +4750,104 @@ mod tests {
     }
 
     #[test]
+    fn opens_branch_selection_recognizes_ctrl_b_only() {
+        assert!(!opens_branch_selection(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::NONE
+        )));
+        assert!(opens_branch_selection(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL
+        )));
+    }
+
+    #[test]
+    fn ctrl_b_opens_branch_selection_when_messages_exist() {
+        let mut app = test_app();
+        let (event_tx, _event_rx) = unbounded_channel();
+        app.reset_conversation_from_messages(vec![
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("world"),
+        ]);
+
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+            event_tx,
+        )
+        .expect("ctrl+b should open branch selection");
+
+        assert!(app.branch_selection.open);
+        assert_eq!(app.branch_selection.selected, 0);
+    }
+
+    #[test]
+    fn branch_selection_escape_closes_without_creating_branch() {
+        let mut app = test_app();
+        let (event_tx, _event_rx) = unbounded_channel();
+        app.reset_conversation_from_messages(vec![
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("world"),
+        ]);
+        app.open_branch_selection();
+
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            event_tx,
+        )
+        .expect("escape should be handled");
+
+        assert!(!app.branch_selection.open);
+        assert_eq!(app.conversation_tree.branch_count(), 1);
+    }
+
+    #[test]
+    fn branch_selection_enter_creates_branch() {
+        let mut app = test_app();
+        let (event_tx, _event_rx) = unbounded_channel();
+        app.reset_conversation_from_messages(vec![
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi"),
+            ChatMessage::user("follow up"),
+            ChatMessage::assistant("answer"),
+        ]);
+        app.open_branch_selection();
+
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            event_tx,
+        )
+        .expect("enter should create a branch");
+
+        assert!(!app.branch_selection.open);
+        assert_eq!(app.conversation_tree.branch_count(), 2);
+        assert_eq!(app.conversation_tree.current_branch_id(), "branch-2");
+        assert_eq!(app.messages.len(), 3);
+    }
+
+    #[test]
     fn escape_cancels_active_stream() {
         let mut app = test_app();
         app.streaming = true;
-        app.messages.push(ChatMessage::assistant(String::new()));
+        let assistant_message_id =
+            app.push_conversation_message(ChatMessage::assistant(String::new()));
         app.assistant_index = Some(0);
+        app.assistant_message_id = Some(assistant_message_id.clone());
 
         app.handle_escape_key();
 
         assert!(!app.streaming);
         assert_eq!(app.assistant_index, None);
+        assert_eq!(app.assistant_message_id, None);
         assert_eq!(app.status, "Generation cancelled");
         assert_eq!(app.messages[0].content, "Request cancelled.");
+        assert_eq!(
+            app.conversation_tree
+                .message_mut(&assistant_message_id)
+                .expect("assistant message should exist")
+                .content
+                .as_str(),
+            "Request cancelled."
+        );
     }
 
     #[test]
@@ -4113,12 +4875,31 @@ mod tests {
     #[test]
     fn workspace_panels_return_once_messages_exist() {
         let mut app = test_app();
-        app.messages.push(ChatMessage::user("hello"));
-        app.messages.push(ChatMessage::assistant("world"));
+        app.reset_conversation_from_messages(vec![
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("world"),
+        ]);
 
         let screen = render_screen(&mut app);
         assert!(screen.contains("Conversation"));
         assert!(screen.contains("Plan"));
+    }
+
+    #[test]
+    fn render_shows_branch_title_and_marker() {
+        let mut app = test_app();
+        app.reset_conversation_from_messages(vec![
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi"),
+            ChatMessage::user("follow up"),
+            ChatMessage::assistant("answer"),
+        ]);
+        app.handle_branch_command(Some(2))
+            .expect("branch command should succeed");
+
+        let screen = render_screen(&mut app);
+        assert!(screen.contains("Conversation — branch-2"));
+        assert!(screen.contains("◇"));
     }
 
     #[test]
@@ -4133,8 +4914,10 @@ mod tests {
     #[test]
     fn plan_panel_remains_visible_outside_plan_mode() {
         let mut app = test_app();
-        app.messages.push(ChatMessage::user("hello"));
-        app.messages.push(ChatMessage::assistant("world"));
+        app.reset_conversation_from_messages(vec![
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("world"),
+        ]);
 
         let screen = render_screen(&mut app);
         assert!(screen.contains("Conversation"));
@@ -4149,14 +4932,81 @@ mod tests {
     #[test]
     fn clearing_conversation_returns_to_landing_screen() {
         let mut app = test_app();
-        app.messages.push(ChatMessage::user("hello"));
-        app.messages.push(ChatMessage::assistant("world"));
+        app.reset_conversation_from_messages(vec![
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("world"),
+        ]);
 
         app.clear_conversation();
 
         let screen = render_screen(&mut app);
         assert!(screen.contains("Ask anything...  \"Fix a TODO in the codebase\""));
         assert!(screen.contains("Conversation cleared"));
+    }
+
+    #[test]
+    fn apply_loaded_session_restores_saved_branch_tree() {
+        let mut app = test_app();
+        let mut tree = ConversationTree::from_flat_messages(vec![
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi"),
+            ChatMessage::user("follow up"),
+            ChatMessage::assistant("answer"),
+        ]);
+        tree.create_branch_from_message("msg-2")
+            .expect("branch should be created");
+        tree.add_message_to_current(ChatMessage::user("branched prompt"));
+        tree.add_message_to_current(ChatMessage::assistant("branched answer"));
+
+        app.apply_loaded_session(
+            session_store::SavedSession {
+                saved_at_epoch: 1,
+                title: "hello".to_string(),
+                model: "mimo-v2-flash".to_string(),
+                mode: AppMode::Agent,
+                active_skills: Vec::new(),
+                lsp_auto_run: false,
+                plan_items: Vec::new(),
+                attachments: Vec::new(),
+                messages: tree.current_messages(),
+                conversation_tree: Some(tree),
+            },
+            "test.json".to_string(),
+        );
+
+        assert_eq!(app.conversation_tree.branch_count(), 2);
+        assert_eq!(app.conversation_tree.current_branch_id(), "branch-2");
+        assert_eq!(
+            app.messages.last().map(|message| message.content.as_str()),
+            Some("branched answer")
+        );
+    }
+
+    #[test]
+    fn apply_loaded_session_migrates_legacy_flat_messages() {
+        let mut app = test_app();
+        app.apply_loaded_session(
+            session_store::SavedSession {
+                saved_at_epoch: 1,
+                title: "legacy".to_string(),
+                model: "mimo-v2-flash".to_string(),
+                mode: AppMode::Agent,
+                active_skills: Vec::new(),
+                lsp_auto_run: false,
+                plan_items: Vec::new(),
+                attachments: Vec::new(),
+                messages: vec![
+                    ChatMessage::user("legacy"),
+                    ChatMessage::assistant("session"),
+                ],
+                conversation_tree: None,
+            },
+            "legacy.json".to_string(),
+        );
+
+        assert_eq!(app.conversation_tree.branch_count(), 1);
+        assert_eq!(app.messages.len(), 2);
+        assert_eq!(app.conversation_tree.current_branch_id(), "branch-1");
     }
 
     #[test]

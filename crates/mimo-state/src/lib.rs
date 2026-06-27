@@ -2,6 +2,7 @@ use std::{fs, io::Write, path::Path};
 
 use anyhow::{Context, Result};
 
+pub mod branch;
 pub mod diagnostics_store;
 pub mod mcp_store;
 pub mod memory_store;

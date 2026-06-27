@@ -13,6 +13,7 @@ MiMo-TUI turns your terminal into a capable AI coding workspace. Type a prompt, 
 - 🖥️ **Full-screen TUI** with an OpenCode-style landing prompt, streaming responses, multiline editor, and slash-command palette
 - 🔧 **Agentic tool loop** — file read/write, shell execution, git, search, and diagnostics
 - 💾 **Session persistence** — save, restore, and export conversations as Markdown
+- 🌿 **Conversation branching** — fork from earlier messages, switch paths, and save branches with sessions
 - 🗂️ **Plan mode** — keep a live checklist alongside your conversation
 - 🧠 **Memory** — persist notes across sessions with `/note` and `/recall`
 - 🤖 **Auto model routing** — short prompts on `mimo-v2-flash`, heavy tasks on `mimo-v2.5-pro`
@@ -110,6 +111,7 @@ For one-shot CLI use, `cargo run -- ask "..."` only auto-approves read-only tool
 | `Ctrl+K` | Command palette |
 | `Ctrl+R` | Session picker |
 | `Ctrl+L` | Open the latest-message pager |
+| `Ctrl+B` | Select a message and create a conversation branch |
 | `Ctrl+S` | Stash the current draft |
 | `Alt+R` | Browse draft history / cleared drafts |
 | `Tab` | Slash-command completion |
@@ -117,6 +119,7 @@ For one-shot CLI use, `cargo run -- ask "..."` only auto-approves read-only tool
 | `Esc` | Cancel generation / close overlay |
 | `y / n / a / r / p` | Approve, deny, or change approval mode in a tool prompt |
 | `/clear` `/save` `/load` | Manage conversation |
+| `/branch` `/branches` `/switch` | Create, list, and change conversation branches |
 | `/mode [agent\|plan\|yolo]` | Switch execution mode |
 | `/model [id\|auto]` | Change or auto-route model |
 | `/plan` `/note` `/recall` | Checklist, memory, search |
@@ -125,3 +128,15 @@ For one-shot CLI use, `cargo run -- ask "..."` only auto-approves read-only tool
 | `/skills` `/skill` `/mcp` | Skills and MCP management |
 
 Type `/help` inside the TUI for the full command reference.
+
+---
+
+## Conversation branching
+
+Use branching to fork the visible transcript from an earlier message without losing the original path.
+
+- Press `Ctrl+B`, move to a message, press `Enter`, then type a new prompt.
+- Run `/branch 3` to branch from visible message `#3`.
+- Run `/branches` to list saved paths and `/switch branch-1` to jump back.
+
+Branches are saved in session files and restored by `/load`.

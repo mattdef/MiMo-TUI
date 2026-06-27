@@ -202,10 +202,11 @@ fn list_sessions(config: &AppConfig) -> Result<()> {
 
     for session in sessions {
         println!(
-            "{} | {} | {} | {}",
+            "{} | {} | {} | {} branches | {}",
             session.title,
             session.model,
             session.mode,
+            session.branch_count,
             session.path.display()
         );
     }

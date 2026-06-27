@@ -24,6 +24,9 @@ pub enum SlashCommand {
     Status,
     Retry,
     Context,
+    Branch { message_index: Option<usize> },
+    Branches,
+    Switch { branch_id: String },
     Mode { mode: Option<ModeName> },
     Plan(PlanCommand),
     Jobs(JobsCommand),
@@ -226,6 +229,24 @@ pub const COMMANDS: &[CommandInfo] = &[
         description: "Summarize the current project directory in read-only form.",
     },
     CommandInfo {
+        name: "branch",
+        aliases: &["b"],
+        usage: "/branch [message-number]",
+        description: "Create a new conversation branch from a visible message.",
+    },
+    CommandInfo {
+        name: "branches",
+        aliases: &[],
+        usage: "/branches",
+        description: "List conversation branches.",
+    },
+    CommandInfo {
+        name: "switch",
+        aliases: &[],
+        usage: "/switch <branch-id>",
+        description: "Switch to a conversation branch.",
+    },
+    CommandInfo {
         name: "mode",
         aliases: &[],
         usage: "/mode [agent|plan|yolo]",
@@ -352,6 +373,9 @@ pub fn parse_slash_command(input: &str) -> Result<SlashCommand, CommandParseErro
         "status" => require_no_args(args, SlashCommand::Status, "/status"),
         "retry" => require_no_args(args, SlashCommand::Retry, "/retry"),
         "context" => require_no_args(args, SlashCommand::Context, "/context"),
+        "branch" | "b" => parse_branch_command(args),
+        "branches" => require_no_args(args, SlashCommand::Branches, "/branches"),
+        "switch" => parse_switch_command(args),
         "mode" => parse_mode_command(args),
         "plan" => parse_plan_command(args),
         "jobs" | "job" => parse_jobs_command(args),
@@ -488,6 +512,37 @@ fn parse_mode_command(args: &str) -> Result<SlashCommand, CommandParseError> {
         _ => return Err(CommandParseError::Usage("/mode [agent|plan|yolo]")),
     };
     Ok(SlashCommand::Mode { mode: Some(mode) })
+}
+
+fn parse_branch_command(args: &str) -> Result<SlashCommand, CommandParseError> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return Ok(SlashCommand::Branch {
+            message_index: None,
+        });
+    }
+
+    if trimmed.split_whitespace().count() != 1 {
+        return Err(CommandParseError::Usage("/branch [message-number]"));
+    }
+
+    let message_index = trimmed
+        .parse::<usize>()
+        .map_err(|_| CommandParseError::Usage("/branch [message-number]"))?;
+    Ok(SlashCommand::Branch {
+        message_index: Some(message_index),
+    })
+}
+
+fn parse_switch_command(args: &str) -> Result<SlashCommand, CommandParseError> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() || trimmed.split_whitespace().count() != 1 {
+        return Err(CommandParseError::Usage("/switch <branch-id>"));
+    }
+
+    Ok(SlashCommand::Switch {
+        branch_id: trimmed.to_string(),
+    })
 }
 
 fn parse_plan_command(args: &str) -> Result<SlashCommand, CommandParseError> {
@@ -804,6 +859,31 @@ mod tests {
             Ok(SlashCommand::Memory(MemoryCommand::Path))
         );
         assert_eq!(
+            parse_slash_command("/branch"),
+            Ok(SlashCommand::Branch {
+                message_index: None
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/branch 2"),
+            Ok(SlashCommand::Branch {
+                message_index: Some(2)
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/b 2"),
+            Ok(SlashCommand::Branch {
+                message_index: Some(2)
+            })
+        );
+        assert_eq!(parse_slash_command("/branches"), Ok(SlashCommand::Branches));
+        assert_eq!(
+            parse_slash_command("/switch branch-2"),
+            Ok(SlashCommand::Switch {
+                branch_id: "branch-2".to_string()
+            })
+        );
+        assert_eq!(
             parse_slash_command("/jobs stdin shell-1 y{enter}"),
             Ok(SlashCommand::Jobs(JobsCommand::Stdin {
                 id: "shell-1".to_string(),
@@ -878,6 +958,22 @@ mod tests {
         assert_eq!(
             parse_slash_command("/mode fast"),
             Err(CommandParseError::Usage("/mode [agent|plan|yolo]"))
+        );
+        assert_eq!(
+            parse_slash_command("/branch nope"),
+            Err(CommandParseError::Usage("/branch [message-number]"))
+        );
+        assert_eq!(
+            parse_slash_command("/branch 1 extra"),
+            Err(CommandParseError::Usage("/branch [message-number]"))
+        );
+        assert_eq!(
+            parse_slash_command("/switch"),
+            Err(CommandParseError::Usage("/switch <branch-id>"))
+        );
+        assert_eq!(
+            parse_slash_command("/switch branch-1 extra"),
+            Err(CommandParseError::Usage("/switch <branch-id>"))
         );
     }
 }
