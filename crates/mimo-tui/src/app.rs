@@ -77,6 +77,7 @@ pub enum AppEvent {
 }
 
 const XIAOMI_ORANGE: Color = Color::Rgb(255, 106, 0);
+const SLASH_MENU_PAGE_STEP: i32 = 5;
 
 fn app_mode_for(mode: ModeName) -> AppMode {
     match mode {
@@ -234,6 +235,7 @@ pub struct App {
     tool_runtime: ToolRuntime,
     approval_mode_shared: Arc<Mutex<ApprovalMode>>,
     slash_menu_selected: usize,
+    slash_menu_scroll: u16,
     event_tx: Option<UnboundedSender<AppEvent>>,
     mcp_servers_cache: Vec<mcp_store::McpServerConfig>,
     tasks: Vec<task_store::SavedTask>,
@@ -305,6 +307,7 @@ impl App {
             },
             approval_mode_shared,
             slash_menu_selected: 0,
+            slash_menu_scroll: 0,
             event_tx: None,
             mcp_servers_cache,
             tasks,
@@ -502,6 +505,10 @@ impl App {
                     return Ok(false);
                 }
 
+                if self.handle_slash_menu_key(key) {
+                    return Ok(false);
+                }
+
                 if opens_help(key, self.input.is_empty()) {
                     self.open_help(None);
                     return Ok(false);
@@ -569,10 +576,12 @@ impl App {
                     }
                     KeyCode::Backspace => {
                         self.input.backspace();
+                        self.clamp_slash_menu_selection();
                         refresh_attachment_picker = true;
                     }
                     KeyCode::Delete => {
                         self.input.delete();
+                        self.clamp_slash_menu_selection();
                         refresh_attachment_picker = true;
                     }
                     KeyCode::Left => {
@@ -1558,15 +1567,21 @@ impl App {
 
     fn render_slash_menu_overlay(&mut self, frame: &mut Frame, area: Rect) {
         let popup = centered_rect(area, 72, 34);
+        let block = Block::default()
+            .title("Slash menu")
+            .borders(Borders::ALL)
+            .border_style(panel_border_style());
+        let inner = block.inner(popup);
         frame.render_widget(Clear, popup);
-        frame.render_widget(
-            Block::default()
-                .title("Commands")
-                .borders(Borders::ALL)
-                .border_style(panel_border_style()),
-            popup,
-        );
+        frame.render_widget(block, popup);
         let entries = self.slash_menu_entries();
+        let last = entries.len().saturating_sub(1);
+        self.slash_menu_selected = self.slash_menu_selected.min(last);
+        self.slash_menu_scroll = adjust_selection_scroll(
+            self.slash_menu_selected,
+            self.slash_menu_scroll,
+            inner.height.max(1) as usize,
+        );
         let lines = entries
             .iter()
             .enumerate()
@@ -1592,16 +1607,10 @@ impl App {
                 )
             })
             .collect::<Vec<_>>();
+        // Keep each command on one row so the selection scroll stays aligned.
         frame.render_widget(
-            Paragraph::new(Text::from(lines))
-                .block(
-                    Block::default()
-                        .title("Slash menu")
-                        .borders(Borders::ALL)
-                        .border_style(panel_border_style()),
-                )
-                .wrap(Wrap { trim: false }),
-            popup,
+            Paragraph::new(Text::from(lines)).scroll((self.slash_menu_scroll, 0)),
+            inner,
         );
     }
 
@@ -2130,21 +2139,78 @@ impl App {
         }
     }
 
+    fn move_slash_menu_selection(&mut self, delta: i32) {
+        let entries_len = self.slash_menu_entries().len();
+        if entries_len == 0 || delta == 0 {
+            return;
+        }
+
+        let last_index = entries_len.saturating_sub(1) as i32;
+        let current_index = self.slash_menu_selected.min(entries_len.saturating_sub(1)) as i32;
+        let next_index = (current_index + delta).clamp(0, last_index) as usize;
+        self.slash_menu_selected = next_index;
+    }
+
+    fn reset_slash_menu_navigation(&mut self) {
+        self.slash_menu_selected = 0;
+        self.slash_menu_scroll = 0;
+    }
+
+    fn handle_slash_menu_key(&mut self, key: KeyEvent) -> bool {
+        if matches!(
+            key.code,
+            KeyCode::Home | KeyCode::End | KeyCode::PageUp | KeyCode::PageDown
+        ) && !key.modifiers.is_empty()
+        {
+            return false;
+        }
+
+        match key.code {
+            KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Home
+            | KeyCode::End
+            | KeyCode::PageUp
+            | KeyCode::PageDown => {}
+            _ => return false,
+        }
+
+        if !self.slash_menu_visible() {
+            return false;
+        }
+
+        match key.code {
+            KeyCode::Up => self.move_slash_menu_selection(-1),
+            KeyCode::Down => self.move_slash_menu_selection(1),
+            KeyCode::Home => self.slash_menu_selected = 0,
+            KeyCode::End => {
+                self.slash_menu_selected = self.slash_menu_entries().len().saturating_sub(1)
+            }
+            KeyCode::PageUp => self.move_slash_menu_selection(-SLASH_MENU_PAGE_STEP),
+            KeyCode::PageDown => self.move_slash_menu_selection(SLASH_MENU_PAGE_STEP),
+            _ => unreachable!(),
+        }
+
+        true
+    }
+
     fn handle_tab_key(&mut self) -> Result<bool> {
         if self.slash_menu_visible() {
             let entries = self.slash_menu_entries();
+            let last = entries.len().saturating_sub(1);
+            self.slash_menu_selected = self.slash_menu_selected.min(last);
             if let Some(entry) = entries.get(self.slash_menu_selected) {
                 self.input.set_text(entry.insertion_text());
                 self.clear_attachment_picker();
                 self.status = format!("Command selected: /{}", entry.command.name);
-                self.slash_menu_selected = 0;
+                self.reset_slash_menu_navigation();
                 return Ok(true);
             }
             if let Some(completed) = slash_menu::autocomplete_input(self.input.trim()) {
                 self.input.set_text(completed.clone());
                 self.clear_attachment_picker();
                 self.status = format!("Command completed: {}", completed.trim_end());
-                self.slash_menu_selected = 0;
+                self.reset_slash_menu_navigation();
                 return Ok(true);
             }
         }
@@ -2332,6 +2398,7 @@ impl App {
         self.event_tx = Some(event_tx.clone());
         self.input.clear();
         self.clear_attachment_picker();
+        self.reset_slash_menu_navigation();
         match commands::parse_slash_command(command_line) {
             Ok(command) => self.execute_command(command, event_tx),
             Err(CommandParseError::NotACommand) => Ok(false),
@@ -3272,6 +3339,7 @@ impl App {
         }
         self.input.clear();
         self.clear_attachment_picker();
+        self.reset_slash_menu_navigation();
         self.status = "Draft cleared".to_string();
     }
 
@@ -3284,6 +3352,7 @@ impl App {
         remember_draft(&mut self.draft_stash, &draft);
         self.input.clear();
         self.clear_attachment_picker();
+        self.reset_slash_menu_navigation();
         self.status = "Draft stashed".to_string();
     }
 
@@ -4229,6 +4298,7 @@ impl App {
     fn clamp_slash_menu_selection(&mut self) {
         let last = self.slash_menu_entries().len().saturating_sub(1);
         self.slash_menu_selected = self.slash_menu_selected.min(last);
+        self.slash_menu_scroll = 0;
     }
 }
 
@@ -4736,6 +4806,8 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
     use tempfile::tempdir;
     use tokio::sync::mpsc::unbounded_channel;
+
+    use mimo_tui_core::commands::COMMANDS;
 
     use super::*;
 
@@ -5263,6 +5335,8 @@ mod tests {
     fn ctrl_u_clears_the_draft_and_attachment_picker() {
         let mut app = test_app();
         app.input.insert_str("hello");
+        app.slash_menu_selected = 4;
+        app.slash_menu_scroll = 8;
         app.attachment_picker = attachments::AttachmentPickerState {
             query: Some(attachments::AttachmentQuery {
                 token_start: 0,
@@ -5287,6 +5361,8 @@ mod tests {
 
         assert!(app.input.is_empty());
         assert!(!app.attachment_picker.is_visible());
+        assert_eq!(app.slash_menu_selected, 0);
+        assert_eq!(app.slash_menu_scroll, 0);
         assert_eq!(app.status, "Draft cleared");
     }
 
@@ -5294,6 +5370,8 @@ mod tests {
     fn ctrl_s_stashes_the_draft_and_attachment_picker() {
         let mut app = test_app();
         app.input.insert_str("hello");
+        app.slash_menu_selected = 4;
+        app.slash_menu_scroll = 8;
         app.attachment_picker = attachments::AttachmentPickerState {
             query: Some(attachments::AttachmentQuery {
                 token_start: 0,
@@ -5318,6 +5396,8 @@ mod tests {
 
         assert!(app.input.is_empty());
         assert!(!app.attachment_picker.is_visible());
+        assert_eq!(app.slash_menu_selected, 0);
+        assert_eq!(app.slash_menu_scroll, 0);
         assert_eq!(app.draft_stash, vec!["hello".to_string()]);
         assert_eq!(app.status, "Draft stashed");
     }
@@ -6076,5 +6156,175 @@ mod tests {
         assert!(screen.contains("Preview"));
         assert!(screen.contains("notes.txt"));
         assert!(screen.contains("Tab/Enter attach"));
+    }
+
+    #[test]
+    fn slash_menu_overlay_scrolls_to_show_late_entries() {
+        let mut app = test_app();
+        app.input.set_text("/");
+        let last_entry = slash_menu::visible_entries("/")
+            .last()
+            .expect("slash menu should have a last entry")
+            .clone();
+        app.slash_menu_selected = COMMANDS.len().saturating_sub(1);
+
+        let screen = render_screen(&mut app);
+
+        assert!(app.slash_menu_scroll > 0);
+        assert!(screen.contains(&format!("/{}", last_entry.command.name)));
+    }
+
+    #[test]
+    fn slash_menu_navigation_home_end_and_page_steps_do_not_scroll_conversation() {
+        let mut app = test_app();
+        app.input.set_text("/");
+        app.scroll = 7;
+        let (event_tx, _event_rx) = unbounded_channel();
+
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+            event_tx.clone(),
+        )
+        .expect("page down should move the slash menu selection");
+        assert_eq!(app.scroll, 7);
+        assert!(app.slash_menu_selected > 0);
+
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+            event_tx.clone(),
+        )
+        .expect("page up should move the slash menu selection");
+        assert_eq!(app.scroll, 7);
+        assert_eq!(app.slash_menu_selected, 0);
+
+        for _ in 0..(COMMANDS.len() + 2) {
+            app.handle_terminal_event(
+                Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+                event_tx.clone(),
+            )
+            .expect("down should keep moving within the slash menu");
+        }
+        assert_eq!(app.scroll, 7);
+        assert_eq!(app.slash_menu_selected, COMMANDS.len().saturating_sub(1));
+
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            event_tx.clone(),
+        )
+        .expect("up should move within the slash menu");
+        assert_eq!(app.scroll, 7);
+        assert_eq!(app.slash_menu_selected, COMMANDS.len().saturating_sub(2));
+
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
+            event_tx.clone(),
+        )
+        .expect("end should jump to the last slash command");
+        assert_eq!(app.slash_menu_selected, COMMANDS.len().saturating_sub(1));
+
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+            event_tx,
+        )
+        .expect("home should jump to the first slash command");
+        assert_eq!(app.slash_menu_selected, 0);
+    }
+
+    #[test]
+    fn slash_menu_tab_inserts_selected_entry_and_resets_navigation() {
+        let mut app = test_app();
+        app.input.set_text("/");
+        let expected_input = slash_menu::visible_entries("/")
+            .last()
+            .expect("slash menu should have a last entry")
+            .clone()
+            .insertion_text();
+        app.slash_menu_selected = COMMANDS.len().saturating_sub(1);
+        app.slash_menu_scroll = 12;
+        let (event_tx, _event_rx) = unbounded_channel();
+
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            event_tx,
+        )
+        .expect("tab should select the slash menu entry");
+
+        assert_eq!(app.input.as_str(), expected_input);
+        assert_eq!(app.slash_menu_selected, 0);
+        assert_eq!(app.slash_menu_scroll, 0);
+    }
+
+    #[test]
+    fn slash_menu_selection_clamps_and_resets_scroll_when_filter_changes() {
+        let mut app = test_app();
+        app.input.set_text("/mc");
+        app.slash_menu_selected = COMMANDS.len();
+        app.slash_menu_scroll = 12;
+        let (event_tx, _event_rx) = unbounded_channel();
+
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            event_tx,
+        )
+        .expect("backspace should update the slash menu selection");
+
+        let entries = app.slash_menu_entries();
+        assert!(!entries.is_empty());
+        assert_eq!(app.slash_menu_selected, entries.len().saturating_sub(1));
+        assert_eq!(app.slash_menu_scroll, 0);
+    }
+
+    #[test]
+    fn slash_menu_ctrl_home_and_end_scroll_the_conversation() {
+        let mut app = test_app();
+        app.reset_conversation_from_messages(vec![
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("world"),
+        ]);
+        app.conversation_view_height = 3;
+        app.input.set_text("/");
+        assert!(app.slash_menu_entries().len() > 1);
+        app.slash_menu_selected = 1;
+        app.slash_menu_scroll = 9;
+        app.scroll = 7;
+        let expected_bottom = app.max_scroll();
+        assert!(expected_bottom > 0);
+        let (event_tx, _event_rx) = unbounded_channel();
+
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL)),
+            event_tx.clone(),
+        )
+        .expect("ctrl+home should scroll the conversation to the top");
+
+        assert_eq!(app.scroll, 0);
+        assert_eq!(app.slash_menu_selected, 1);
+
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::CONTROL)),
+            event_tx.clone(),
+        )
+        .expect("ctrl+pagedown should scroll the conversation");
+
+        assert!(app.scroll > 0);
+        assert_eq!(app.slash_menu_selected, 1);
+
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::CONTROL)),
+            event_tx.clone(),
+        )
+        .expect("ctrl+pageup should scroll the conversation");
+
+        assert_eq!(app.scroll, 0);
+        assert_eq!(app.slash_menu_selected, 1);
+
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL)),
+            event_tx,
+        )
+        .expect("ctrl+end should scroll the conversation to the bottom");
+
+        assert_eq!(app.scroll, expected_bottom);
+        assert_eq!(app.slash_menu_selected, 1);
     }
 }
