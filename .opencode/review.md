@@ -1,30 +1,35 @@
 # Code Review Summary
 
-**Scope**: vérification des corrections des deux findings P2 dans `crates/mimo-tui/src/app.rs`
+**Scope**: Remove runtime yolo mode and make tool permissions config-only
 **Overall risk**: Low
-**Verdict**: Approve
+**Verdict**: Approve with comments
 
-Les deux findings P2 précédents sont bien corrigés.
+No remaining in-code `yolo` references were found in the reviewed scope.
 
 ## Findings
 
 ### [P0] Blocking
 
-- None.
+None.
 
 ### [P1] High
 
-- None.
+None.
 
 ### [P2] Medium
 
-- None. Vérifié que `handle_slash_menu_key()` laisse désormais passer les variantes modifiées de `Home`/`End`/`PageUp`/`PageDown` (`crates/mimo-tui/src/app.rs:2159-2166`), ce qui permet à `Ctrl+Home` / `Ctrl+End` de retomber sur les handlers de scroll de conversation (`crates/mimo-tui/src/app.rs:595-610`). Vérifié aussi que les changements de filtre réinitialisent `slash_menu_scroll` via `clamp_slash_menu_selection()` (`crates/mimo-tui/src/app.rs:577-585`, `crates/mimo-tui/src/app.rs:640-653`, `crates/mimo-tui/src/app.rs:4298-4302`), avec des tests de régression dédiés (`crates/mimo-tui/src/app.rs:6258-6328`).
+None.
 
 ### [P3] Low
 
-- None.
+- **`AppConfig::load` still accepts a non-file permission override**
+  - **Location**: `crates/mimo-config/src/lib.rs:24-30,148-155`
+  - **Why it matters**: The binaries no longer expose a permissions flag, but the configuration layer still allows callers to override the permission policy programmatically. That means the "permissions are configured only in config.toml" guarantee is not actually enforced at the API boundary.
+  - **Evidence**: `ConfigOverrides` still exposes `pub permissions: Option<PermissionPolicy>`, and `AppConfig::load` prefers `(ConfigValueSource::Cli, overrides.permissions)` over `file_config.permissions`. Any caller can pass `ConfigOverrides { permissions: Some(PermissionPolicy::Auto), ..Default::default() }` and bypass the file value entirely.
+  - **Fix**: Remove `permissions` from `ConfigOverrides` and drop the CLI override branch from `AppConfig::load`, then add a regression test that permissions only resolve from `config.toml` or the built-in default.
 
 ## Suggested Next Steps
 
-- [x] Confirmer les deux corrections P2 dans la review
-- [ ] Re-run relevant validation after fixes
+- [x] No P0/P1 findings blocking merge
+- [ ] Tighten the config API so permissions can only come from `config.toml` or the built-in default
+- [ ] Add a regression test for permission-source resolution after the API change

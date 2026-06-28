@@ -129,12 +129,14 @@ mod tests {
             base_url: "https://example.test/v1".to_string(),
             model: "mimo-v2-flash".to_string(),
             temperature: 0.2,
+            permissions: mimo_config::PermissionPolicy::Prompt,
             system_prompt: "test".to_string(),
             config_path: dir.path().join("config.toml"),
             api_key_source: ConfigValueSource::Default,
             base_url_source: ConfigValueSource::Default,
             model_source: ConfigValueSource::Default,
             temperature_source: ConfigValueSource::Default,
+            permissions_source: ConfigValueSource::Default,
             system_prompt_source: ConfigValueSource::Default,
         }
     }
@@ -174,7 +176,7 @@ mod tests {
             prompt: "Background run".to_string(),
             model: "mimo-v2-flash".to_string(),
             routed_model: None,
-            mode: crate::AppMode::Yolo,
+            mode: crate::AppMode::Agent,
             status: TaskStatus::Running,
             created_at_epoch: now_epoch(),
             updated_at_epoch: now_epoch(),

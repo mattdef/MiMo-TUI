@@ -6,7 +6,6 @@ use super::keybindings::KEYBINDINGS;
 pub enum ModeName {
     Agent,
     Plan,
-    Yolo,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -249,7 +248,7 @@ pub const COMMANDS: &[CommandInfo] = &[
     CommandInfo {
         name: "mode",
         aliases: &[],
-        usage: "/mode [agent|plan|yolo]",
+        usage: "/mode [agent|plan]",
         description: "Show or switch the current MiMo interaction mode.",
     },
     CommandInfo {
@@ -507,9 +506,8 @@ fn parse_mode_command(args: &str) -> Result<SlashCommand, CommandParseError> {
     let mode = match value.to_ascii_lowercase().as_str() {
         "plan" => ModeName::Plan,
         "agent" | "chat" | "2" => ModeName::Agent,
-        "yolo" | "3" => ModeName::Yolo,
         "1" => ModeName::Plan,
-        _ => return Err(CommandParseError::Usage("/mode [agent|plan|yolo]")),
+        _ => return Err(CommandParseError::Usage("/mode [agent|plan]")),
     };
     Ok(SlashCommand::Mode { mode: Some(mode) })
 }
@@ -837,12 +835,6 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_slash_command("/mode yolo"),
-            Ok(SlashCommand::Mode {
-                mode: Some(ModeName::Yolo)
-            })
-        );
-        assert_eq!(
             parse_slash_command("/config model mimo-v2-flash"),
             Ok(SlashCommand::Config(ConfigCommand::SetModel(
                 "mimo-v2-flash".to_string()
@@ -957,7 +949,11 @@ mod tests {
         );
         assert_eq!(
             parse_slash_command("/mode fast"),
-            Err(CommandParseError::Usage("/mode [agent|plan|yolo]"))
+            Err(CommandParseError::Usage("/mode [agent|plan]"))
+        );
+        assert_eq!(
+            parse_slash_command("/mode 3"),
+            Err(CommandParseError::Usage("/mode [agent|plan]"))
         );
         assert_eq!(
             parse_slash_command("/branch nope"),

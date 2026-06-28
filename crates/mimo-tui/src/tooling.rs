@@ -1,14 +1,7 @@
+use mimo_config::{ConfigValueSource, PermissionPolicy};
 use tokio::sync::oneshot;
 
 use mimo_tools::ToolKind;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ApprovalMode {
-    #[default]
-    Prompt,
-    ReadOnly,
-    Auto,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolStatus {
@@ -57,12 +50,25 @@ impl PendingApproval {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ToolRuntime {
-    pub approval_mode: ApprovalMode,
+    pub permissions: PermissionPolicy,
+    pub permissions_source: ConfigValueSource,
     pub active: Option<ToolRequest>,
     pub pending_approval: Option<PendingApproval>,
     pub history: Vec<ToolRequest>,
+}
+
+impl Default for ToolRuntime {
+    fn default() -> Self {
+        Self {
+            permissions: PermissionPolicy::default(),
+            permissions_source: ConfigValueSource::Default,
+            active: None,
+            pending_approval: None,
+            history: Vec::new(),
+        }
+    }
 }
 
 impl ToolRuntime {
@@ -70,8 +76,8 @@ impl ToolRuntime {
         let active = usize::from(self.active.is_some());
         let pending = usize::from(self.pending_approval.is_some());
         format!(
-            "{active} running, {pending} pending, approvals {:?}",
-            self.approval_mode
+            "{active} running, {pending} pending, permissions {} ({})",
+            self.permissions, self.permissions_source
         )
     }
 

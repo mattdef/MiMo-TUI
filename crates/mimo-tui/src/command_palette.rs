@@ -88,7 +88,7 @@ pub fn filtered_entries(
             hint: if mode == AppMode::Plan {
                 "Current mode".to_string()
             } else {
-                "Read-only planning mode".to_string()
+                "Planning workflow".to_string()
             },
             action: PaletteAction::SwitchMode(AppMode::Plan),
         },
@@ -97,18 +97,9 @@ pub fn filtered_entries(
             hint: if mode == AppMode::Agent {
                 "Current mode".to_string()
             } else {
-                "Prompt for mutating tool approvals".to_string()
+                "Execution workflow".to_string()
             },
             action: PaletteAction::SwitchMode(AppMode::Agent),
-        },
-        PaletteEntry {
-            label: "Switch to yolo mode".to_string(),
-            hint: if mode == AppMode::Yolo {
-                "Current mode".to_string()
-            } else {
-                "Auto-approve tool execution".to_string()
-            },
-            action: PaletteAction::SwitchMode(AppMode::Yolo),
         },
     ];
 

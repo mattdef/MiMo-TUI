@@ -1,16 +1,12 @@
-use std::{
-    collections::BTreeMap,
-    path::PathBuf,
-    process::Command,
-    sync::{Arc, Mutex},
-};
+use std::{collections::BTreeMap, path::PathBuf, process::Command};
 
 use anyhow::{Context, Result, anyhow, bail};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use mimo_agent::{self as agent, AgentStatus};
 use mimo_client::MimoClient;
 use mimo_config::{
-    AUTO_MODEL, AppConfig, known_mimo_models, normalize_base_url, normalize_model_name,
+    AUTO_MODEL, AppConfig, PermissionPolicy, known_mimo_models, normalize_base_url,
+    normalize_model_name,
 };
 use mimo_protocol::{ChatMessage, Role};
 use mimo_state::{
@@ -43,7 +39,7 @@ use tokio::task::JoinHandle;
 
 use super::{
     attachments, command_palette, session_picker, slash_menu,
-    tooling::{ApprovalMode, ToolRequest, ToolRuntime, ToolStatus},
+    tooling::{ToolRequest, ToolRuntime, ToolStatus},
 };
 
 mod command_handlers;
@@ -83,7 +79,6 @@ fn app_mode_for(mode: ModeName) -> AppMode {
     match mode {
         ModeName::Agent => AppMode::Agent,
         ModeName::Plan => AppMode::Plan,
-        ModeName::Yolo => AppMode::Yolo,
     }
 }
 
@@ -233,7 +228,6 @@ pub struct App {
     diagnostics_auto_run: bool,
     plan_items: Vec<PlanItem>,
     tool_runtime: ToolRuntime,
-    approval_mode_shared: Arc<Mutex<ApprovalMode>>,
     slash_menu_selected: usize,
     slash_menu_scroll: u16,
     event_tx: Option<UnboundedSender<AppEvent>>,
@@ -249,7 +243,7 @@ impl App {
         let tool_context = ToolContext::new(default_workspace_root());
         let tool_registry = ToolRegistryBuilder::new().build_all();
         let mode = AppMode::Agent;
-        let approval_mode_shared = Arc::new(Mutex::new(mode_approval_mode(mode)));
+        let permissions = config.permissions;
         let tasks = task_store::load_tasks(&config).unwrap_or_default();
         let diagnostics = diagnostics_store::load_snapshot(&config).unwrap_or_default();
         let installed_skills_cache =
@@ -261,6 +255,7 @@ impl App {
         } else {
             "Missing API key: use /config api-key <key> or edit config.toml".to_string()
         };
+        let permissions_source = config.permissions_source;
 
         Self {
             config,
@@ -302,10 +297,10 @@ impl App {
             diagnostics_auto_run: false,
             plan_items: Vec::new(),
             tool_runtime: ToolRuntime {
-                approval_mode: mode_approval_mode(mode),
+                permissions,
+                permissions_source,
                 ..ToolRuntime::default()
             },
-            approval_mode_shared,
             slash_menu_selected: 0,
             slash_menu_scroll: 0,
             event_tx: None,
@@ -837,9 +832,12 @@ impl App {
             ),
             Span::raw(" | mode: "),
             Span::styled(self.mode.to_string(), Style::default().fg(Color::Blue)),
-            Span::raw(" | approvals: "),
+            Span::raw(" | permissions: "),
             Span::styled(
-                approval_mode_label(self.tool_runtime.approval_mode),
+                format!(
+                    "{} ({})",
+                    self.tool_runtime.permissions, self.tool_runtime.permissions_source
+                ),
                 Style::default().fg(Color::Yellow),
             ),
             Span::raw(" | model: "),
@@ -936,7 +934,7 @@ impl App {
             lines.push(Line::raw("Use /plan done <n> to mark a step complete."));
             lines.push(Line::raw(""));
             let hint = if self.mode == AppMode::Plan {
-                "Plan mode stays read-only until you switch to agent or yolo mode."
+                "Plan mode keeps the assistant focused on analysis; switch to agent mode when you want execution."
             } else {
                 "This checklist stays visible while you work in other modes."
             };
@@ -1057,12 +1055,6 @@ impl App {
                 )
             }
             Err(_) => "context unavailable · F1/? help".to_string(),
-        };
-
-        let summary = if self.mode == AppMode::Yolo {
-            format!("{summary} · YOLO auto-approves mutating tools")
-        } else {
-            summary
         };
 
         format!(
@@ -1547,9 +1539,10 @@ impl App {
             ToolKind::Project => "Project",
             ToolKind::Shell => "Shell",
         };
-        let mode = approval_mode_label(self.tool_runtime.approval_mode);
+        let permissions = self.tool_runtime.permissions;
+        let permissions_source = self.tool_runtime.permissions_source;
         let body = format!(
-            "Kind: {kind}\nTool: {}\nMode: {mode}\n\n{}\n\nEnter/y approve | Esc/n deny | a approve and switch to yolo mode | r deny and switch to plan mode | p switch to agent mode",
+            "Kind: {kind}\nTool: {}\nPermissions: {permissions} ({permissions_source})\n\n{}\n\nEnter/y approve | Esc/n deny | r deny and switch to plan mode | p switch to agent mode",
             pending.request.name, pending.request.summary
         );
         frame.render_widget(
@@ -2283,7 +2276,7 @@ impl App {
         self.clear_attachment_picker();
         let tool_context = self.tool_context.child_operation();
         let tool_registry = self.tool_registry.clone();
-        let approval_mode = Arc::clone(&self.approval_mode_shared);
+        let permissions = self.tool_runtime.permissions;
         self.stream_context = Some(tool_context.clone());
 
         let stream_task = tokio::spawn(async move {
@@ -2355,16 +2348,11 @@ impl App {
                 },
                 |invocation| {
                     let event_tx = event_tx.clone();
-                    let approval_mode = Arc::clone(&approval_mode);
                     async move {
-                        match approval_mode
-                            .lock()
-                            .map(|guard| *guard)
-                            .unwrap_or(ApprovalMode::Prompt)
-                        {
-                            ApprovalMode::Auto => Ok(true),
-                            ApprovalMode::ReadOnly => Ok(false),
-                            ApprovalMode::Prompt => {
+                        match permissions {
+                            PermissionPolicy::Auto => Ok(true),
+                            PermissionPolicy::ReadOnly => Ok(false),
+                            PermissionPolicy::Prompt => {
                                 let (response_tx, response_rx) = oneshot::channel();
                                 let request = tool_request_from_invocation(
                                     &invocation,
@@ -3246,6 +3234,7 @@ impl App {
         event_tx: UnboundedSender<AppEvent>,
     ) -> Result<()> {
         let mode = self.mode;
+        let permissions = self.tool_runtime.permissions;
         let config = self.config.clone();
         let request_messages = self.task_request_messages(prompt.clone(), mode)?;
         let tool_context = self.tool_context.child_operation();
@@ -3293,12 +3282,11 @@ impl App {
                         .context("TUI closed")?;
                     Ok(())
                 },
-                |invocation| {
-                    let allow_prompt_tools = matches!(mode, AppMode::Agent | AppMode::Yolo);
-                    async move {
-                        match invocation.approval_requirement {
-                            ApprovalRequirement::Auto => Ok(true),
-                            ApprovalRequirement::Prompt => Ok(allow_prompt_tools),
+                |invocation| async move {
+                    match invocation.approval_requirement {
+                        ApprovalRequirement::Auto => Ok(true),
+                        ApprovalRequirement::Prompt => {
+                            Ok(matches!(permissions, PermissionPolicy::Auto))
                         }
                     }
                 },
@@ -3441,7 +3429,7 @@ impl App {
         messages.push(ChatMessage::system(self.config.system_prompt.clone()));
         if mode == AppMode::Plan {
             messages.push(ChatMessage::system(
-                "You are in planning mode. Analyze the project, propose concrete implementation steps, and do not claim that files were modified or commands were executed unless the user explicitly switches to agent or yolo mode.".to_string(),
+                "You are in planning mode. Analyze the project, propose concrete implementation steps, and do not claim that files were modified or commands were executed unless the user explicitly switches to agent mode.".to_string(),
             ));
         }
         for skill_name in &self.active_skills {
@@ -3504,13 +3492,6 @@ impl App {
                     self.status = format!("Denied: {}", request.summary);
                 }
             }
-            KeyCode::Char('a' | 'A') => {
-                self.set_mode(AppMode::Yolo);
-                if let Some(request) = self.tool_runtime.approve_pending(true) {
-                    self.status =
-                        format!("Approved and switched to yolo mode: {}", request.summary);
-                }
-            }
             KeyCode::Char('r' | 'R') => {
                 self.set_mode(AppMode::Plan);
                 if let Some(request) = self.tool_runtime.approve_pending(false) {
@@ -3526,16 +3507,8 @@ impl App {
         false
     }
 
-    fn set_approval_mode(&mut self, mode: ApprovalMode) {
-        self.tool_runtime.approval_mode = mode;
-        if let Ok(mut shared) = self.approval_mode_shared.lock() {
-            *shared = mode;
-        }
-    }
-
     fn set_mode(&mut self, mode: AppMode) {
         self.mode = mode;
-        self.set_approval_mode(mode_approval_mode(mode));
     }
 
     fn open_help(&mut self, topic: Option<&str>) {
@@ -4013,14 +3986,15 @@ impl App {
             .map(|snapshot| snapshot.status.to_string())
             .unwrap_or_else(|| "none".to_string());
         format!(
-            "Configuration\n\nConfig file      : {}\nBase URL         : {}\nModel            : {}\nTemperature      : {}\nAPI key          : {}\nMode             : {}\nApprovals        : {}\nAttachments      : {}\nPlan items       : {}\nMemory notes     : {}\nSkills dir       : {}\nSkills active    : {}\nSkills installed : {}\nMCP file         : {}\nMCP enabled      : {}\nMCP servers      : {}\nDiagnostics file : {}\nDiagnostics auto : {}\nDiagnostics state: {}\nTasks file       : {}\nTasks saved      : {}",
+            "Configuration\n\nConfig file      : {}\nBase URL         : {}\nModel            : {}\nTemperature      : {}\nAPI key          : {}\nMode             : {}\nPermissions      : {} ({})\nAttachments      : {}\nPlan items       : {}\nMemory notes     : {}\nSkills dir       : {}\nSkills active    : {}\nSkills installed : {}\nMCP file         : {}\nMCP enabled      : {}\nMCP servers      : {}\nDiagnostics file : {}\nDiagnostics auto : {}\nDiagnostics state: {}\nTasks file       : {}\nTasks saved      : {}",
             self.config.config_path.display(),
             self.config.base_url,
             self.config.model,
             self.config.temperature,
             self.config.masked_api_key(),
             self.mode,
-            approval_mode_label(self.tool_runtime.approval_mode),
+            self.config.permissions,
+            self.config.permissions_source,
             self.attachments.len(),
             self.plan_items.len(),
             memory_notes,
@@ -4059,10 +4033,11 @@ impl App {
             .map(|message| message.content.chars().count())
             .sum::<usize>();
         Ok(format!(
-            "Status\n\nWorkspace         : {}\nMode              : {}\nApprovals         : {}\nModel             : {}\nStreaming         : {}\nMessages          : {}\nActive branch     : {}\nBranches          : {}\nSaved files       : {}\nAPI key           : {}\nAttachments       : {}\nDraft stash       : {}\nPlan items        : {}\nMemory notes      : {}\nSkills active     : {}\nSkills installed  : {}\nMCP enabled       : {}\nMCP servers       : {}\nDiagnostics auto  : {}\nDiagnostics state : {}\nRequest chars     : {}\nShell jobs        : {}\nTasks             : {}\nTools             : {}",
+            "Status\n\nWorkspace         : {}\nMode              : {}\nPermissions       : {} ({})\nModel             : {}\nStreaming         : {}\nMessages          : {}\nActive branch     : {}\nBranches          : {}\nSaved files       : {}\nAPI key           : {}\nAttachments       : {}\nDraft stash       : {}\nPlan items        : {}\nMemory notes      : {}\nSkills active     : {}\nSkills installed  : {}\nMCP enabled       : {}\nMCP servers       : {}\nDiagnostics auto  : {}\nDiagnostics state : {}\nRequest chars     : {}\nShell jobs        : {}\nTasks             : {}\nTools             : {}",
             self.tool_context.workspace_root.display(),
             self.mode,
-            approval_mode_label(self.tool_runtime.approval_mode),
+            self.tool_runtime.permissions,
+            self.tool_runtime.permissions_source,
             self.config.model,
             if self.streaming { "yes" } else { "no" },
             self.messages.len(),
@@ -4584,27 +4559,10 @@ fn trim_task_log(log: &mut Vec<String>) {
     }
 }
 
-fn approval_mode_label(mode: ApprovalMode) -> &'static str {
-    match mode {
-        ApprovalMode::Prompt => "prompt",
-        ApprovalMode::ReadOnly => "read-only",
-        ApprovalMode::Auto => "auto",
-    }
-}
-
-fn mode_approval_mode(mode: AppMode) -> ApprovalMode {
-    match mode {
-        AppMode::Plan => ApprovalMode::ReadOnly,
-        AppMode::Agent => ApprovalMode::Prompt,
-        AppMode::Yolo => ApprovalMode::Auto,
-    }
-}
-
 fn next_mode(mode: AppMode) -> AppMode {
     match mode {
         AppMode::Agent => AppMode::Plan,
-        AppMode::Plan => AppMode::Yolo,
-        AppMode::Yolo => AppMode::Agent,
+        AppMode::Plan => AppMode::Agent,
     }
 }
 
@@ -4817,11 +4775,13 @@ mod tests {
             base_url: "https://example.test/v1".to_string(),
             model: "mimo-v2-flash".to_string(),
             temperature: 0.2,
+            permissions: PermissionPolicy::Prompt,
             system_prompt: "test".to_string(),
             config_path: PathBuf::from("config.toml"),
             base_url_source: mimo_config::ConfigValueSource::Default,
             model_source: mimo_config::ConfigValueSource::Default,
             temperature_source: mimo_config::ConfigValueSource::Default,
+            permissions_source: mimo_config::ConfigValueSource::Default,
             system_prompt_source: mimo_config::ConfigValueSource::Default,
             api_key_source: mimo_config::ConfigValueSource::Default,
         })
@@ -4907,11 +4867,14 @@ mod tests {
     }
 
     #[test]
-    fn status_summary_mentions_mode() {
+    fn status_summary_mentions_mode_and_permissions() {
         let app = test_app();
         let summary = app.status_summary().expect("status summary");
         assert!(summary.contains("Mode"));
         assert!(summary.contains("agent"));
+        assert!(summary.contains("Permissions"));
+        assert!(summary.contains("prompt"));
+        assert!(summary.contains("default"));
     }
 
     #[test]
@@ -5525,16 +5488,16 @@ mod tests {
     }
 
     #[test]
-    fn yolo_mode_shows_persistent_safety_warning() {
+    fn render_header_shows_permissions_policy() {
         let mut app = test_app();
-        app.mode = AppMode::Yolo;
+        app.reset_conversation_from_messages(vec![ChatMessage::user("hello")]);
 
         let screen = render_screen(&mut app);
-        assert!(screen.contains("YOLO auto-approves mutating tools"));
+        assert!(screen.contains("permissions: prompt (default)"));
     }
 
     #[test]
-    fn plan_panel_remains_visible_outside_plan_mode() {
+    fn plan_panel_remains_visible_in_agent_and_plan_modes() {
         let mut app = test_app();
         app.reset_conversation_from_messages(vec![
             ChatMessage::user("hello"),
@@ -5545,7 +5508,7 @@ mod tests {
         assert!(screen.contains("Conversation"));
         assert!(screen.contains("Plan"));
 
-        app.mode = AppMode::Yolo;
+        app.mode = AppMode::Plan;
         let screen = render_screen(&mut app);
         assert!(screen.contains("Conversation"));
         assert!(screen.contains("Plan"));
@@ -5759,15 +5722,15 @@ mod tests {
             Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL)),
             event_tx.clone(),
         )
-        .expect("ctrl+tab should cycle to yolo");
-        assert_eq!(app.mode, AppMode::Yolo);
+        .expect("ctrl+tab should cycle back to agent");
+        assert_eq!(app.mode, AppMode::Agent);
 
         app.handle_terminal_event(
             Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL)),
             event_tx,
         )
-        .expect("ctrl+tab should cycle back to agent");
-        assert_eq!(app.mode, AppMode::Agent);
+        .expect("ctrl+tab should cycle back to plan");
+        assert_eq!(app.mode, AppMode::Plan);
     }
 
     #[test]
@@ -5780,12 +5743,12 @@ mod tests {
         assert_eq!(app.mode, AppMode::Plan);
 
         app.handle_terminal_event(Event::Key(KeyEvent::from(KeyCode::F(2))), event_tx.clone())
-            .expect("f2 should cycle to yolo");
-        assert_eq!(app.mode, AppMode::Yolo);
-
-        app.handle_terminal_event(Event::Key(KeyEvent::from(KeyCode::F(2))), event_tx)
             .expect("f2 should cycle back to agent");
         assert_eq!(app.mode, AppMode::Agent);
+
+        app.handle_terminal_event(Event::Key(KeyEvent::from(KeyCode::F(2))), event_tx)
+            .expect("f2 should cycle back to plan");
+        assert_eq!(app.mode, AppMode::Plan);
     }
 
     #[test]

@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use mimo_agent::{AgentStatus, run_agent_turn};
 use mimo_client::MimoClient;
-use mimo_config::{AppConfig, ConfigOverrides, known_mimo_models};
+use mimo_config::{AppConfig, ConfigOverrides, PermissionPolicy, known_mimo_models};
 use mimo_protocol::ChatMessage;
 use mimo_state::session_store;
 use mimo_tools::{ApprovalRequirement, ToolContext, ToolRegistryBuilder, default_workspace_root};
@@ -42,7 +42,7 @@ enum Command {
         #[arg(help = "Prompt to send to MiMo")]
         prompt: String,
     },
-    #[command(about = "Show resolved configuration and credential status")]
+    #[command(about = "Show resolved configuration, permission policy, and credential status")]
     Doctor,
     #[command(about = "List MiMo models from the API, or local suggestions when offline")]
     Models,
@@ -58,6 +58,7 @@ async fn main() -> Result<()> {
         base_url: cli.base_url,
         model: cli.model,
         temperature: cli.temperature,
+        permissions: None,
     })?;
 
     match cli.command {
@@ -71,6 +72,7 @@ async fn main() -> Result<()> {
 
 async fn ask(config: AppConfig, prompt: String) -> Result<()> {
     let client = MimoClient::new(&config)?;
+    let permissions = config.permissions;
     let request_messages = vec![
         ChatMessage::system(config.system_prompt.clone()),
         ChatMessage::user(prompt),
@@ -91,10 +93,13 @@ async fn ask(config: AppConfig, prompt: String) -> Result<()> {
         },
         |status| {
             if let AgentStatus::ToolRequested(invocation) = status
-                && !should_auto_approve_non_interactive_cli(invocation.approval_requirement)
+                && !should_auto_approve_non_interactive_cli(
+                    invocation.approval_requirement,
+                    permissions,
+                )
             {
                 eprintln!(
-                    "warning: denying '{}' in non-interactive ask mode; rerun in the TUI to approve mutating tools",
+                    "warning: denying '{}' in non-interactive ask mode; set permissions = \"auto\" in config.toml to allow mutating tools",
                     invocation.summary
                 );
             }
@@ -103,6 +108,7 @@ async fn ask(config: AppConfig, prompt: String) -> Result<()> {
         |invocation| async move {
             Ok(should_auto_approve_non_interactive_cli(
                 invocation.approval_requirement,
+                permissions,
             ))
         },
     )
@@ -125,6 +131,10 @@ async fn doctor(config: &AppConfig) -> Result<()> {
     println!(
         "Temperature      : {} ({})",
         config.temperature, config.temperature_source
+    );
+    println!(
+        "Permissions      : {} ({})",
+        config.permissions, config.permissions_source
     );
     println!(
         "System prompt    : {} ({})",
@@ -213,22 +223,39 @@ fn list_sessions(config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
-fn should_auto_approve_non_interactive_cli(requirement: ApprovalRequirement) -> bool {
-    matches!(requirement, ApprovalRequirement::Auto)
+fn should_auto_approve_non_interactive_cli(
+    requirement: ApprovalRequirement,
+    permissions: PermissionPolicy,
+) -> bool {
+    match requirement {
+        ApprovalRequirement::Auto => true,
+        ApprovalRequirement::Prompt => matches!(permissions, PermissionPolicy::Auto),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::should_auto_approve_non_interactive_cli;
+    use mimo_config::PermissionPolicy;
     use mimo_tools::ApprovalRequirement;
 
     #[test]
-    fn non_interactive_cli_only_auto_approves_read_only_tools() {
+    fn non_interactive_cli_only_auto_approves_mutating_tools_when_configured() {
         assert!(should_auto_approve_non_interactive_cli(
-            ApprovalRequirement::Auto
+            ApprovalRequirement::Auto,
+            PermissionPolicy::Prompt
         ));
         assert!(!should_auto_approve_non_interactive_cli(
-            ApprovalRequirement::Prompt
+            ApprovalRequirement::Prompt,
+            PermissionPolicy::ReadOnly
+        ));
+        assert!(!should_auto_approve_non_interactive_cli(
+            ApprovalRequirement::Prompt,
+            PermissionPolicy::Prompt
+        ));
+        assert!(should_auto_approve_non_interactive_cli(
+            ApprovalRequirement::Prompt,
+            PermissionPolicy::Auto
         ));
     }
 }

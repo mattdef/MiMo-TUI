@@ -1,232 +1,234 @@
-# Plan: Corriger le défilement vertical du menu slash
+# Plan: Remove the legacy auto-approval mode and move tool permissions to config
 
 ## Objective
 
-Rendre le menu slash de MiMo-TUI entièrement navigable lorsque la liste des commandes dépasse la hauteur de la popup Ratatui, afin que les commandes situées après `/export` (`/config`, `/status`, `/retry`, `/context`, `/mcp`, etc.) soient visibles et sélectionnables.
+Remove the runtime auto-approval execution mode from MiMo-TUI and make tool permission behavior come only from `config.toml` plus a safe built-in default. Keep the agent/planning workflow modes, but stop using mode switches, keybindings, palette entries, or approval-prompt shortcuts to change permission behavior.
 
 ## Requirements Snapshot
 
-- **R1:** Identifier le composant responsable du rendu du menu slash.
-- **R2:** Le menu slash doit permettre un défilement vertical complet dans Ratatui.
-- **R3:** Les commandes au-delà de `/export` doivent être visibles et navigables.
-- **R4:** La navigation au clavier doit rester intuitive avec `Up`/`Down`; `Tab` doit continuer à insérer la commande sélectionnée.
-- **R5:** La solution doit rester ciblée sur le menu slash et ne pas réorganiser l'architecture du TUI.
+- **R1:** Find and remove all product references to the legacy auto-approval mode.
+- **R2:** Preserve only supported execution modes after removal: `agent` and `plan`.
+- **R3:** Tool permissions must be configured through the config file, not through runtime mode changes, CLI flags, environment variables, palette actions, or approval-prompt shortcuts.
+- **R4:** Keep safe defaults: mutating tools should not become auto-approved unless the config file explicitly asks for that behavior.
+- **R5:** Update tests and docs to match the new mode and permission model.
 
 ## Scope
 
-- Modifier principalement `crates/mimo-tui/src/app.rs`.
-- Utiliser les données existantes de `crates/mimo-tui/src/slash_menu.rs` (`visible_entries`) et `crates/mimo-tui-core/src/commands.rs` (`COMMANDS`).
-- Ajouter ou ajuster uniquement les tests nécessaires dans `crates/mimo-tui/src/app.rs` et, si utile, `crates/mimo-tui/src/slash_menu.rs`.
-- Ne pas modifier la liste des commandes ni le parsing des slash commands, sauf si un test révèle une régression liée au filtrage.
+- In scope: config loading, CLI/TUI approval decisions, TUI mode UI, slash-command parsing, session/task mode serialization, tests, and README/docs.
+- Out of scope: changing individual tool implementations, HTTP client behavior, protocol types, or adding per-tool permission rules beyond the existing global read-only/prompt/auto behavior.
 
 ## Assumptions and Constraints
 
-- Aucun `.opencode/task.md` n'existe; ce plan est basé sur la demande utilisateur et l'exploration du code.
-- Le TUI utilise Ratatui et Crossterm.
-- Le rendu du menu slash est actuellement dans `App::render_slash_menu_overlay()` (`crates/mimo-tui/src/app.rs:1559`).
-- L'état actuel du menu slash ne stocke que `slash_menu_selected` (`crates/mimo-tui/src/app.rs:236`), sans offset de scroll dédié.
-- `Up`/`Down` changent déjà la sélection (`crates/mimo-tui/src/app.rs:602-608`), mais le `Paragraph` rendu n'applique aucun `.scroll(...)`, donc Ratatui coupe les lignes hors popup.
-- Les helpers existants `adjust_selection_scroll(...)` et les patterns des overlays `model_picker`, `command_palette` et `attachment_picker` peuvent être réutilisés.
-- Le support molette est optionnel et plus risqué, car `crates/mimo-tui/src/lib.rs` n'active pas actuellement `EnableMouseCapture` et `App::handle_terminal_event` ne traite pas `Event::Mouse`.
+- `.opencode/task.md` is absent; this plan is based on the user request and code exploration.
+- Current permission behavior is not config-driven: `AppMode::Plan` maps to `ApprovalMode::ReadOnly` and `AppMode::Agent` maps to `ApprovalMode::Prompt` in `crates/mimo-tui/src/app.rs`; the removed legacy auto-approval mode mapped to `ApprovalMode::Auto`.
+- Current per-tool risk classification stays in `crates/mimo-tools`: `ApprovalRequirement::Auto` for read/search/git/project-style tools and `ApprovalRequirement::Prompt` for mutating/network/shell tools.
+- Default permission policy should be `prompt` for interactive TUI use; non-interactive/background flows cannot prompt and should deny prompt-required tools unless the config policy is `auto`.
+- Because repo instructions say new settings normally thread through `ConfigOverrides`, add an internal override field if needed for consistency/tests, but do not expose permissions through CLI args or environment variables.
 
 ## Risks and Areas Requiring Care
 
-- Éviter de laisser la sélection pointer hors de la liste filtrée après modification de l'input.
-- Ne pas casser `Tab` pour l'autocomplétion slash ni l'attachement `@path`.
-- Ne pas interférer avec les overlays prioritaires déjà gérés avant le menu slash: help, command palette, session/model picker, attachment picker, approval overlay.
-- Si la molette est ajoutée, activer/désactiver MouseCapture proprement dans `TerminalGuard` pour éviter de perturber le terminal après sortie.
+- Removing the legacy auto-approval mode can break loading older saved sessions/tasks whose serialized `mode` was the removed value. Prefer a compatibility strategy that maps unknown legacy mode strings to `Agent` without re-emitting the removed mode.
+- Decoupling plan mode from permission enforcement changes semantics: plan mode should remain a planning prompt/UI mode, while actual tool permission decisions come from config.
+- Background tasks currently auto-approve mutating tools in `Agent`; after this change they must use the config policy instead.
+- Avoid leaving UI affordances that imply permissions can be changed at runtime.
 
-## Core concepts
+## Current Findings
 
-- **Entrées visibles:** `slash_menu::visible_entries(self.input.trim())` filtre `COMMANDS` selon la commande en cours.
-- **Sélection:** `slash_menu_selected` indique l'entrée active pour le style `> ...` et pour `Tab`.
-- **Scroll offset:** ajouter un offset vertical, par exemple `slash_menu_scroll: u16`, puis le recalculer avec `adjust_selection_scroll(selected, scroll, visible_lines)` avant de rendre le `Paragraph` avec `.scroll((slash_menu_scroll, 0))`.
-- **Hauteur visible:** calculer la hauteur intérieure du block du menu (`block.inner(popup).height`) au lieu de supposer que toute la popup peut afficher des lignes.
+### Product references found by case-insensitive search
+
+- `README.md`: overview, mode docs, warning, keybinding table, `/mode` table.
+- `crates/mimo-tui-core/src/keybindings.rs`: F2/Ctrl+Tab description.
+- `crates/mimo-tui-core/src/commands.rs`: removed mode name, `/mode` usage, parser branch, parser tests.
+- `crates/mimo-state/src/models.rs`: removed mode, display string.
+- `crates/mimo-state/src/task_store.rs`: test fixture using the removed mode.
+- `crates/mimo-tui/src/command_palette.rs`: auto-approval mode entry.
+- `crates/mimo-tui/src/app.rs`: `ModeName` mapping, plan hints/system prompt, footer warning, approval overlay text, background task permission logic, approval-key shortcut, `mode_approval_mode`, `next_mode`, and tests.
+
+### Current permission flow
+
+- Tools declare `ApprovalRequirement` in `crates/mimo-tools/src/spec.rs` and overrides in `file.rs`, `shell.rs`, and `extra.rs`.
+- `mimo-agent::run_agent_turn` asks its caller whether to approve prompt-required tools.
+- `mimo-cli ask` auto-approves only `ApprovalRequirement::Auto` and denies `Prompt`.
+- Foreground TUI uses `ApprovalMode` from current app mode: auto approves, denies read-only, or prompts.
+- Background tasks currently approve prompt-required tools whenever mode is `Agent` or the removed auto mode.
+- `crates/mimo-config/src/lib.rs` currently has no tool permission setting.
+
+## Core Concepts
+
+- **Execution mode:** user workflow mode (`agent` or `plan`) that affects UI/system-prompt behavior.
+- **Permission policy:** config-file setting controlling tool approval behavior. Suggested TOML shape:
+
+  ```toml
+  permissions = "prompt"  # read_only | prompt | auto
+  ```
+
+- **Policy semantics:**
+  - `read_only`: allow `ApprovalRequirement::Auto`; deny `ApprovalRequirement::Prompt`.
+  - `prompt`: allow `Auto`; prompt in foreground TUI for `Prompt`; deny `Prompt` in non-interactive/background contexts because no prompt is available.
+  - `auto`: allow both `Auto` and `Prompt`; dangerous and must be explicit in `config.toml`.
 
 ## Sub-Tasks
 
-### Sub-Task 1: Ajouter l'état de scroll du menu slash
+### Sub-Task 1: Add file-backed permission policy to config
 
 - **Status:** Pending
-- **Objective:** Donner au menu slash un offset vertical persistant et initialisé.
-- **Related Requirements:** R2, R3, R5
-- **Dependencies and Preconditions:** Le champ `slash_menu_selected` existe déjà dans `App`.
+- **Objective:** Make permissions load from `config.toml` with a safe default and no user-facing CLI/env overrides.
+- **Related Requirements:** R3, R4
+- **Dependencies and Preconditions:** Existing config precedence and file-loading behavior in `crates/mimo-config/src/lib.rs`.
 - **In Scope for This Sub-Task:**
-  - Ajouter `slash_menu_scroll: u16` à `App`.
-  - Initialiser ce champ à `0` dans `App::new()`.
-  - Remettre ce scroll à `0` quand la sélection slash est réinitialisée après insertion/autocomplétion.
-- **Out of Scope for This Sub-Task:**
-  - Support molette.
-  - Changements dans `COMMANDS` ou le parser.
+  - Add a public config type such as `PermissionMode { ReadOnly, Prompt, Auto }` with serde support.
+  - Add `permissions: PermissionMode` and `permissions_source: ConfigValueSource` to `AppConfig`.
+  - Add `permissions: Option<PermissionMode>` to `FileConfig`.
+  - Default to `Prompt` when unset.
+  - Add an internal `ConfigOverrides` field only if needed by project convention/tests; do not wire it to Clap or environment variables.
+  - Add config tests for default, valid file values, and invalid values.
+- **Out of Scope for This Sub-Task:** Per-tool or per-command permission rules.
 - **Instructions:**
-  1. Ajouter le champ près de `slash_menu_selected`.
-  2. Mettre à jour les endroits qui réinitialisent déjà `slash_menu_selected` (`handle_tab_key`, changements d'input si nécessaire) pour réinitialiser aussi `slash_menu_scroll`.
-  3. Garder `clamp_slash_menu_selection()` responsable de la validité de l'index sélectionné.
-- **Acceptance Criteria:**
-  - L'état compile et `App::new()` initialise correctement le scroll.
-  - Aucune logique de rendu n'est encore nécessaire pour ce sous-lot.
-- **Cautionary Points (Risks & Edge Cases):**
-  - Ne pas ajouter un état global partagé ou une dépendance nouvelle.
-- **Implementation Suggestions:**
-  - Copier le pattern des états `ModelPickerState`, `CommandPaletteState` ou `AttachmentPickerState`, qui possèdent déjà `scroll`.
-- **Testing Suggestions:**
-  - `cargo check` après ce sous-lot.
-- **Done When:**
-  - `App` possède un offset de scroll slash initialisé et utilisable par le rendu.
+  1. Keep the TOML key simple: `permissions = "prompt"`.
+  2. Accept `read_only`, `prompt`, and `auto`; do not accept the removed mode name as a config value.
+  3. Track source as `File` or `Default` for normal user flows.
+  4. Update all test `AppConfig { ... }` literals across crates with the new fields.
+- **Acceptance Criteria:** Config loading exposes a permission policy, default is safe, and no CLI/env permission surface exists.
+- **Testing Suggestions:** `cargo test -p mimo-config` plus compile-driven updates to all `AppConfig` literals.
 
-### Sub-Task 2: Appliquer le scroll dans `render_slash_menu_overlay`
+### Sub-Task 2: Remove the removed mode from shared mode state and slash commands
 
 - **Status:** Pending
-- **Objective:** Faire défiler le contenu rendu pour que la sélection active reste visible dans la popup.
-- **Related Requirements:** R1, R2, R3, R4
-- **Dependencies and Preconditions:** Sub-Task 1 terminé.
+- **Objective:** Leave only `Plan` and `Agent` as execution modes.
+- **Related Requirements:** R1, R2, R5
+- **Dependencies and Preconditions:** Sub-Task 1 can be done before or after this task.
 - **In Scope for This Sub-Task:**
-  - Refactor ciblé de `App::render_slash_menu_overlay()`.
-  - Utilisation de `adjust_selection_scroll(...)`.
-  - Application de `.scroll((self.slash_menu_scroll, 0))` sur le `Paragraph`.
-- **Out of Scope for This Sub-Task:**
-  - Changement visuel majeur du menu.
-  - Remplacement par un widget `List` sauf si l'implémentation existante en `Paragraph` devient plus complexe que nécessaire.
+  - `crates/mimo-state/src/models.rs`: remove the legacy auto-approval mode and its `Display` branch.
+  - Add a legacy-safe deserialization strategy if desired: unknown/removed serialized mode values should load as `Agent` while serialization only emits `plan` or `agent`.
+  - `crates/mimo-tui-core/src/commands.rs`: remove the legacy auto-approval mode name, update `/mode [agent|plan]`, remove parser support for the removed value and numeric `3`, update tests.
+  - `crates/mimo-state/src/task_store.rs`: replace the removed-mode test fixture with `Agent` or a compatibility-focused fixture that does not reintroduce product support.
+- **Out of Scope for This Sub-Task:** TUI rendering and runtime permission decisions.
 - **Instructions:**
-  1. Construire un `Block` unique pour le menu slash et calculer son `inner` avant le rendu.
-  2. Calculer `visible_lines = inner.height.max(1) as usize`.
-  3. Avant de rendre les lignes, mettre à jour `self.slash_menu_scroll = adjust_selection_scroll(self.slash_menu_selected, self.slash_menu_scroll, visible_lines)`.
-  4. Rendre les lignes dans `inner` avec `Paragraph::new(Text::from(lines)).scroll((self.slash_menu_scroll, 0))`.
-  5. Garder le style de sélection existant (`>`, bleu, gras).
-  6. Ajouter un titre ou hint court du type `Slash menu · ↑/↓ scroll · Tab select` si cela reste lisible.
-- **Acceptance Criteria:**
-  - Quand la sélection descend après `/export`, la liste scroll automatiquement et les commandes suivantes deviennent visibles.
-  - La ligne sélectionnée reste visible quand on monte et descend.
-  - Le rendu continue à fonctionner sur petits terminaux.
-- **Cautionary Points (Risks & Edge Cases):**
-  - Le code actuel rend deux blocks sur `popup`; éviter les bordures doublées ou conserver le rendu sans duplication inutile.
-  - Le scroll doit être calculé avec la hauteur intérieure, pas la hauteur totale du popup.
-- **Implementation Suggestions:**
-  - S'inspirer de `render_model_picker_overlay()` et `render_command_palette_overlay()` qui synchronisent `selected` et `scroll` avant le rendu.
-- **Testing Suggestions:**
-  - Ajouter un test de rendu avec `TestBackend` où `app.input` vaut `/`, `slash_menu_selected` pointe sur une commande après `/export`, puis vérifier que l'écran contient une commande tardive comme `/config`, `/status`, `/skill` ou `/mcp`.
-- **Done When:**
-  - Le menu slash n'est plus coupé uniquement aux premières commandes et suit la sélection.
+  1. Keep `#[serde(alias = "chat")]` for `Agent` if still needed.
+  2. Decide compatibility explicitly: either map unknown legacy modes to `Agent`, or document that old sessions/tasks with removed modes are no longer loadable.
+  3. Ensure `/mode 1` and `/mode 2` behavior remains if numeric aliases are retained; `/mode 3` should be invalid.
+- **Acceptance Criteria:** Shared state and command parsing no longer expose the removed mode.
+- **Testing Suggestions:** `cargo test -p mimo-state`, `cargo test -p mimo-tui-core`.
 
-### Sub-Task 3: Compléter la navigation clavier du menu slash
+### Sub-Task 3: Decouple TUI permissions from execution modes
 
 - **Status:** Pending
-- **Objective:** Rendre la navigation clavier complète et prévisible.
+- **Objective:** Make foreground and background TUI tool approval decisions use config policy only.
 - **Related Requirements:** R2, R3, R4
-- **Dependencies and Preconditions:** Sub-Task 2 terminé.
+- **Dependencies and Preconditions:** Sub-Tasks 1 and 2.
 - **In Scope for This Sub-Task:**
-  - Étendre les branches `KeyCode` existantes dans `App::handle_terminal_event()` lorsque `self.slash_menu_visible()` est vrai.
-  - Supporter au minimum `Up`, `Down`, `Home`, `End`, et idéalement `PageUp`/`PageDown`.
-- **Out of Scope for This Sub-Task:**
-  - Changement du comportement de `Enter` ou de l'exécution des commandes.
-  - Support souris obligatoire.
+  - `crates/mimo-tui/src/tooling.rs`: replace or repurpose `ApprovalMode` as config-backed permission state; prefer using the config enum to avoid duplicate concepts.
+  - `crates/mimo-tui/src/app.rs`: initialize tool runtime permission state from `self.config.permissions`, not `self.mode`.
+  - Remove `mode_approval_mode` and stop `set_mode` from changing permissions.
+  - Change foreground `run_agent_turn` approval closure to use `config.permissions`.
+  - Change background task approval closure to use `config.permissions`; in `prompt` mode, deny prompt-required tools because no interactive prompt is available.
+  - Update `config_summary`, `status_summary`, header text, and tool runtime summaries to show the configured permission policy and source.
+- **Out of Scope for This Sub-Task:** Adding live config reload while the TUI is running.
 - **Instructions:**
-  1. Garder `Up`/`Down` comme navigation ligne par ligne.
-  2. Ajouter `Home` pour sélectionner la première entrée et `End` pour sélectionner la dernière.
-  3. Ajouter `PageUp`/`PageDown` pour déplacer la sélection par tranche visible ou par constante raisonnable si la hauteur n'est pas stockée dans l'état.
-  4. Après chaque mouvement, laisser le rendu ajuster `slash_menu_scroll` via `adjust_selection_scroll`.
-  5. Conserver `Tab` comme sélection/autocomplétion via `handle_tab_key()`.
-- **Acceptance Criteria:**
-  - `/` affiche le menu; `Down` permet d'atteindre toutes les commandes jusqu'à la fin.
-  - `Up` permet de revenir vers le haut.
-  - `Home`/`End` atteignent directement début/fin.
-  - `Tab` insère toujours la commande sélectionnée, même si elle est hors de la première page initiale.
-- **Cautionary Points (Risks & Edge Cases):**
-  - Les branches globales `PageUp`/`PageDown` scrollent actuellement la conversation; elles ne doivent pas capter l'événement quand le menu slash est visible.
-  - La sélection doit rester dans `0..entries.len()` même si le filtre change.
-- **Implementation Suggestions:**
-  - Factoriser en petites méthodes privées si le `match` devient chargé: `move_slash_menu_selection(delta)`, `set_slash_menu_selection(index)`.
-- **Testing Suggestions:**
-  - Ajouter des tests d'événements `Event::Key` pour `Down` répété, `Up`, `End`, `Home`, et `Tab` sur une commande tardive.
-  - Vérifier que `PageDown` ne modifie pas `self.scroll` de conversation lorsque le menu slash est ouvert.
-- **Done When:**
-  - Le menu slash est entièrement navigable au clavier sans régression des raccourcis existants.
+  1. Add a small helper for approval decisions so foreground, background, and tests share semantics.
+  2. Foreground TUI behavior:
+     - `read_only`: auto-required tools run; prompt-required tools are denied.
+     - `prompt`: prompt-required tools open the existing approval overlay.
+     - `auto`: prompt-required tools run without overlay.
+  3. Background behavior:
+     - `auto`: run prompt-required tools.
+     - `prompt`/`read_only`: deny prompt-required tools and log/status that config does not permit unattended execution.
+  4. `set_mode(AppMode::Plan|Agent)` should only update `self.mode` and status.
+- **Acceptance Criteria:** Changing `/mode`, F2, Ctrl+Tab, or palette mode entries never changes approval behavior.
+- **Testing Suggestions:** Add TUI unit tests proving mode toggles do not change permission policy and background approval follows config.
 
-### Sub-Task 4: Option molette souris, uniquement si demandé pendant l'implémentation
+### Sub-Task 4: Remove TUI UI affordances for runtime permission switching
 
 - **Status:** Pending
-- **Objective:** Ajouter un défilement à la molette si l'équipe veut un support souris en plus du clavier.
-- **Related Requirements:** R2, R3
-- **Dependencies and Preconditions:** Sub-Tasks 1-3 terminés; décision explicite d'accepter le risque MouseCapture.
+- **Objective:** Remove user-visible runtime entry points for the removed mode and for changing permissions outside config.
+- **Related Requirements:** R1, R2, R3, R5
+- **Dependencies and Preconditions:** Sub-Tasks 2 and 3.
 - **In Scope for This Sub-Task:**
-  - `crates/mimo-tui/src/lib.rs` pour activer/désactiver `EnableMouseCapture`/`DisableMouseCapture`.
-  - `crates/mimo-tui/src/app.rs` pour traiter `Event::Mouse` avec `MouseEventKind::ScrollUp`/`ScrollDown` quand `slash_menu_visible()`.
-- **Out of Scope for This Sub-Task:**
-  - Clic souris pour sélectionner une ligne.
-  - Drag scrollbar ou refonte du layout.
-- **Instructions:**
-  1. Ajouter MouseCapture dans `TerminalGuard::enter()` et son cleanup dans `Drop`.
-  2. Importer et traiter les événements souris dans `handle_terminal_event`.
-  3. Quand le menu slash est visible, mapper molette haut/bas aux mêmes changements que `Up`/`Down`.
-  4. Ignorer les événements souris pour le menu slash quand un overlay prioritaire est ouvert.
-- **Acceptance Criteria:**
-  - La molette déplace la sélection et le rendu scroll pour garder la sélection visible.
-  - Le terminal revient à son état normal après sortie du TUI.
-- **Cautionary Points (Risks & Edge Cases):**
-  - C'est une surface plus large que le bug initial; si le clavier satisfait l'acceptance, garder ce sous-lot non implémenté.
-- **Implementation Suggestions:**
-  - Préférer une méthode commune de navigation pour éviter de dupliquer la logique clavier/souris.
-- **Testing Suggestions:**
-  - Ajouter des tests unitaires d'événements souris si Crossterm les construit facilement; sinon valider manuellement dans `cargo run`.
-- **Done When:**
-  - La molette fonctionne sans casser les événements clavier ni l'état terminal.
+  - `crates/mimo-tui/src/app.rs`:
+    - Remove mapping from `ModeName` to removed mode.
+    - Remove footer safety warning branch.
+    - Update plan panel hint and planning system prompt so they do not mention switching to the removed mode or claim mode enforces permissions.
+    - Update approval overlay copy to only offer approve/deny and mention config-file permissions if useful.
+    - Remove approval key branch that approves and switches to the removed mode.
+    - Remove approval key branches that change approval behavior through `r`/`p`; keep only approve/deny unless there is a non-permission mode-change reason.
+    - Change `next_mode` to toggle `Agent <-> Plan`.
+  - `crates/mimo-tui/src/command_palette.rs`: remove the auto-approval mode entry and update agent/plan hints to avoid implying permissions are controlled by modes.
+  - `crates/mimo-tui-core/src/keybindings.rs`: update F2/Ctrl+Tab and approval-prompt descriptions.
+- **Out of Scope for This Sub-Task:** Permission config parsing already handled in Sub-Task 1.
+- **Instructions:** Ensure every product string that mentioned the removed mode is rewritten or removed.
+- **Acceptance Criteria:** UI offers only `agent` and `plan` modes, and the approval prompt cannot alter permission policy.
+- **Testing Suggestions:** Update/remove affected TUI tests: safety-warning test, plan-panel test, Ctrl+Tab/F2 cycling tests, approval prompt tests if present.
 
-### Sub-Task 5: Tests et validation finale
+### Sub-Task 5: Update CLI behavior and diagnostics for config-backed permissions
 
 - **Status:** Pending
-- **Objective:** Couvrir le bug signalé et vérifier l'absence de régressions.
-- **Related Requirements:** R1, R2, R3, R4, R5
-- **Dependencies and Preconditions:** Sub-Tasks 1-3 terminés; Sub-Task 4 si choisi.
+- **Objective:** Make non-interactive CLI tool approval use the same config policy.
+- **Related Requirements:** R3, R4, R5
+- **Dependencies and Preconditions:** Sub-Task 1.
 - **In Scope for This Sub-Task:**
-  - Tests ciblés de rendu et d'événements dans `crates/mimo-tui/src/app.rs`.
-  - Validation manuelle du TUI.
-- **Out of Scope for This Sub-Task:**
-  - Tests nécessitant une API MiMo active.
+  - `crates/mimo-cli/src/main.rs`: pass config permission policy into `ask` approval decisions.
+  - Update `should_auto_approve_non_interactive_cli` to account for policy.
+  - Update warnings for denied tools to explain that non-interactive prompt-required tools need `permissions = "auto"` in `config.toml` to run unattended.
+  - Update `doctor` output to print the resolved permissions policy and source.
+- **Out of Scope for This Sub-Task:** Adding `--permissions` or environment variables.
+- **Acceptance Criteria:** CLI behavior is config-driven and no new runtime permission flag exists.
+- **Testing Suggestions:** Update `mimo-cli` unit tests for `read_only`, `prompt`, and `auto` policies.
+
+### Sub-Task 6: Update docs and canonical project instructions
+
+- **Status:** Pending
+- **Objective:** Documentation matches the new mode and permission model.
+- **Related Requirements:** R1, R3, R5
+- **Dependencies and Preconditions:** Sub-Tasks 1-5 define final behavior.
+- **In Scope for This Sub-Task:**
+  - `README.md`: remove removed-mode overview/warning, update config example with `permissions = "prompt"`, document `read_only|prompt|auto`, update execution modes, controls, and `/mode [agent|plan]`.
+  - `.github/copilot-instructions.md`: add the config-file-only permission setting to the configuration details if maintainers want canonical docs updated.
+- **Out of Scope for This Sub-Task:** Changelog/release notes unless the project already has them.
+- **Acceptance Criteria:** User docs no longer describe runtime auto-approval mode and clearly state permissions are file-configured.
+- **Testing Suggestions:** Run a case-insensitive product grep after docs update.
+
+### Sub-Task 7: Final cleanup and regression tests
+
+- **Status:** Pending
+- **Objective:** Verify the removed mode is gone from product code/docs and permissions are config-only.
+- **Related Requirements:** R1-R5
+- **Dependencies and Preconditions:** Sub-Tasks 1-6.
+- **In Scope for This Sub-Task:**
+  - Remove obsolete tests and add targeted replacements.
+  - Verify no product references remain.
+  - Run workspace validation.
+- **Out of Scope for This Sub-Task:** Broad refactors unrelated to modes/permissions.
 - **Instructions:**
-  1. Ajouter un test de rendu qui reproduit le bug: input `/`, sélection sur une commande après `/export`, rendu dans une hauteur limitée, assertion que la commande tardive est visible.
-  2. Ajouter un test `Down` répété qui prouve que la sélection atteint la dernière commande de `COMMANDS`.
-  3. Ajouter un test `Tab` sur une commande tardive pour vérifier l'insertion dans l'input.
-  4. Si `PageUp`/`PageDown` sont ajoutés, tester qu'ils agissent sur le menu slash au lieu du scroll conversation.
-  5. Lancer la validation workspace.
-- **Acceptance Criteria:**
-  - Le bug `/export` coupant la suite de la liste est couvert par un test.
-  - Les commandes tardives (`/config`, `/skill`, `/mcp`, selon la sélection) sont visibles et sélectionnables.
-  - Les commandes de validation passent.
-- **Cautionary Points (Risks & Edge Cases):**
-  - Les assertions de rendu doivent chercher des textes de commandes stables, pas des coordonnées exactes fragiles.
-  - Utiliser `TestBackend` existant plutôt qu'une automatisation terminal externe.
-- **Implementation Suggestions:**
-  - Réutiliser les helpers de tests existants `test_app()` et `render_screen()`.
+  1. Run a case-insensitive search for the removed mode in product files; expected result should be none except temporary planning notes or explicit migration comments if the team accepts them.
+  2. Run targeted tests first, then workspace checks.
+  3. Manually smoke-test `/mode`, F2/Ctrl+Tab, approval overlay, `/config show`, `doctor`, and `ask` under each config permission value.
+- **Acceptance Criteria:** Tests pass and no runtime UI/CLI path can switch permissions outside config.
 - **Testing Suggestions:**
-  - `cargo test -p mimo-tui slash_menu`
   - `cargo fmt --check`
   - `cargo check`
   - `cargo clippy --workspace -- -D warnings`
   - `cargo test --workspace`
-- **Done When:**
-  - Les tests ciblés et la validation workspace confirment que le menu slash est entièrement navigable.
 
 ## Final Integration & Verification
 
 - **System-Wide Test:**
-  1. Lancer `cargo run`.
-  2. Taper `/` dans l'input.
-  3. Descendre avec `Down` au-delà de `/export`.
-  4. Vérifier que `/config`, `/status`, puis les commandes plus basses deviennent visibles.
-  5. Aller jusqu'à la fin de la liste et vérifier que `/mcp` est visible.
-  6. Appuyer sur `Tab` sur une commande tardive et vérifier que la commande sélectionnée est insérée.
-  7. Remonter avec `Up` et vérifier que le menu remonte correctement.
+  1. With no `permissions` key, launch TUI and confirm header/status shows `prompt` permissions.
+  2. Confirm `/mode` shows/switches only `agent` and `plan`.
+  3. Confirm F2/Ctrl+Tab toggles only between `agent` and `plan` and does not alter permissions.
+  4. Trigger a mutating tool in foreground TUI with `permissions = "prompt"`; approval overlay should offer only approve/deny.
+  5. Set `permissions = "read_only"`; mutating tools should be denied.
+  6. Set `permissions = "auto"`; mutating tools should run without approval.
+  7. Run `cargo run -- doctor` and confirm permissions/source are shown.
+  8. Run `cargo run -- ask "..."` with each permission value and confirm prompt-required tools are denied unless policy is `auto`.
 - **Completion Checklist:**
-  - [ ] Composant identifié: `App::render_slash_menu_overlay()` dans `crates/mimo-tui/src/app.rs`.
-  - [ ] État de scroll slash ajouté et initialisé.
-  - [ ] Rendu Ratatui applique `.scroll(...)` sur le contenu du menu.
-  - [ ] La sélection reste visible avec `adjust_selection_scroll(...)`.
-  - [ ] `Up`/`Down` permettent d'atteindre toutes les commandes.
-  - [ ] `Home`/`End` et éventuellement `PageUp`/`PageDown` fonctionnent sans voler le scroll conversation hors menu.
-  - [ ] Les commandes après `/export` sont visibles et sélectionnables.
-  - [ ] Tests ciblés ajoutés.
-  - [ ] `cargo fmt --check`, `cargo check`, `cargo clippy --workspace -- -D warnings`, et `cargo test --workspace` passent.
+  - [ ] Product references to the removed mode are gone.
+  - [ ] `AppMode` has only `Plan` and `Agent`.
+  - [ ] `/mode` accepts only `plan`/`agent` plus retained numeric aliases if any.
+  - [ ] Permission policy loads from `config.toml` with safe default.
+  - [ ] No CLI arg, env var, keybinding, palette action, or approval-prompt shortcut changes permissions.
+  - [ ] Foreground TUI, background tasks, and CLI ask all use config-backed permission decisions.
+  - [ ] README and tests are updated.
 
 ## Open Questions
 
-- Faut-il implémenter la molette immédiatement, ou considérer le défilement clavier complet comme suffisant pour ce correctif ciblé ? Recommandation: livrer d'abord le clavier; ajouter la molette seulement si le support souris est explicitement souhaité.
+- Should legacy saved sessions/tasks with the removed serialized mode be accepted and normalized to `agent`, or is strict failure acceptable? Recommendation: normalize to `agent` to avoid breaking user state, while never serializing or exposing the removed mode again.

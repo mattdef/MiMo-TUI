@@ -8,7 +8,7 @@
 - `cargo test --workspace` — run the full workspace test suite
 - `cargo test <test_name>` — run a single test or a filtered subset by name
 - `cargo run` — launch the TUI
-- `cargo run -- doctor` — print the resolved config, model, and API key status
+- `cargo run -- doctor` — print the resolved config, permission policy, model, and API key status
 - `cargo run -- ask "your prompt"` — exercise the MiMo API path without opening the TUI
 
 ## High-level architecture
@@ -36,5 +36,5 @@
 
 - The default config file is `~/.config/mimo-tui/config.toml`.
 - `MIMO_TUI_CONFIG` overrides the config file location.
-- `MIMO_API_KEY`, `MIMO_BASE_URL`, `MIMO_MODEL`, and `MIMO_TEMPERATURE` are the supported environment variables.
+- `MIMO_API_KEY`, `MIMO_BASE_URL`, `MIMO_MODEL`, and `MIMO_TEMPERATURE` are the supported environment variables. Tool permissions are configured only in `config.toml`.
 - The repository is now a Cargo workspace with separate crates for CLI, config, protocol, client, tools, state, agent, TUI-core, and TUI runtime.

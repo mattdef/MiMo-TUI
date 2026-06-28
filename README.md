@@ -6,7 +6,7 @@
 
 ## What it does
 
-MiMo-TUI turns your terminal into a capable AI coding workspace. Type a prompt, get a streamed response. In the TUI, MiMo can read your files, run shell commands, apply patches, or review your git diff — it asks for approval before mutating actions unless you switch to `yolo` mode. The non-interactive `ask` command only auto-approves read-only tools.
+MiMo-TUI turns your terminal into a capable AI coding workspace. Type a prompt, get a streamed response. In the TUI, MiMo can read your files, run shell commands, apply patches, or review your git diff — mutating actions follow the permission policy configured in `config.toml`. The non-interactive `ask` command auto-approves read-only tools and only runs mutating tools when `permissions = "auto"`.
 
 **Highlights:**
 
@@ -32,7 +32,7 @@ One-shot from the command line:
 
 ```bash
 cargo run -- ask "What makes MiMo v2.5 good for coding?"
-cargo run -- doctor    # show resolved config and API key status
+cargo run -- doctor    # show resolved config, permissions, and API key status
 cargo run -- models    # list available models
 cargo run -- sessions  # list saved sessions
 ```
@@ -74,6 +74,7 @@ Create `~/.config/mimo-tui/config.toml` — or use environment variables:
 api_key      = "your-api-key"
 model        = "mimo-v2-flash"          # or mimo-v2.5, mimo-v2.5-pro
 temperature  = 0.2
+permissions  = "prompt"                  # read_only | prompt | auto
 # base_url defaults to https://api.xiaomimimo.com/v1
 ```
 
@@ -86,17 +87,21 @@ temperature  = 0.2
 | `MIMO_TUI_CONFIG` | Custom config file path |
 
 Config can also be edited live inside the TUI with `/config`.
+Permissions are file-only; edit `config.toml` directly.
 
 ---
 
-## Execution modes and approvals
+## Execution modes and permissions
 
-- **plan** — read-only workflow: mutating tools are denied.
-- **agent** — normal workflow: mutating tools require approval.
-- **yolo** — all tool requests are auto-approved.
-  ⚠️ **Warning:** `yolo` mode executes shell commands, file writes, and network requests without confirmation. Use only in trusted environments.
+- **plan** — planning workflow: the assistant analyzes and proposes steps.
+- **agent** — execution workflow: tool requests follow the configured permission policy.
+- **permissions** — file-only setting in `config.toml`:
 
-For one-shot CLI use, `cargo run -- ask "..."` only auto-approves read-only tools and denies mutating ones.
+  ```toml
+  permissions = "prompt"  # read_only | prompt | auto
+  ```
+
+For one-shot CLI use, `cargo run -- ask "..."` follows the same permission policy.
 
 ---
 
@@ -107,7 +112,7 @@ For one-shot CLI use, `cargo run -- ask "..."` only auto-approves read-only tool
 | `Enter` | Send prompt |
 | `Ctrl+J` / `Shift+Enter` | New line in draft |
 | `F1` / `?` | Open help |
-| `F2` / `Ctrl+Tab` | Cycle plan / agent / yolo modes |
+| `F2` / `Ctrl+Tab` | Cycle plan / agent modes |
 | `Ctrl+K` | Command palette |
 | `Ctrl+R` | Session picker |
 | `Ctrl+L` | Open the latest-message pager |
@@ -117,10 +122,10 @@ For one-shot CLI use, `cargo run -- ask "..."` only auto-approves read-only tool
 | `Tab` | Slash-command completion |
 | `@path` + `Tab` | Attach a file or directory |
 | `Esc` | Cancel generation / close overlay |
-| `y / n / a / r / p` | Approve, deny, or change approval mode in a tool prompt |
+| `y / n / r / p` | Approve or deny a tool request, or switch workflow modes |
 | `/clear` `/save` `/load` | Manage conversation |
 | `/branch` `/branches` `/switch` | Create, list, and change conversation branches |
-| `/mode [agent\|plan\|yolo]` | Switch execution mode |
+| `/mode [agent\|plan]` | Switch execution mode |
 | `/model [id\|auto]` | Change or auto-route model |
 | `/plan` `/note` `/recall` | Checklist, memory, search |
 | `/review` `/lsp` | Code review and diagnostics |

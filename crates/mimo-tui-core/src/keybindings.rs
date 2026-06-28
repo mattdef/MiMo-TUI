@@ -47,7 +47,7 @@ pub const KEYBINDINGS: &[KeybindingInfo] = &[
     },
     KeybindingInfo {
         chord: "F2 / Ctrl+Tab",
-        description: "Cycle between plan, agent, and yolo modes.",
+        description: "Cycle between plan and agent modes.",
     },
     KeybindingInfo {
         chord: "@path + Tab",
@@ -94,7 +94,7 @@ pub const KEYBINDINGS: &[KeybindingInfo] = &[
         description: "Close overlays, cancel a generation, or quit.",
     },
     KeybindingInfo {
-        chord: "y / n / a / r / p",
-        description: "Approve, deny, or change approval mode in the tool prompt.",
+        chord: "y / n / r / p",
+        description: "Approve or deny the current tool request, or switch workflow modes.",
     },
 ];

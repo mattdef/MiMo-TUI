@@ -13,6 +13,7 @@ const DEFAULT_MODEL: &str = "mimo-v2-flash";
 const DEFAULT_TEMPERATURE: f32 = 0.2;
 pub const AUTO_MODEL: &str = "auto";
 const KNOWN_MIMO_MODELS: &[&str] = &["mimo-v2-flash", "mimo-v2.5", "mimo-v2.5-pro"];
+const DEFAULT_PERMISSION_POLICY: PermissionPolicy = PermissionPolicy::Prompt;
 const DEFAULT_SYSTEM_PROMPT: &str = r#"You are MiMo TUI, a terminal assistant specialised for Xiaomi MiMo models.
 Answer concisely, preserve technical accuracy, and adapt to developer workflows.
 When the user asks for code, prefer small, practical changes and explain tradeoffs."#;
@@ -25,6 +26,7 @@ pub struct ConfigOverrides {
     pub base_url: Option<String>,
     pub model: Option<String>,
     pub temperature: Option<f32>,
+    pub permissions: Option<PermissionPolicy>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +36,26 @@ pub enum ConfigValueSource {
     File,
     WorkspaceInstructions,
     Default,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionPolicy {
+    #[serde(alias = "read-only")]
+    ReadOnly,
+    #[default]
+    Prompt,
+    Auto,
+}
+
+impl fmt::Display for PermissionPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReadOnly => formatter.write_str("read_only"),
+            Self::Prompt => formatter.write_str("prompt"),
+            Self::Auto => formatter.write_str("auto"),
+        }
+    }
 }
 
 impl fmt::Display for ConfigValueSource {
@@ -54,12 +76,14 @@ pub struct AppConfig {
     pub base_url: String,
     pub model: String,
     pub temperature: f32,
+    pub permissions: PermissionPolicy,
     pub system_prompt: String,
     pub config_path: PathBuf,
     pub api_key_source: ConfigValueSource,
     pub base_url_source: ConfigValueSource,
     pub model_source: ConfigValueSource,
     pub temperature_source: ConfigValueSource,
+    pub permissions_source: ConfigValueSource,
     pub system_prompt_source: ConfigValueSource,
 }
 
@@ -73,6 +97,8 @@ struct FileConfig {
     model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    permissions: Option<PermissionPolicy>,
     #[serde(skip_serializing_if = "Option::is_none")]
     system_prompt: Option<String>,
 }
@@ -119,6 +145,17 @@ impl AppConfig {
         ]);
         let temperature = temperature.unwrap_or(DEFAULT_TEMPERATURE);
 
+        let (permissions, permissions_source) = {
+            let (permissions, permissions_source) = pick_permission([
+                (ConfigValueSource::Cli, overrides.permissions),
+                (ConfigValueSource::File, file_config.permissions),
+            ]);
+            match permissions {
+                Some(permissions) => (permissions, permissions_source),
+                None => resolve_permissions(None),
+            }
+        };
+
         let (base_system_prompt, base_system_prompt_source) =
             pick_string([(ConfigValueSource::File, file_config.system_prompt)]);
         let workspace_root = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -133,12 +170,14 @@ impl AppConfig {
             base_url,
             model,
             temperature,
+            permissions,
             system_prompt,
             config_path,
             api_key_source,
             base_url_source,
             model_source,
             temperature_source,
+            permissions_source,
             system_prompt_source,
         })
     }
@@ -231,6 +270,26 @@ fn resolve_system_prompt(
         )),
         None => Ok((base_system_prompt, base_system_prompt_source)),
     }
+}
+
+fn resolve_permissions(
+    file_permissions: Option<PermissionPolicy>,
+) -> (PermissionPolicy, ConfigValueSource) {
+    match file_permissions {
+        Some(permissions) => (permissions, ConfigValueSource::File),
+        None => (DEFAULT_PERMISSION_POLICY, ConfigValueSource::Default),
+    }
+}
+
+fn pick_permission<const N: usize>(
+    values: [(ConfigValueSource, Option<PermissionPolicy>); N],
+) -> (Option<PermissionPolicy>, ConfigValueSource) {
+    for (source, value) in values {
+        if let Some(value) = value {
+            return (Some(value), source);
+        }
+    }
+    (None, ConfigValueSource::Default)
 }
 
 fn append_workspace_instructions(
@@ -504,9 +563,9 @@ mod tests {
     use std::fs;
 
     use super::{
-        ConfigValueSource, DEFAULT_SYSTEM_PROMPT, WORKSPACE_INSTRUCTIONS_MAX_BYTES,
-        discover_workspace_instructions, known_mimo_models, normalize_base_url,
-        normalize_model_name, resolve_system_prompt,
+        ConfigValueSource, DEFAULT_SYSTEM_PROMPT, PermissionPolicy,
+        WORKSPACE_INSTRUCTIONS_MAX_BYTES, discover_workspace_instructions, known_mimo_models,
+        normalize_base_url, normalize_model_name, resolve_permissions, resolve_system_prompt,
     };
 
     #[test]
@@ -546,6 +605,36 @@ mod tests {
             ConfigValueSource::WorkspaceInstructions.to_string(),
             "workspace instructions"
         );
+    }
+
+    #[test]
+    fn permission_policy_display_is_human_readable() {
+        assert_eq!(PermissionPolicy::ReadOnly.to_string(), "read_only");
+        assert_eq!(PermissionPolicy::Prompt.to_string(), "prompt");
+        assert_eq!(PermissionPolicy::Auto.to_string(), "auto");
+    }
+
+    #[test]
+    fn parses_permission_policy_from_toml() {
+        let file_config: super::FileConfig =
+            toml::from_str(r#"permissions = "read_only""#).expect("parse config");
+        assert_eq!(file_config.permissions, Some(PermissionPolicy::ReadOnly));
+    }
+
+    #[test]
+    fn defaults_permission_policy_to_prompt_when_missing() {
+        let (permissions, source) = resolve_permissions(None);
+
+        assert_eq!(permissions, PermissionPolicy::Prompt);
+        assert_eq!(source, ConfigValueSource::Default);
+    }
+
+    #[test]
+    fn uses_file_permission_policy_when_configured() {
+        let (permissions, source) = resolve_permissions(Some(PermissionPolicy::Auto));
+
+        assert_eq!(permissions, PermissionPolicy::Auto);
+        assert_eq!(source, ConfigValueSource::File);
     }
 
     #[test]
