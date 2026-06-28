@@ -894,6 +894,7 @@ dependencies = [
  "mimo-tui-core",
  "ratatui",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

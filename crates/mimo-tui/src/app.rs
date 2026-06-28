@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    path::PathBuf,
     process::Command,
     sync::{Arc, Mutex},
 };
@@ -156,6 +157,16 @@ struct MessagePagerState {
     scroll: u16,
 }
 
+// Cache the last attachment search and preview so unchanged queries do not rescan the filesystem.
+#[derive(Debug, Default)]
+struct AttachmentPickerCache {
+    search_base_dir: Option<PathBuf>,
+    search_raw: Option<String>,
+    results: Option<attachments::AttachmentSearchResults>,
+    preview_suggestion: Option<attachments::AttachmentSuggestion>,
+    preview: Option<attachments::AttachmentPreview>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InspectorBrowserKind {
     Tasks,
@@ -214,6 +225,8 @@ pub struct App {
     draft_history: Vec<String>,
     draft_stash: Vec<String>,
     attachments: Vec<FileAttachment>,
+    attachment_picker: attachments::AttachmentPickerState,
+    attachment_picker_cache: AttachmentPickerCache,
     active_skills: Vec<String>,
     diagnostics: Option<diagnostics_store::DiagnosticsSnapshot>,
     diagnostics_auto_run: bool,
@@ -280,6 +293,8 @@ impl App {
             draft_history: Vec::new(),
             draft_stash: Vec::new(),
             attachments: Vec::new(),
+            attachment_picker: attachments::AttachmentPickerState::default(),
+            attachment_picker_cache: AttachmentPickerCache::default(),
             active_skills: Vec::new(),
             diagnostics,
             diagnostics_auto_run: false,
@@ -325,6 +340,8 @@ impl App {
             self.render_model_picker_overlay(frame, area);
         } else if self.message_pager.open {
             self.render_message_pager_overlay(frame, area);
+        } else if self.attachment_picker.is_visible() {
+            self.render_attachment_picker_overlay(frame, area);
         } else if self.slash_menu_visible() {
             self.render_slash_menu_overlay(frame, area);
         }
@@ -481,6 +498,10 @@ impl App {
                     return self.handle_branch_selection_key(key);
                 }
 
+                if self.attachment_picker.is_visible() && self.handle_attachment_picker_key(key)? {
+                    return Ok(false);
+                }
+
                 if opens_help(key, self.input.is_empty()) {
                     self.open_help(None);
                     return Ok(false);
@@ -523,8 +544,12 @@ impl App {
                     return Ok(true);
                 }
 
+                let mut refresh_attachment_picker = false;
                 match key.code {
-                    KeyCode::Enter if inserts_newline(key) => self.input.insert_char('\n'),
+                    KeyCode::Enter if inserts_newline(key) => {
+                        self.input.insert_char('\n');
+                        refresh_attachment_picker = true;
+                    }
                     KeyCode::Enter => {
                         if self.submit(event_tx)? {
                             return Ok(true);
@@ -542,18 +567,36 @@ impl App {
                             self.status = format!("Removed attachment: {}", attachment.path);
                         }
                     }
-                    KeyCode::Backspace => self.input.backspace(),
-                    KeyCode::Delete => self.input.delete(),
-                    KeyCode::Left => self.input.move_left(),
-                    KeyCode::Right => self.input.move_right(),
+                    KeyCode::Backspace => {
+                        self.input.backspace();
+                        refresh_attachment_picker = true;
+                    }
+                    KeyCode::Delete => {
+                        self.input.delete();
+                        refresh_attachment_picker = true;
+                    }
+                    KeyCode::Left => {
+                        self.input.move_left();
+                        refresh_attachment_picker = true;
+                    }
+                    KeyCode::Right => {
+                        self.input.move_right();
+                        refresh_attachment_picker = true;
+                    }
                     KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         self.scroll = 0
                     }
                     KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         self.scroll_to_bottom()
                     }
-                    KeyCode::Home => self.input.move_to_line_start(),
-                    KeyCode::End => self.input.move_to_line_end(),
+                    KeyCode::Home => {
+                        self.input.move_to_line_start();
+                        refresh_attachment_picker = true;
+                    }
+                    KeyCode::End => {
+                        self.input.move_to_line_end();
+                        refresh_attachment_picker = true;
+                    }
                     KeyCode::PageUp => self.scroll_page_up(),
                     KeyCode::PageDown => self.scroll_page_down(),
                     KeyCode::Up if self.slash_menu_visible() => {
@@ -567,12 +610,15 @@ impl App {
                     KeyCode::Down => self.scroll_by(1),
                     KeyCode::Char('a' | 'A') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         self.input.move_to_line_start();
+                        refresh_attachment_picker = true;
                     }
                     KeyCode::Char('e' | 'E') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         self.input.move_to_line_end();
+                        refresh_attachment_picker = true;
                     }
                     KeyCode::Char('j' | 'J') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         self.input.insert_char('\n');
+                        refresh_attachment_picker = true;
                     }
                     KeyCode::Char('u' | 'U') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         self.clear_current_draft();
@@ -584,13 +630,19 @@ impl App {
                     {
                         self.input.insert_char(c);
                         self.clamp_slash_menu_selection();
+                        refresh_attachment_picker = true;
                     }
                     _ => {}
+                }
+
+                if refresh_attachment_picker {
+                    self.sync_attachment_picker();
                 }
             }
             Event::Paste(text) => {
                 self.input.insert_str(&text);
                 self.clamp_slash_menu_selection();
+                self.sync_attachment_picker();
             }
             _ => {}
         }
@@ -965,6 +1017,7 @@ impl App {
             && !self.message_pager.open
             && !self.inspector_browser.open
             && self.tool_runtime.pending_approval.is_none()
+            && !self.attachment_picker.is_visible()
             && !self.slash_menu_visible()
         {
             self.set_input_cursor(frame, inner, visible_lines, cursor_line, cursor_col);
@@ -1079,6 +1132,7 @@ impl App {
             && !self.message_pager.open
             && !self.inspector_browser.open
             && self.tool_runtime.pending_approval.is_none()
+            && !self.attachment_picker.is_visible()
             && !self.slash_menu_visible()
         {
             self.set_input_cursor(frame, draft_area, visible_lines, cursor_line, cursor_col);
@@ -1551,6 +1605,137 @@ impl App {
         );
     }
 
+    fn render_attachment_picker_overlay(&mut self, frame: &mut Frame, area: Rect) {
+        let popup = centered_rect(area, 92, 80);
+        frame.render_widget(Clear, popup);
+
+        let split_vertical = popup.width < 84 || popup.height < 14;
+        let panels = if split_vertical {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+                .split(popup)
+        } else {
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+                .split(popup)
+        };
+
+        let suggestion_title = format!(
+            "Matches ({}) · ↑/↓ move · Tab/Enter attach · Esc cancel",
+            self.attachment_picker.suggestions.len()
+        );
+        let suggestion_block = Block::default()
+            .title(suggestion_title)
+            .borders(Borders::ALL)
+            .border_style(panel_border_style());
+        let suggestion_inner = suggestion_block.inner(panels[0]);
+        frame.render_widget(suggestion_block, panels[0]);
+
+        let suggestion_body_height = suggestion_inner.height.max(1) as usize;
+        self.attachment_picker.scroll = adjust_selection_scroll(
+            self.attachment_picker.selected,
+            self.attachment_picker.scroll,
+            suggestion_body_height,
+        );
+        let mut suggestion_lines = self
+            .attachment_picker
+            .suggestions
+            .iter()
+            .enumerate()
+            .map(|(index, suggestion)| {
+                let prefix = if index == self.attachment_picker.selected {
+                    "> "
+                } else {
+                    "  "
+                };
+                let style = if index == self.attachment_picker.selected {
+                    Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                Line::styled(
+                    format!(
+                        "{prefix}[{}] {}",
+                        suggestion.kind.label(),
+                        suggestion.display_path
+                    ),
+                    style,
+                )
+            })
+            .collect::<Vec<_>>();
+        if let Some(status) = &self.attachment_picker.status {
+            if !suggestion_lines.is_empty() {
+                suggestion_lines.push(Line::raw(""));
+            }
+            suggestion_lines.push(Line::styled(
+                status.clone(),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        if suggestion_lines.is_empty() {
+            suggestion_lines.push(Line::styled(
+                "No attachment matches",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        frame.render_widget(
+            Paragraph::new(Text::from(suggestion_lines))
+                .wrap(Wrap { trim: false })
+                .scroll((self.attachment_picker.scroll, 0)),
+            suggestion_inner,
+        );
+
+        let preview_block = Block::default()
+            .title("Preview")
+            .borders(Borders::ALL)
+            .border_style(panel_border_style());
+        let preview_inner = preview_block.inner(panels[1]);
+        frame.render_widget(preview_block, panels[1]);
+
+        let mut preview_lines = Vec::new();
+        if let Some(preview) = &self.attachment_picker.preview {
+            preview_lines.extend(
+                preview
+                    .metadata
+                    .iter()
+                    .map(|line| Line::styled(line.clone(), Style::default().fg(Color::Cyan))),
+            );
+            if !preview.metadata.is_empty() && (!preview.lines.is_empty() || preview.note.is_some())
+            {
+                preview_lines.push(Line::raw(""));
+            }
+            preview_lines.extend(preview.lines.iter().map(|line| Line::raw(line.clone())));
+            if let Some(note) = &preview.note {
+                if !preview.lines.is_empty() {
+                    preview_lines.push(Line::raw(""));
+                }
+                preview_lines.push(Line::styled(
+                    note.clone(),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+        } else if let Some(status) = &self.attachment_picker.status {
+            preview_lines.push(Line::styled(
+                status.clone(),
+                Style::default().fg(Color::DarkGray),
+            ));
+        } else {
+            preview_lines.push(Line::styled(
+                "Select a suggestion to preview it",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+
+        frame.render_widget(
+            Paragraph::new(Text::from(preview_lines)).wrap(Wrap { trim: false }),
+            preview_inner,
+        );
+    }
+
     fn render_filter_box(&self, frame: &mut Frame, area: Rect, input: &InputBuffer, title: &str) {
         let filter_visible_lines = area.height.saturating_sub(2).max(1) as usize;
         let (filter_line, _) = input.cursor_line_col();
@@ -1762,28 +1947,219 @@ impl App {
         false
     }
 
+    fn clear_attachment_picker(&mut self) {
+        self.attachment_picker = attachments::AttachmentPickerState::default();
+    }
+
+    fn dismiss_attachment_picker(&mut self) {
+        if let Some(query) = self.attachment_picker.query.clone() {
+            self.attachment_picker.dismissed_query = Some(query);
+            self.attachment_picker.open = false;
+        }
+    }
+
+    fn refresh_attachment_picker_preview(&mut self) {
+        let selected = self.attachment_picker.selected_suggestion().cloned();
+        self.attachment_picker.preview =
+            selected.map(|suggestion| self.attachment_preview_for(&suggestion));
+    }
+
+    fn attachment_suggestions_for(
+        &mut self,
+        query: &attachments::AttachmentQuery,
+    ) -> attachments::AttachmentSearchResults {
+        let workspace_root = self.tool_context.workspace_root.clone();
+        let cache_hit = self.attachment_picker_cache.search_base_dir.as_ref()
+            == Some(&workspace_root)
+            && self.attachment_picker_cache.search_raw.as_deref() == Some(query.raw.as_str());
+
+        if cache_hit && let Some(results) = &self.attachment_picker_cache.results {
+            return results.clone();
+        }
+
+        let results = attachments::discover_attachment_suggestions(query, workspace_root.as_path());
+        self.attachment_picker_cache.search_base_dir = Some(workspace_root);
+        self.attachment_picker_cache.search_raw = Some(query.raw.clone());
+        self.attachment_picker_cache.results = Some(results.clone());
+        results
+    }
+
+    fn attachment_preview_for(
+        &mut self,
+        suggestion: &attachments::AttachmentSuggestion,
+    ) -> attachments::AttachmentPreview {
+        if self.attachment_picker_cache.preview_suggestion.as_ref() == Some(suggestion)
+            && let Some(preview) = &self.attachment_picker_cache.preview
+        {
+            return preview.clone();
+        }
+
+        let preview = attachments::build_attachment_preview(suggestion);
+        self.attachment_picker_cache.preview_suggestion = Some(suggestion.clone());
+        self.attachment_picker_cache.preview = Some(preview.clone());
+        preview
+    }
+
+    fn sync_attachment_picker(&mut self) {
+        let Some(query) = attachments::current_attachment_query(&self.input) else {
+            self.clear_attachment_picker();
+            return;
+        };
+
+        if self.attachment_picker.dismissed_query.as_ref() == Some(&query) {
+            self.attachment_picker.query = Some(query);
+            self.attachment_picker.open = false;
+            return;
+        }
+
+        let query_changed = self.attachment_picker.query.as_ref() != Some(&query);
+        if !query_changed && self.attachment_picker.is_visible() {
+            return;
+        }
+
+        let results = self.attachment_suggestions_for(&query);
+        self.attachment_picker.query = Some(query);
+        self.attachment_picker.dismissed_query = None;
+        self.attachment_picker.open = true;
+        self.attachment_picker.suggestions = results.suggestions;
+        self.attachment_picker.status = results.status;
+        if query_changed {
+            self.attachment_picker.selected = 0;
+            self.attachment_picker.scroll = 0;
+        }
+        self.attachment_picker.clamp_selected();
+        self.refresh_attachment_picker_preview();
+    }
+
+    fn move_attachment_picker_selection(&mut self, delta: i32) {
+        if self.attachment_picker.suggestions.is_empty() || delta == 0 {
+            return;
+        }
+
+        let step = delta.signum();
+        let last_index = self.attachment_picker.suggestions.len().saturating_sub(1) as i32;
+        let next_index =
+            (self.attachment_picker.selected as i32 + step).clamp(0, last_index) as usize;
+        if next_index == self.attachment_picker.selected {
+            return;
+        }
+        self.attachment_picker.selected = next_index;
+        self.refresh_attachment_picker_preview();
+    }
+
+    fn confirm_attachment_picker_selection(&mut self) {
+        let Some(query) = self.attachment_picker.query.clone() else {
+            return;
+        };
+
+        // Prefer the exact path the user typed when it already exists.
+        let workspace_root = self.tool_context.workspace_root.clone();
+        match attachments::try_attach_from_query_if_exists(
+            &mut self.input,
+            &mut self.attachments,
+            workspace_root.as_path(),
+            &query,
+        ) {
+            Ok(Some(status)) => {
+                self.status = status;
+                self.clear_attachment_picker();
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.status = error.to_string();
+                return;
+            }
+        }
+
+        if let Some(suggestion) = self.attachment_picker.selected_suggestion().cloned() {
+            match attachments::try_attach_suggestion(
+                &mut self.input,
+                &mut self.attachments,
+                &query,
+                &suggestion,
+            ) {
+                Ok(Some(status)) => {
+                    self.status = status;
+                    self.clear_attachment_picker();
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.status = error.to_string();
+                }
+            }
+            return;
+        }
+
+        match attachments::try_attach_from_input(&mut self.input, &mut self.attachments) {
+            Ok(Some(status)) => {
+                self.status = status;
+                self.clear_attachment_picker();
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.status = error.to_string();
+            }
+        }
+    }
+
+    fn handle_attachment_picker_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if closes_overlay(key) {
+            self.dismiss_attachment_picker();
+            return Ok(true);
+        }
+
+        match key.code {
+            KeyCode::Up => {
+                self.move_attachment_picker_selection(-1);
+                Ok(true)
+            }
+            KeyCode::Down => {
+                self.move_attachment_picker_selection(1);
+                Ok(true)
+            }
+            KeyCode::Tab if key.modifiers.is_empty() => {
+                self.confirm_attachment_picker_selection();
+                Ok(true)
+            }
+            KeyCode::Enter if key.modifiers.is_empty() => {
+                self.confirm_attachment_picker_selection();
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     fn handle_tab_key(&mut self) -> Result<bool> {
         if self.slash_menu_visible() {
             let entries = self.slash_menu_entries();
             if let Some(entry) = entries.get(self.slash_menu_selected) {
                 self.input.set_text(entry.insertion_text());
+                self.clear_attachment_picker();
                 self.status = format!("Command selected: /{}", entry.command.name);
                 self.slash_menu_selected = 0;
                 return Ok(true);
             }
             if let Some(completed) = slash_menu::autocomplete_input(self.input.trim()) {
                 self.input.set_text(completed.clone());
+                self.clear_attachment_picker();
                 self.status = format!("Command completed: {}", completed.trim_end());
                 self.slash_menu_selected = 0;
                 return Ok(true);
             }
         }
 
-        if let Some(status) =
-            attachments::try_attach_from_input(&mut self.input, &mut self.attachments)?
-        {
-            self.status = status;
-            return Ok(true);
+        match attachments::try_attach_from_input(&mut self.input, &mut self.attachments) {
+            Ok(Some(status)) => {
+                self.status = status;
+                self.clear_attachment_picker();
+                return Ok(true);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.status = error.to_string();
+                return Ok(true);
+            }
         }
 
         Ok(false)
@@ -1838,6 +2214,7 @@ impl App {
         };
         self.scroll_to_bottom();
         self.attachments.clear();
+        self.clear_attachment_picker();
         let tool_context = self.tool_context.child_operation();
         let tool_registry = self.tool_registry.clone();
         let approval_mode = Arc::clone(&self.approval_mode_shared);
@@ -1954,6 +2331,7 @@ impl App {
     ) -> Result<bool> {
         self.event_tx = Some(event_tx.clone());
         self.input.clear();
+        self.clear_attachment_picker();
         match commands::parse_slash_command(command_line) {
             Ok(command) => self.execute_command(command, event_tx),
             Err(CommandParseError::NotACommand) => Ok(false),
@@ -2221,6 +2599,7 @@ impl App {
             return;
         };
 
+        self.clear_attachment_picker();
         self.branch_selection.open = true;
         self.branch_selection.selected = selected.saturating_sub(1);
         self.ensure_branch_selection_visible();
@@ -2874,6 +3253,7 @@ impl App {
             return;
         }
 
+        self.clear_attachment_picker();
         self.messages.clear();
         self.conversation_tree = ConversationTree::new();
         self.assistant_index = None;
@@ -2891,6 +3271,7 @@ impl App {
             remember_draft(&mut self.draft_history, &draft);
         }
         self.input.clear();
+        self.clear_attachment_picker();
         self.status = "Draft cleared".to_string();
     }
 
@@ -2902,6 +3283,7 @@ impl App {
         }
         remember_draft(&mut self.draft_stash, &draft);
         self.input.clear();
+        self.clear_attachment_picker();
         self.status = "Draft stashed".to_string();
     }
 
@@ -3088,6 +3470,7 @@ impl App {
     }
 
     fn open_help(&mut self, topic: Option<&str>) {
+        self.clear_attachment_picker();
         self.help.open = true;
         self.help.scroll = 0;
         self.help.filter.set_text(topic.unwrap_or_default());
@@ -3099,6 +3482,7 @@ impl App {
     }
 
     fn open_model_picker(&mut self, event_tx: UnboundedSender<AppEvent>) {
+        self.clear_attachment_picker();
         self.refresh_model_picker_catalog();
         self.model_picker.scroll = 0;
         self.model_picker.open = true;
@@ -3116,6 +3500,7 @@ impl App {
             self.status = "No saved sessions yet".to_string();
             return Ok(());
         }
+        self.clear_attachment_picker();
         self.session_picker.open = true;
         self.session_picker.entries = entries;
         self.session_picker.selected = 0;
@@ -3125,6 +3510,7 @@ impl App {
     }
 
     fn open_command_palette(&mut self) {
+        self.clear_attachment_picker();
         self.command_palette = CommandPaletteState::default();
         self.command_palette.open = true;
         self.status = "Command palette opened".to_string();
@@ -3152,6 +3538,7 @@ impl App {
             };
             return;
         }
+        self.clear_attachment_picker();
         self.draft_browser.open = true;
         self.draft_browser.kind = kind;
         self.draft_browser.selected = 0;
@@ -3170,6 +3557,7 @@ impl App {
             };
             return Ok(());
         }
+        self.clear_attachment_picker();
         self.inspector_browser.open = true;
         self.inspector_browser.kind = kind;
         self.inspector_browser.selected = 0;
@@ -3197,6 +3585,7 @@ impl App {
     }
 
     fn open_text_pager(&mut self, title: impl Into<String>, content: impl Into<String>) {
+        self.clear_attachment_picker();
         self.message_pager.open = true;
         self.message_pager.title = title.into();
         self.message_pager.lines = markdown::render_markdown_lines(&content.into());
@@ -3284,6 +3673,7 @@ impl App {
         self.diagnostics_auto_run = lsp_auto_run;
         self.plan_items = plan_items;
         self.attachments = attachments;
+        self.clear_attachment_picker();
         self.assistant_index = None;
         self.assistant_message_id = None;
         self.tool_runtime.clear_transient();
@@ -3303,6 +3693,8 @@ impl App {
             return;
         };
         self.input.set_text(draft);
+        self.clear_attachment_picker();
+        self.sync_attachment_picker();
         self.draft_browser = DraftBrowserState::default();
         self.status = "Draft restored".to_string();
     }
@@ -3915,7 +4307,10 @@ fn closes_overlay(key: KeyEvent) -> bool {
 fn is_quit_key(key: KeyEvent, input_is_empty: bool) -> bool {
     matches!(key.code, KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL))
         || (input_is_empty
-            && matches!(key.code, KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL)))
+            && matches!(
+                key.code,
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL)
+            ))
 }
 
 fn model_catalog(current_model: &str, discovered_models: &[String]) -> Vec<String> {
@@ -4334,10 +4729,12 @@ fn should_refresh_diagnostics(request: &ToolRequest) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{fs, path::PathBuf};
 
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use dirs::home_dir;
     use ratatui::{Terminal, backend::TestBackend};
+    use tempfile::tempdir;
     use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
@@ -4379,6 +4776,28 @@ mod tests {
             screen.push('\n');
         }
         screen
+    }
+
+    fn attachment_query(text: &str) -> attachments::AttachmentQuery {
+        attachments::current_attachment_query(&mimo_tui_core::input::InputBuffer::from(text))
+            .expect("query should exist")
+    }
+
+    fn prepare_attachment_picker(
+        app: &mut App,
+        query: attachments::AttachmentQuery,
+        results: attachments::AttachmentSearchResults,
+    ) {
+        app.attachment_picker = attachments::AttachmentPickerState {
+            query: Some(query),
+            dismissed_query: None,
+            open: true,
+            selected: 0,
+            scroll: 0,
+            suggestions: results.suggestions,
+            preview: None,
+            status: results.status,
+        };
     }
 
     #[test]
@@ -4648,17 +5067,46 @@ mod tests {
     fn slash_commands_clear_the_draft() {
         let mut app = test_app();
         app.input.insert_str("/status");
+        app.attachment_picker = attachments::AttachmentPickerState {
+            query: Some(attachments::AttachmentQuery {
+                token_start: 0,
+                token_end: 1,
+                raw: String::new(),
+            }),
+            dismissed_query: None,
+            open: true,
+            selected: 0,
+            scroll: 0,
+            suggestions: Vec::new(),
+            preview: None,
+            status: Some("open".to_string()),
+        };
 
         let (event_tx, _event_rx) = unbounded_channel();
         app.handle_slash_command("/status", event_tx)
             .expect("slash command should execute");
 
         assert!(app.input.is_empty());
+        assert!(!app.attachment_picker.is_visible());
     }
 
     #[test]
     fn models_command_opens_picker() {
         let mut app = test_app();
+        app.attachment_picker = attachments::AttachmentPickerState {
+            query: Some(attachments::AttachmentQuery {
+                token_start: 0,
+                token_end: 1,
+                raw: String::new(),
+            }),
+            dismissed_query: None,
+            open: true,
+            selected: 0,
+            scroll: 0,
+            suggestions: Vec::new(),
+            preview: None,
+            status: Some("open".to_string()),
+        };
         let (event_tx, _event_rx) = unbounded_channel();
 
         app.handle_slash_command("/models", event_tx)
@@ -4667,12 +5115,27 @@ mod tests {
         assert!(app.model_picker.open);
         assert!(!app.model_picker.models.is_empty());
         assert!(!app.model_picker.loading);
+        assert!(!app.attachment_picker.is_visible());
     }
 
     #[test]
     fn model_picker_applies_selected_model() {
         let mut app = test_app();
         let (event_tx, _event_rx) = unbounded_channel();
+        app.attachment_picker = attachments::AttachmentPickerState {
+            query: Some(attachments::AttachmentQuery {
+                token_start: 0,
+                token_end: 1,
+                raw: String::new(),
+            }),
+            dismissed_query: None,
+            open: true,
+            selected: 0,
+            scroll: 0,
+            suggestions: Vec::new(),
+            preview: None,
+            status: Some("open".to_string()),
+        };
         app.open_model_picker(event_tx);
         app.model_picker.selected = app
             .model_picker
@@ -4685,6 +5148,7 @@ mod tests {
 
         assert_eq!(app.config.model, "mimo-v2.5");
         assert!(!app.model_picker.open);
+        assert!(!app.attachment_picker.is_visible());
     }
 
     #[test]
@@ -4769,6 +5233,20 @@ mod tests {
             ChatMessage::user("hello"),
             ChatMessage::assistant("world"),
         ]);
+        app.attachment_picker = attachments::AttachmentPickerState {
+            query: Some(attachments::AttachmentQuery {
+                token_start: 0,
+                token_end: 1,
+                raw: String::new(),
+            }),
+            dismissed_query: None,
+            open: true,
+            selected: 0,
+            scroll: 0,
+            suggestions: Vec::new(),
+            preview: None,
+            status: Some("open".to_string()),
+        };
 
         app.handle_terminal_event(
             Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)),
@@ -4778,6 +5256,70 @@ mod tests {
 
         assert!(app.branch_selection.open);
         assert_eq!(app.branch_selection.selected, 0);
+        assert!(!app.attachment_picker.is_visible());
+    }
+
+    #[test]
+    fn ctrl_u_clears_the_draft_and_attachment_picker() {
+        let mut app = test_app();
+        app.input.insert_str("hello");
+        app.attachment_picker = attachments::AttachmentPickerState {
+            query: Some(attachments::AttachmentQuery {
+                token_start: 0,
+                token_end: 1,
+                raw: String::new(),
+            }),
+            dismissed_query: None,
+            open: true,
+            selected: 0,
+            scroll: 0,
+            suggestions: Vec::new(),
+            preview: None,
+            status: Some("open".to_string()),
+        };
+
+        let (event_tx, _event_rx) = unbounded_channel();
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            event_tx,
+        )
+        .expect("ctrl+u should clear the draft");
+
+        assert!(app.input.is_empty());
+        assert!(!app.attachment_picker.is_visible());
+        assert_eq!(app.status, "Draft cleared");
+    }
+
+    #[test]
+    fn ctrl_s_stashes_the_draft_and_attachment_picker() {
+        let mut app = test_app();
+        app.input.insert_str("hello");
+        app.attachment_picker = attachments::AttachmentPickerState {
+            query: Some(attachments::AttachmentQuery {
+                token_start: 0,
+                token_end: 1,
+                raw: String::new(),
+            }),
+            dismissed_query: None,
+            open: true,
+            selected: 0,
+            scroll: 0,
+            suggestions: Vec::new(),
+            preview: None,
+            status: Some("open".to_string()),
+        };
+
+        let (event_tx, _event_rx) = unbounded_channel();
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            event_tx,
+        )
+        .expect("ctrl+s should stash the draft");
+
+        assert!(app.input.is_empty());
+        assert!(!app.attachment_picker.is_visible());
+        assert_eq!(app.draft_stash, vec!["hello".to_string()]);
+        assert_eq!(app.status, "Draft stashed");
     }
 
     #[test]
@@ -4936,17 +5478,88 @@ mod tests {
             ChatMessage::user("hello"),
             ChatMessage::assistant("world"),
         ]);
+        app.attachment_picker = attachments::AttachmentPickerState {
+            query: Some(attachments::AttachmentQuery {
+                token_start: 0,
+                token_end: 1,
+                raw: String::new(),
+            }),
+            dismissed_query: None,
+            open: true,
+            selected: 0,
+            scroll: 0,
+            suggestions: Vec::new(),
+            preview: None,
+            status: Some("open".to_string()),
+        };
 
         app.clear_conversation();
 
+        assert!(!app.attachment_picker.is_visible());
         let screen = render_screen(&mut app);
         assert!(screen.contains("Ask anything...  \"Fix a TODO in the codebase\""));
         assert!(screen.contains("Conversation cleared"));
     }
 
     #[test]
+    fn opening_other_overlays_clears_attachment_picker() {
+        let mut app = test_app();
+        app.attachment_picker = attachments::AttachmentPickerState {
+            query: Some(attachments::AttachmentQuery {
+                token_start: 0,
+                token_end: 1,
+                raw: String::new(),
+            }),
+            dismissed_query: None,
+            open: true,
+            selected: 0,
+            scroll: 0,
+            suggestions: Vec::new(),
+            preview: None,
+            status: Some("open".to_string()),
+        };
+
+        app.open_help(None);
+        assert!(app.help.open);
+        assert!(!app.attachment_picker.is_visible());
+
+        app.attachment_picker = attachments::AttachmentPickerState {
+            query: Some(attachments::AttachmentQuery {
+                token_start: 0,
+                token_end: 1,
+                raw: String::new(),
+            }),
+            dismissed_query: None,
+            open: true,
+            selected: 0,
+            scroll: 0,
+            suggestions: Vec::new(),
+            preview: None,
+            status: Some("open".to_string()),
+        };
+
+        app.open_command_palette();
+        assert!(app.command_palette.open);
+        assert!(!app.attachment_picker.is_visible());
+    }
+
+    #[test]
     fn apply_loaded_session_restores_saved_branch_tree() {
         let mut app = test_app();
+        app.attachment_picker = attachments::AttachmentPickerState {
+            query: Some(attachments::AttachmentQuery {
+                token_start: 0,
+                token_end: 1,
+                raw: String::new(),
+            }),
+            dismissed_query: None,
+            open: true,
+            selected: 0,
+            scroll: 0,
+            suggestions: Vec::new(),
+            preview: None,
+            status: Some("open".to_string()),
+        };
         let mut tree = ConversationTree::from_flat_messages(vec![
             ChatMessage::user("hello"),
             ChatMessage::assistant("hi"),
@@ -4976,6 +5589,7 @@ mod tests {
 
         assert_eq!(app.conversation_tree.branch_count(), 2);
         assert_eq!(app.conversation_tree.current_branch_id(), "branch-2");
+        assert!(!app.attachment_picker.is_visible());
         assert_eq!(
             app.messages.last().map(|message| message.content.as_str()),
             Some("branched answer")
@@ -5092,5 +5706,375 @@ mod tests {
         app.handle_terminal_event(Event::Key(KeyEvent::from(KeyCode::F(2))), event_tx)
             .expect("f2 should cycle back to agent");
         assert_eq!(app.mode, AppMode::Agent);
+    }
+
+    #[test]
+    fn typing_at_opens_attachment_picker_and_filters_results() {
+        let tempdir = tempdir().expect("tempdir should be created");
+        fs::create_dir(tempdir.path().join("folder")).expect("folder should be created");
+        fs::write(tempdir.path().join("apple.txt"), "apple").expect("file should be written");
+        fs::write(tempdir.path().join("banana.txt"), "banana").expect("file should be written");
+
+        let mut app = test_app();
+        app.tool_context.workspace_root = tempdir.path().to_path_buf();
+        let (event_tx, _event_rx) = unbounded_channel();
+
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::NONE)),
+            event_tx.clone(),
+        )
+        .expect("typing @ should update the picker");
+
+        assert!(app.attachment_picker.is_visible());
+        assert!(!app.attachment_picker.suggestions.is_empty());
+
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)),
+            event_tx,
+        )
+        .expect("typing should refine the picker");
+
+        assert_eq!(app.input.as_str(), "@f");
+        assert_eq!(app.attachment_picker.suggestions.len(), 1);
+        assert_eq!(app.attachment_picker.suggestions[0].display_path, "folder");
+    }
+
+    #[test]
+    fn attachment_picker_navigation_updates_preview() {
+        let tempdir = tempdir().expect("tempdir should be created");
+        fs::write(tempdir.path().join("apple.txt"), "apple").expect("file should be written");
+        fs::write(tempdir.path().join("apricot.txt"), "apricot").expect("file should be written");
+
+        let mut app = test_app();
+        app.tool_context.workspace_root = tempdir.path().to_path_buf();
+        let (event_tx, _event_rx) = unbounded_channel();
+
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::NONE)),
+            event_tx.clone(),
+        )
+        .expect("typing @ should open the picker");
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            event_tx.clone(),
+        )
+        .expect("typing a should filter results");
+
+        let first_preview = app
+            .attachment_picker
+            .preview
+            .as_ref()
+            .expect("preview should exist")
+            .metadata[0]
+            .clone();
+
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            event_tx,
+        )
+        .expect("down should move the selection");
+
+        let next_preview = app
+            .attachment_picker
+            .preview
+            .as_ref()
+            .expect("preview should still exist")
+            .metadata[0]
+            .clone();
+        assert_eq!(app.attachment_picker.selected, 1);
+        assert_ne!(next_preview, first_preview);
+        assert!(next_preview.contains("apricot.txt"));
+    }
+
+    #[test]
+    fn attachment_picker_escape_can_reopen_after_query_changes() {
+        let tempdir = tempdir().expect("tempdir should be created");
+        fs::write(tempdir.path().join("apple.txt"), "apple").expect("file should be written");
+
+        let mut app = test_app();
+        app.tool_context.workspace_root = tempdir.path().to_path_buf();
+        let (event_tx, _event_rx) = unbounded_channel();
+
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::NONE)),
+            event_tx.clone(),
+        )
+        .expect("typing @ should open the picker");
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            event_tx.clone(),
+        )
+        .expect("escape should dismiss the picker");
+
+        assert!(!app.attachment_picker.is_visible());
+        assert!(app.attachment_picker.dismissed_query.is_some());
+
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            event_tx,
+        )
+        .expect("changing the query should reopen the picker");
+
+        assert!(app.attachment_picker.is_visible());
+        assert!(app.attachment_picker.dismissed_query.is_none());
+        assert!(!app.attachment_picker.suggestions.is_empty());
+    }
+
+    #[test]
+    fn attachment_picker_enter_confirms_without_submitting() {
+        let tempdir = tempdir().expect("tempdir should be created");
+        fs::write(tempdir.path().join("apple.txt"), "apple").expect("file should be written");
+
+        let mut app = test_app();
+        app.tool_context.workspace_root = tempdir.path().to_path_buf();
+        let (event_tx, _event_rx) = unbounded_channel();
+
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::NONE)),
+            event_tx.clone(),
+        )
+        .expect("typing @ should open the picker");
+
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            event_tx,
+        )
+        .expect("enter should confirm the selected attachment");
+
+        assert_eq!(app.attachments.len(), 1);
+        assert!(app.messages.is_empty());
+        assert!(app.last_prompt.is_none());
+        assert!(app.input.as_str().is_empty());
+        assert!(!app.attachment_picker.is_visible());
+        assert!(app.status.contains("Attached workspace context"));
+    }
+
+    #[test]
+    fn attachment_picker_duplicate_confirmation_is_reported() {
+        let tempdir = tempdir().expect("tempdir should be created");
+        fs::write(tempdir.path().join("apple.txt"), "apple").expect("file should be written");
+
+        let mut app = test_app();
+        app.tool_context.workspace_root = tempdir.path().to_path_buf();
+        app.attachments.push(FileAttachment::new("apple.txt"));
+        let (event_tx, _event_rx) = unbounded_channel();
+
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::NONE)),
+            event_tx.clone(),
+        )
+        .expect("typing @ should open the picker");
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            event_tx,
+        )
+        .expect("typing a should filter results");
+
+        let (confirm_tx, _confirm_rx) = unbounded_channel();
+
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            confirm_tx,
+        )
+        .expect("enter should confirm the selected attachment");
+
+        assert_eq!(app.attachments.len(), 1);
+        assert!(app.input.as_str().is_empty());
+        assert!(app.messages.is_empty());
+        assert!(app.last_prompt.is_none());
+        assert!(app.status.contains("Attachment already added"));
+        assert!(!app.attachment_picker.is_visible());
+    }
+
+    #[test]
+    fn attachment_picker_prefers_exact_directory_attachment_for_trailing_slash() {
+        let tempdir = tempdir().expect("tempdir should be created");
+        let docs_dir = tempdir.path().join("docs");
+        fs::create_dir(&docs_dir).expect("docs dir should be created");
+        fs::write(docs_dir.join("child.txt"), "child").expect("child file should be written");
+
+        let mut app = test_app();
+        app.tool_context.workspace_root = tempdir.path().to_path_buf();
+        app.input.set_text("@docs/");
+
+        let query = attachment_query("@docs/");
+        let results = attachments::discover_attachment_suggestions(&query, tempdir.path());
+        assert_eq!(
+            results
+                .suggestions
+                .first()
+                .map(|suggestion| suggestion.display_path.as_str()),
+            Some("docs/child.txt")
+        );
+        prepare_attachment_picker(&mut app, query, results);
+
+        app.confirm_attachment_picker_selection();
+
+        assert_eq!(app.attachments, vec![FileAttachment::new("docs")]);
+        assert_eq!(app.input.as_str(), "");
+        assert!(!app.attachment_picker.is_visible());
+        assert_eq!(app.status, "Attached workspace context: docs");
+    }
+
+    #[test]
+    fn attachment_picker_prefers_exact_home_directory_attachment_for_trailing_slash() {
+        let home_path = home_dir().expect("home directory should exist");
+        let _home_entry =
+            tempfile::tempdir_in(&home_path).expect("temporary home entry should be created");
+        let tempdir = tempdir().expect("tempdir should be created");
+
+        let mut app = test_app();
+        app.tool_context.workspace_root = tempdir.path().to_path_buf();
+        app.input.set_text("@~/");
+
+        let query = attachment_query("@~/");
+        let results = attachments::discover_attachment_suggestions(&query, tempdir.path());
+        assert!(
+            !results.suggestions.is_empty(),
+            "home directory should contain at least one entry"
+        );
+        prepare_attachment_picker(&mut app, query, results);
+
+        app.confirm_attachment_picker_selection();
+
+        let expected = home_path.display().to_string();
+        let attachment_path = &app
+            .attachments
+            .first()
+            .expect("attachment should be added")
+            .path;
+        assert_eq!(
+            attachment_path.trim_end_matches(['/', '\\']),
+            expected.trim_end_matches(['/', '\\'])
+        );
+        assert_eq!(app.input.as_str(), "");
+        assert!(!app.attachment_picker.is_visible());
+        assert_eq!(
+            app.status,
+            format!("Attached workspace context: {attachment_path}")
+        );
+    }
+
+    #[test]
+    fn attachment_picker_reuses_cached_suggestions_for_unchanged_query() {
+        let tempdir = tempdir().expect("tempdir should be created");
+        fs::write(tempdir.path().join("apple.txt"), "apple").expect("apple file should be written");
+
+        let mut app = test_app();
+        app.tool_context.workspace_root = tempdir.path().to_path_buf();
+        app.input.set_text("@a");
+
+        app.sync_attachment_picker();
+        let initial_suggestions = app
+            .attachment_picker
+            .suggestions
+            .iter()
+            .map(|suggestion| suggestion.display_path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(initial_suggestions, vec!["apple.txt".to_string()]);
+
+        fs::write(tempdir.path().join("apricot.txt"), "apricot")
+            .expect("apricot file should be written");
+        app.attachment_picker.open = false;
+        app.sync_attachment_picker();
+
+        let cached_suggestions = app
+            .attachment_picker
+            .suggestions
+            .iter()
+            .map(|suggestion| suggestion.display_path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(cached_suggestions, initial_suggestions);
+        assert!(!cached_suggestions.iter().any(|path| path == "apricot.txt"));
+    }
+
+    #[test]
+    fn attachment_picker_reuses_cached_preview_for_same_selection() {
+        let tempdir = tempdir().expect("tempdir should be created");
+        let file_path = tempdir.path().join("notes.txt");
+        fs::write(&file_path, "old").expect("file should be written");
+
+        let mut app = test_app();
+        prepare_attachment_picker(
+            &mut app,
+            attachment_query("@notes"),
+            attachments::AttachmentSearchResults {
+                suggestions: vec![attachments::AttachmentSuggestion {
+                    display_path: "notes.txt".to_string(),
+                    resolved_path: file_path.clone(),
+                    kind: attachments::AttachmentEntryKind::File,
+                    score: 0,
+                }],
+                status: None,
+            },
+        );
+
+        app.refresh_attachment_picker_preview();
+        let first_preview = app
+            .attachment_picker
+            .preview
+            .clone()
+            .expect("preview should be generated");
+        assert_eq!(first_preview.lines.clone(), vec!["old".to_string()]);
+
+        fs::write(&file_path, "new").expect("file should be rewritten");
+        app.refresh_attachment_picker_preview();
+
+        assert_eq!(app.attachment_picker.preview, Some(first_preview));
+    }
+
+    #[test]
+    fn tab_falls_back_to_exact_attachment_when_picker_inactive() {
+        let tempdir = tempdir().expect("tempdir should be created");
+        let file_path = tempdir.path().join("exact.txt");
+        fs::write(&file_path, "exact").expect("file should be written");
+
+        let mut app = test_app();
+        let (event_tx, _event_rx) = unbounded_channel();
+        app.input.set_text(format!("@{}", file_path.display()));
+
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            event_tx,
+        )
+        .expect("tab should still confirm an exact attachment");
+
+        assert_eq!(app.attachments.len(), 1);
+        assert!(app.input.as_str().is_empty());
+        assert!(app.status.contains("Attached workspace context"));
+    }
+
+    #[test]
+    fn attachment_picker_overlay_renders_suggestions_and_preview() {
+        let mut app = test_app();
+        app.attachment_picker = attachments::AttachmentPickerState {
+            query: Some(attachments::AttachmentQuery {
+                token_start: 0,
+                token_end: 1,
+                raw: String::new(),
+            }),
+            dismissed_query: None,
+            open: true,
+            selected: 0,
+            scroll: 0,
+            suggestions: vec![attachments::AttachmentSuggestion {
+                display_path: "notes.txt".to_string(),
+                resolved_path: PathBuf::from("notes.txt"),
+                kind: attachments::AttachmentEntryKind::File,
+                score: 0,
+            }],
+            preview: Some(attachments::AttachmentPreview {
+                metadata: vec!["Path: notes.txt".to_string(), "Type: text".to_string()],
+                lines: vec!["hello".to_string()],
+                note: None,
+            }),
+            status: None,
+        };
+
+        let screen = render_screen(&mut app);
+        assert!(screen.contains("Matches (1)"));
+        assert!(screen.contains("Preview"));
+        assert!(screen.contains("notes.txt"));
+        assert!(screen.contains("Tab/Enter attach"));
     }
 }

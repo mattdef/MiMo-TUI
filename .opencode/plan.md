@@ -1,260 +1,398 @@
-# Plan: Workspace Instruction Auto-Discovery
+# Plan: Autocomplete and Real-Time Preview for `@` File Attachments
 
 ## Objective
 
-Implement startup-time discovery of workspace instruction files for MiMo-TUI. When `AppConfig::load()` resolves the effective `system_prompt`, it should append the first supported workspace instruction file found at the workspace root, enforce a 32 KiB instruction-content cap, reject symlinked instruction files, and expose the contribution through `ConfigValueSource::WorkspaceInstructions` so `cargo run -- doctor` reports the source.
+Add an interactive `@` attachment picker to MiMo-TUI so users can type `@`, see fuzzy-matched file and directory suggestions, navigate them with the keyboard, attach a selected item with `Tab` or `Enter`, cancel with `Escape`, and see a real-time preview of the currently selected entry. Preserve the current `@path` + `Tab` attachment path and existing system-message injection behavior.
 
 ## Requirements Snapshot
 
-- **R1:** Discover workspace instruction files from the workspace root only, in priority order: `AGENTS.md`, then `CLAUDE.md`, then `README.md` as a weak fallback.
-- **R2:** Append discovered instruction content after the existing base prompt: a `system_prompt` from config file when present, otherwise `DEFAULT_SYSTEM_PROMPT`, using a clear separator.
-- **R3:** Limit loaded workspace instruction content to 32 KiB and handle truncation safely.
-- **R4:** Reject symlinked instruction files consistently with the existing `mimo-tools/src/file.rs` `O_NOFOLLOW` defense-in-depth pattern.
-- **R5:** Add `ConfigValueSource::WorkspaceInstructions` and ensure `doctor` displays that source through the existing `system_prompt_source` output.
-- **R6:** Preserve existing workspace layout, Edition 2024, root cargo commands, reqwest rustls-only setup, base URL normalization, and current CLI/TUI request flow.
+- **R1:** When the current input token starts with `@`, show a dropdown/popup of file and directory suggestions and refresh it as the user types more characters.
+- **R2:** Suggestions must support both files and directories and use fuzzy matching for better ranking than simple prefix filtering.
+- **R3:** While the attachment picker is active, `Up`/`Down` navigate suggestions, `Tab` or `Enter` confirms the selected suggestion, and `Escape` cancels the picker.
+- **R4:** When a suggestion is selected, show a real-time preview panel that updates as selection changes and includes metadata such as size and type plus the first approximately 50 lines for files.
+- **R5:** Preserve existing behavior: typing `@path` and pressing `Tab` still attaches a valid file or directory; confirmed attachments still feed `attachment_messages()` and are injected as system context; duplicate and removal behavior remain intact.
+- **R6:** Keep changes minimal and focused, preserve Rust edition 2024, ratatui/crossterm architecture, workspace layout, and root cargo validation commands.
 
 ## Scope
 
-- Modify `crates/mimo-config/src/lib.rs` to add discovery constants/helpers, safe file reading, prompt merging, source tracking, and unit tests.
-- Modify `crates/mimo-config/Cargo.toml` only if needed for `libc` and test-only `tempfile` dependencies.
-- Review `crates/mimo-cli/src/main.rs` doctor output and adjust only if the new source is not displayed automatically.
-- Do not change `crates/mimo-tui/src/app.rs` or `ask()` request construction unless compilation reveals a direct need; both already consume `config.system_prompt`.
+- Modify `crates/mimo-tui/src/attachments.rs` for attachment token parsing, suggestion discovery, fuzzy ranking, preview generation, and shared attach-confirmation helpers.
+- Modify `crates/mimo-tui/src/app.rs` for autocomplete state ownership, keyboard event flow, state refresh, and ratatui rendering of the picker and preview.
+- Modify `crates/mimo-tui/Cargo.toml` only if tests need `tempfile.workspace = true` as a dev-dependency. Prefer an internal fuzzy matcher to avoid a new runtime dependency.
+- Modify `crates/mimo-tui-core/src/input.rs` only if an additional small accessor is strictly needed; the existing `InputBuffer::current_token_bounds()` and `replace_char_range()` should be enough.
+- Do not add or reorganize a `crates/mimo-tui/src/ui/` directory unless the repository has already been refactored by the time this plan is executed. Rendering currently lives in `crates/mimo-tui/src/app.rs`.
 
 ## Assumptions and Constraints
 
-- No `.opencode/task.md` exists; this plan is based on the user-provided requirements.
-- Use `std::env::current_dir()` inside `mimo-config` for the workspace root. Do not add a `mimo-config -> mimo-tools` dependency just to call `default_workspace_root()`.
-- Do not introduce a new user-facing workspace-root config setting in this change. If a configured workspace root is added later, it must be threaded through `ConfigOverrides -> AppConfig::load` and follow config precedence.
-- Treat workspace instructions as an additive prompt contribution, not a replacement for config-file or built-in prompts.
-- Because `system_prompt_source` is a single enum value, set it to `WorkspaceInstructions` when workspace content is appended; otherwise keep the existing `File` or `Default` source.
-- For normal symlink candidates, “reject” means do not load the symlink target. Prefer skipping the rejected candidate and continuing to the next lower-priority file; still use `O_NOFOLLOW` on Unix to guard against race-time symlink replacement.
+- No `.opencode/task.md` exists; this plan is based on the user-provided requirements and direct inspection of the current repository.
+- Directory suggestions are attachable, matching current `attachment_messages()` support for directories through `summarize_directory()`. Navigating into directories can be done by typing a path separator, e.g. `@src/`; drilling into directories with a separate key is out of scope unless maintainers choose to add it later.
+- Suggestions should be built from the current working directory for relative paths and from the home directory for `~/` paths, matching the existing attachment resolver behavior.
+- File-system operations should be bounded and should not happen inside rendering methods. Suggestion and preview data should be cached in app state and refreshed from event handlers.
+- Preview should be best effort. Permission errors, binary/non-UTF-8 content, deleted files, or unreadable directories should show a user-facing preview message rather than crashing the TUI.
+- Existing slash command menu, command palette, model/session pickers, approval overlay, message pager, and other modal flows keep precedence over the attachment picker.
 
 ## Risks and Areas Requiring Care
 
-- The repository root already contains `AGENTS.md`; after this change, running `cargo run -- doctor` from the repo root should show `workspace instructions` as the system prompt source.
-- Avoid global `current_dir` mutations in tests where possible; test helper functions that accept an explicit root path.
-- Do not use `Path::exists()` for discovery because it follows symlinks. Use `symlink_metadata()` to classify candidates.
-- Do not read unbounded `README.md` content before truncating; read only up to the configured cap plus enough to detect truncation.
-- Ensure byte truncation does not panic or create invalid prompt content for UTF-8 markdown files.
-- Adding `libc` to `mimo-config` is acceptable because it is already a workspace dependency; do not alter reqwest features.
+- Key conflicts are the highest-risk area: `Enter` currently submits, `Tab` currently attaches exact paths or slash-completes, and `Up`/`Down` currently scroll or move slash-menu selection. The attachment picker must intercept those keys only while active.
+- Avoid doing `fs::read_dir()` or file reads in `render()`; repeated I/O during drawing can make the TUI feel laggy.
+- Fuzzy matching must be deterministic so tests can assert ordering and UI selection remains stable as the query changes.
+- Large directories and large files must be capped: limit suggestion count and preview content.
+- Path parsing must work for empty `@`, partial relative paths, nested paths such as `@crates/mimo`, home paths such as `@~/notes`, and paths containing Unicode.
+- `InputBuffer` indexes are character indexes, not byte indexes. Any replacement of the `@` token must use the existing character-range helpers.
+- Small terminals may not have enough space for side-by-side suggestions and preview. Rendering should degrade by reducing heights or showing a concise preview.
 
 ## Core Concepts
 
-- **Base prompt:** The existing selected prompt from config file, or `DEFAULT_SYSTEM_PROMPT` when no non-empty config value exists.
-- **Workspace instructions:** The first non-symlink, regular, non-empty supported instruction file in the workspace root by priority.
-- **Effective prompt:** `base prompt + separator + workspace instruction block` when instructions are found; otherwise exactly the previous base prompt.
-- **Source reporting:** `system_prompt_source` remains `File` or `Default` when no instruction file contributes. It becomes `WorkspaceInstructions` when an instruction block is appended.
+- **Attachment token:** The current non-whitespace token under the input cursor. It is eligible for autocomplete when it starts with `@`. The token's character start/end bounds are reused when confirming an attachment so the token can be removed exactly like the existing `try_attach_from_input()` flow.
+- **Attachment query:** The text after `@`, split into a search directory and a fuzzy filter fragment. Examples: `@` searches the current directory with an empty filter; `@src/ap` searches `src/` with filter `ap`; `@~/Do` searches the user's home directory with filter `Do`.
+- **Suggestion:** A cached entry containing display path, resolved path, file/directory kind, optional size/type metadata, and fuzzy score. The selected suggestion drives both confirmation and preview.
+- **Preview:** A cached, best-effort summary of the selected suggestion. For files, show metadata and the first ~50 text lines. For directories, show metadata and a short directory listing because there is no file body to display.
+- **Event-driven refresh:** Input-editing keys and selection-navigation keys update the attachment picker state. Rendering only displays the current state.
 
 ## Sub-Tasks
 
-### Sub-Task 1: Extend config source metadata and dependencies
+### Sub-Task 1: Add attachment autocomplete data model and token parsing
 
 - **Status:** Pending
-- **Objective:** Add the new source variant and any crate dependencies required for no-follow file opening and tests.
-- **Related Requirements:** R4, R5, R6
-- **Dependencies and Preconditions:** None.
+- **Estimated Complexity:** Medium
+- **Objective:** Define the data structures and parsing helpers needed to know when the current input should show attachment autocomplete.
+- **Related Requirements:** R1, R3, R5, R6
+- **Dependencies and Preconditions:** Current `attachments.rs` and `InputBuffer` behavior remain available.
 - **In Scope for This Sub-Task:**
-  - `crates/mimo-config/src/lib.rs`
-  - `crates/mimo-config/Cargo.toml`
+  - `crates/mimo-tui/src/attachments.rs`
+  - Optional, only if unavoidable: `crates/mimo-tui-core/src/input.rs`
 - **Out of Scope for This Sub-Task:**
-  - Prompt discovery logic.
-  - CLI flags or config-file schema changes.
+  - File-system scanning.
+  - Fuzzy ranking.
+  - UI rendering.
 - **Instructions:**
-  1. Add `WorkspaceInstructions` to `ConfigValueSource` in `crates/mimo-config/src/lib.rs`.
-  2. Update the `fmt::Display` implementation so the variant prints a concise human-readable label such as `workspace instructions`.
-  3. Add `libc.workspace = true` to `crates/mimo-config/Cargo.toml` if the Unix `O_NOFOLLOW` helper uses `libc::O_NOFOLLOW` directly.
-  4. Add `[dev-dependencies] tempfile.workspace = true` to `crates/mimo-config/Cargo.toml` if tests use temporary directories.
+  1. Add public or `pub(crate)` attachment autocomplete types in `attachments.rs`, such as an attachment query type, suggestion type, preview type, and picker state type.
+  2. Add a helper that inspects `InputBuffer::current_token_bounds()` and returns an attachment query only when the current token starts with `@`.
+  3. Preserve the token start/end character bounds in the query result for later confirmation.
+  4. Treat bare `@` as an active empty query.
+  5. Treat non-`@` tokens, whitespace-only input, and cursor positions outside an `@` token as inactive.
+  6. Do not change `InputBuffer` unless parsing cannot be implemented cleanly with existing methods. If changed, keep it to a small accessor and add focused tests.
 - **Acceptance Criteria:**
-  - `ConfigValueSource` exhaustive matches compile.
-  - `ConfigValueSource::WorkspaceInstructions.to_string()` can be asserted in tests.
-  - No workspace edition or reqwest dependency settings are changed.
+  - `@`, `@src`, `@src/lib`, and `@~/notes` are recognized as active attachment queries.
+  - Tokens not starting with `@` are ignored.
+  - Query results include token bounds so confirmation can remove the original token.
+  - Existing `try_attach_from_input()` behavior is not changed by this sub-task.
 - **Cautionary Points (Risks & Edge Cases):**
-  - Keep the existing display strings for `Cli`, `Env`, `File`, and `Default` unchanged.
-  - Do not add new environment variables or config TOML keys.
+  - Reuse character-index logic; do not slice strings by arbitrary byte indexes.
+  - Do not require the query path to exist at parsing time; existence is checked during suggestion discovery or final attachment.
 - **Implementation Suggestions:**
-  - Place the new variant alongside the existing enum variants and update the match immediately to keep compiler errors obvious.
+  - Move the existing private `slice_chars()` helper into shared use within `attachments.rs`.
+  - Keep query parsing independent of `App` so it can be unit-tested without terminal state.
 - **Testing Suggestions:**
-  - Add or extend a small unit test in `mimo-config` for the display label.
-  - Run `cargo check` after this sub-task if implementing incrementally.
+  - Add unit tests in `attachments.rs` for active/inactive query detection and token bounds.
+  - If `InputBuffer` changes, add or update tests in `crates/mimo-tui-core/src/input.rs`.
 - **Done When:**
-  - The config crate can represent and display the workspace instruction source.
+  - Attachment query detection is test-covered and ready for suggestion lookup.
 
-### Sub-Task 2: Add safe workspace instruction discovery helpers
+### Sub-Task 2: Implement bounded suggestion discovery and fuzzy ranking
 
 - **Status:** Pending
-- **Objective:** Implement root-only discovery, priority selection, symlink rejection, and 32 KiB bounded reading in `mimo-config`.
-- **Related Requirements:** R1, R3, R4, R6
-- **Dependencies and Preconditions:** Sub-Task 1 completed if `libc` is needed.
+- **Estimated Complexity:** Medium
+- **Objective:** Produce deterministic file and directory suggestions for the active attachment query.
+- **Related Requirements:** R1, R2, R6
+- **Dependencies and Preconditions:** Sub-Task 1 completed.
 - **In Scope for This Sub-Task:**
-  - New private constants in `crates/mimo-config/src/lib.rs`:
-    - `WORKSPACE_INSTRUCTIONS_MAX_BYTES` set to `32 * 1024`.
-    - A filename priority list for `AGENTS.md`, `CLAUDE.md`, `README.md`.
-  - New private helper data structure for discovered instruction metadata, if useful.
-  - New private helper functions for discovery, candidate classification, safe open/read, and truncation.
+  - `crates/mimo-tui/src/attachments.rs`
+  - `crates/mimo-tui/Cargo.toml` only if test-only `tempfile` is needed.
 - **Out of Scope for This Sub-Task:**
-  - Parent-directory walking.
-  - Recursive workspace scanning.
-  - Parsing markdown semantics.
+  - Real-time preview generation.
+  - Async/background directory scanning.
+  - Recursive search through the whole workspace.
 - **Instructions:**
-  1. Add a helper that accepts a workspace root path and checks only `root/AGENTS.md`, `root/CLAUDE.md`, and `root/README.md` in that order.
-  2. Use `fs::symlink_metadata()` for each candidate:
-     - missing file: continue to the next candidate;
-     - symlink: reject it and continue to the next candidate;
-     - directory or other non-regular file: ignore it and continue;
-     - regular file: attempt to read it safely.
-  3. For Unix builds, open the regular candidate using `OpenOptions` plus `O_NOFOLLOW`, matching the defense-in-depth pattern in `crates/mimo-tools/src/file.rs:312`.
-  4. For non-Unix builds, still rely on `symlink_metadata()` to reject symlink candidates before opening.
-  5. Read only up to `WORKSPACE_INSTRUCTIONS_MAX_BYTES + 1` bytes, so truncation can be detected without loading an entire large README.
-  6. Convert the bounded bytes into prompt text safely. Prefer UTF-8-preserving truncation; if using lossy conversion, ensure tests cover the ASCII truncation contract.
-  7. Treat empty or whitespace-only instruction content as no discovered instruction and continue to the next candidate.
-  8. Return discovered metadata including at least filename/path, content, and whether truncation occurred.
+  1. Add a suggestion function that accepts the parsed attachment query and an explicit base/current directory, then returns a capped list of suggestions.
+  2. Resolve search roots consistently with existing attachment behavior:
+     - empty or relative query uses `std::env::current_dir()` or an explicit test root;
+     - `~/` uses `dirs::home_dir()`;
+     - nested paths search the typed parent directory and fuzzy-match only the final fragment.
+  3. Use `fs::read_dir()` on only the immediate search directory; do not recurse.
+  4. Include both files and directories in results. Mark kind clearly so the UI can show `[file]` and `[dir]` or icons.
+  5. Add a small in-crate fuzzy scoring helper to avoid new runtime dependencies unless maintainers explicitly prefer a crate. The helper should match query characters in order, case-insensitively, and score exact/prefix/contiguous matches higher.
+  6. Sort suggestions deterministically, for example by descending fuzzy score, directories before files on ties, then display name/path ascending.
+  7. Cap suggestions to a reasonable maximum, such as 50, to avoid huge overlays.
+  8. Handle unreadable or missing directories by returning an empty list plus an optional status/error string for the picker rather than propagating a fatal error.
 - **Acceptance Criteria:**
-  - Discovery chooses only one file: the first valid candidate by priority.
-  - Symlinked candidates are never followed.
-  - Loaded instruction content is capped at 32 KiB before prompt assembly.
-  - Helper functions are testable without changing the process current directory.
+  - Bare `@` lists files and directories from the current directory.
+  - `@src/ap` lists matching immediate entries under `src/`.
+  - Fuzzy matches find non-prefix candidates when query characters appear in order.
+  - Suggestion order is stable and testable.
+  - Large directories are capped.
 - **Cautionary Points (Risks & Edge Cases):**
-  - `Path::exists()` and `fs::metadata()` follow symlinks; avoid them for candidate classification.
-  - If a file is replaced by a symlink between metadata and open on Unix, `O_NOFOLLOW` should cause open to fail instead of following it.
-  - Be deliberate about unreadable regular files: include path context in any propagated error so startup failures are diagnosable.
+  - `read_dir()` order is platform-dependent; always sort after collecting.
+  - Do not panic if a directory entry disappears between listing and metadata lookup.
+  - Keep hidden-file behavior simple and deterministic. Unless maintainers request otherwise, include entries returned by `read_dir()` and let fuzzy filtering/ranking handle them.
 - **Implementation Suggestions:**
-  - Keep helpers private to `mimo-config` unless tests need `pub(crate)` visibility.
-  - Include the source filename in the returned metadata so the prompt separator can say which file was used.
+  - Include both a display path relative to the current working directory and a resolved path for I/O/attachment.
+  - Preserve path separators in the display path so selecting `crates/mimo-tui` is understandable.
+  - Add `tempfile.workspace = true` under `[dev-dependencies]` for `mimo-tui` if temporary directory tests are added.
 - **Testing Suggestions:**
-  - Unit test priority: create all three files in a tempdir and assert `AGENTS.md` is selected.
-  - Unit test fallback: create only `CLAUDE.md`, then only `README.md`, and assert each can be selected.
-  - Unit test truncation with ASCII content larger than 32 KiB.
-  - Unix-only unit test symlink rejection using a symlinked `AGENTS.md`; assert the symlink target content is not loaded and a lower-priority regular file can be used.
+  - Unit test files and directories appearing together.
+  - Unit test nested query behavior using a temporary directory tree.
+  - Unit test fuzzy ranking with deterministic fixture names.
+  - Unit test missing/unreadable search directory behavior as best effort for the platform.
 - **Done When:**
-  - Discovery is bounded, root-only, priority-aware, and symlink-safe.
+  - The attachment module can return ranked suggestions for active `@` queries without UI involvement.
 
-### Sub-Task 3: Wire discovery into `AppConfig::load()` prompt resolution
+### Sub-Task 3: Implement selected-suggestion preview generation
 
 - **Status:** Pending
-- **Objective:** Merge discovered workspace instructions into the resolved system prompt while preserving existing config precedence for the base prompt.
-- **Related Requirements:** R1, R2, R5, R6
-- **Dependencies and Preconditions:** Sub-Task 2 completed.
+- **Estimated Complexity:** Medium
+- **Objective:** Generate cached preview content and metadata for the selected suggestion.
+- **Related Requirements:** R4, R6
+- **Dependencies and Preconditions:** Sub-Task 2 completed so suggestions include resolved paths and kinds.
 - **In Scope for This Sub-Task:**
-  - `crates/mimo-config/src/lib.rs`, specifically `AppConfig::load()` and nearby prompt helper functions.
+  - `crates/mimo-tui/src/attachments.rs`
 - **Out of Scope for This Sub-Task:**
-  - Changes to `mimo-client`, `mimo-agent`, or TUI message construction.
-  - New CLI options for system prompts.
+  - Rendering the preview panel.
+  - Changing how attached file contents are injected into chat messages.
 - **Instructions:**
-  1. Keep the existing file/default base prompt behavior:
-     - non-empty `file_config.system_prompt` remains the base prompt;
-     - otherwise use `DEFAULT_SYSTEM_PROMPT`.
-  2. Resolve the workspace root with `std::env::current_dir()` inside `AppConfig::load()`; fall back to `.` if matching the existing `default_workspace_root()` behavior is preferred over startup failure.
-  3. Call the discovery helper after the base prompt is selected.
-  4. If no instruction content is discovered, leave both `system_prompt` and `system_prompt_source` exactly as before.
-  5. If instruction content is discovered, append it to the base prompt using a clear separator that includes the source filename, for example a heading-style block naming `AGENTS.md`, `CLAUDE.md`, or `README.md`.
-  6. If the content was truncated, include a concise truncation note in the workspace instruction block.
-  7. Set `system_prompt_source` to `ConfigValueSource::WorkspaceInstructions` when an instruction block is appended.
+  1. Add a preview builder that accepts a selected suggestion and returns preview metadata plus preview lines.
+  2. For files:
+     - read only enough content to display approximately the first 50 lines;
+     - bound bytes read so a large single-line file cannot allocate excessively;
+     - display file size from metadata;
+     - display a simple type label such as extension, `text`, `binary/non-UTF-8`, or `file`.
+  3. For directories:
+     - display type `directory` and an appropriate size/entry-count label when available;
+     - show a short listing of the first ~50 immediate entries instead of file content.
+  4. For errors, return preview text such as `Preview unavailable: ...` instead of failing the whole event handler.
+  5. Keep preview generation outside render code; the app should call it when suggestions refresh or selected index changes.
 - **Acceptance Criteria:**
-  - With no workspace instruction files, effective prompt output and source are unchanged.
-  - With a workspace `AGENTS.md`, effective prompt contains the base prompt first, then a separator, then AGENTS content.
-  - With a config-file `system_prompt` and workspace instructions, the config prompt remains first and workspace instructions are appended after it.
-  - `base_url.trim_end_matches('/')` behavior remains untouched.
+  - Selected file preview includes size/type and the first ~50 lines.
+  - Selected directory preview includes directory metadata and a short listing.
+  - Binary or invalid UTF-8 files do not crash; they show a clear preview-unavailable or binary-content message.
+  - Deleted/unreadable paths show an error preview and leave the TUI usable.
 - **Cautionary Points (Risks & Edge Cases):**
-  - Do not accidentally trim or rewrite the built-in default prompt.
-  - Do not allow `README.md` to override `AGENTS.md` or `CLAUDE.md`.
-  - Avoid duplicate separators when instruction content is empty.
+  - `fs::read_to_string()` on large or binary files is risky. Prefer a bounded read with UTF-8/lossy handling.
+  - Avoid repeating expensive metadata reads if suggestion metadata can be reused, but keep the implementation simple.
 - **Implementation Suggestions:**
-  - Keep prompt assembly in a small helper such as `append_workspace_instructions(...)` so tests can assert the separator and ordering directly.
+  - Add a small human-readable byte formatter local to `attachments.rs`.
+  - Keep preview line count and byte cap as constants, e.g. `ATTACHMENT_PREVIEW_MAX_LINES = 50`.
 - **Testing Suggestions:**
-  - Unit test prompt assembly with default base prompt.
-  - Unit test prompt assembly with a custom config-style base prompt.
-  - Unit test no-discovery path keeps the previous source.
+  - Unit test a text file with more than 50 lines and assert truncation/line cap.
+  - Unit test metadata display includes size and type.
+  - Unit test directory preview lists immediate entries.
+  - Unit test invalid UTF-8 or binary bytes do not panic.
 - **Done When:**
-  - `AppConfig::load()` produces the correct effective prompt and source for discovered and non-discovered cases.
+  - Preview data is available and safe for the UI to render from cached state.
 
-### Sub-Task 4: Ensure `doctor` reports the new source
+### Sub-Task 4: Refactor attachment confirmation while preserving existing `Tab` behavior
 
 - **Status:** Pending
-- **Objective:** Confirm the CLI `doctor` output displays `WorkspaceInstructions` through `system_prompt_source`.
-- **Related Requirements:** R5, R6
-- **Dependencies and Preconditions:** Sub-Task 1 and Sub-Task 3 completed.
+- **Estimated Complexity:** Low to Medium
+- **Objective:** Share attachment-confirmation logic between the legacy exact-path flow and the new selected-suggestion flow.
+- **Related Requirements:** R3, R5, R6
+- **Dependencies and Preconditions:** Sub-Tasks 1-2 completed.
 - **In Scope for This Sub-Task:**
-  - `crates/mimo-cli/src/main.rs:115-147`, especially the `System prompt` line.
+  - `crates/mimo-tui/src/attachments.rs`
 - **Out of Scope for This Sub-Task:**
-  - Printing full prompt contents.
-  - Adding a new doctor section for full instruction-file paths unless needed for debugging.
+  - App key handling changes.
+  - UI rendering changes.
 - **Instructions:**
-  1. Inspect the existing `doctor()` implementation. It already prints `config.system_prompt_source` via `Display`.
-  2. If that remains true after adding the enum variant, no code change is required in `mimo-cli` beyond any formatting cleanup requested by `cargo fmt`.
-  3. If the implementation changes during development, ensure the output still includes the source beside the system prompt preview.
+  1. Extract shared logic from `try_attach_from_input()` so both exact `@path` attachment and selected-suggestion attachment:
+     - resolve/display the path consistently;
+     - check duplicates consistently;
+     - push `FileAttachment::new(display_path)` consistently;
+     - remove the original `@` token from the input using token bounds.
+  2. Add a helper for confirming a selected suggestion using the query token bounds captured by autocomplete state.
+  3. Keep `try_attach_from_input()` public signature and return behavior intact so existing `App::handle_tab_key()` fallback keeps working.
+  4. Confirming a directory should be allowed because existing `summarize_attachment()` already supports directories.
 - **Acceptance Criteria:**
-  - From a directory containing a valid `AGENTS.md`, `cargo run -- doctor` shows the system prompt source as `workspace instructions`.
-  - From a directory without instruction files, `doctor` still shows `default` or `config file` as before.
+  - Existing `@path` + `Tab` still attaches when no picker selection is being confirmed.
+  - New selected-suggestion confirmation produces the same attachment status style as existing attachments.
+  - Duplicate selected suggestions produce the existing duplicate status and do not add another attachment.
+  - Input token removal remains correct for Unicode and nested paths.
 - **Cautionary Points (Risks & Edge Cases):**
-  - The doctor preview prints only the first line of the effective prompt; this is acceptable and should not be expanded in this task.
-  - Do not change `ask()` request construction; it already sends `config.system_prompt` as the system message.
+  - Do not change `attachment_messages()` truncation/summarization behavior in this task.
+  - Do not clear unrelated input around the `@` token.
 - **Implementation Suggestions:**
-  - Prefer relying on `ConfigValueSource` `Display` over adding CLI-specific source string logic.
+  - A shared internal helper can accept `start`, `end`, and a resolved `PathBuf`.
+  - Preserve `display_path()` behavior so session persistence and UI previews continue to use relative paths when possible.
 - **Testing Suggestions:**
-  - Manual check: run `cargo run -- doctor` from the repo root; because this repo has `AGENTS.md`, it should report `workspace instructions`.
+  - Unit test selected-suggestion confirmation adds one `FileAttachment` and removes the token.
+  - Unit test duplicate selected-suggestion confirmation matches existing duplicate behavior.
+  - Regression test exact `try_attach_from_input()` still works with a real temp file and directory.
 - **Done When:**
-  - Doctor output reflects the new source without broader CLI behavior changes.
+  - Both legacy and autocomplete confirmation paths share behavior and are covered by tests.
 
-### Sub-Task 5: Add tests and run workspace validation
+### Sub-Task 5: Wire autocomplete state into `App` event handling
 
 - **Status:** Pending
-- **Objective:** Cover discovery behavior, prompt assembly, source reporting, truncation, and symlink rejection without destabilizing the workspace.
-- **Related Requirements:** R1, R2, R3, R4, R5, R6
+- **Estimated Complexity:** High
+- **Objective:** Make the picker open, refresh, navigate, confirm, and cancel correctly from crossterm key events.
+- **Related Requirements:** R1, R3, R4, R5, R6
 - **Dependencies and Preconditions:** Sub-Tasks 1-4 completed.
 - **In Scope for This Sub-Task:**
-  - Unit tests in `crates/mimo-config/src/lib.rs`.
-  - Existing root cargo validation commands.
+  - `crates/mimo-tui/src/app.rs`
+  - `crates/mimo-tui/src/attachments.rs` if small state-helper methods are needed.
 - **Out of Scope for This Sub-Task:**
-  - End-to-end tests that require a live MiMo API key.
-  - Snapshot tests for full doctor output unless such infrastructure already exists.
+  - Visual styling beyond data needed by the renderer.
+  - Background async scanning.
 - **Instructions:**
-  1. Add unit tests for discovery priority and fallback behavior.
-  2. Add unit tests for no-file behavior returning no instructions.
-  3. Add unit tests for prompt assembly order and separator presence.
-  4. Add a unit test for `ConfigValueSource::WorkspaceInstructions` display text.
-  5. Add a truncation test proving only 32 KiB of instruction content is included before any separator/metadata overhead.
-  6. Add a Unix-only symlink rejection test. If `AGENTS.md` is a symlink and `CLAUDE.md` is a regular file, assert the symlink target content is not used and the regular fallback can be selected.
-  7. Avoid tests that mutate the process current directory; test helper functions with explicit temporary roots instead.
+  1. Add an attachment autocomplete/picker state field to `App` and initialize it in `App::new()`.
+  2. Add helper methods on `App` for:
+     - refreshing picker state from the current input token;
+     - moving selection up/down and rebuilding preview;
+     - confirming the selected suggestion;
+     - canceling/dismissing the picker.
+  3. Refresh suggestions after input-mutating events: character insertion, paste, backspace, delete, and draft-clear where appropriate.
+  4. Refresh or close suggestions after cursor movement events: left, right, home, end.
+  5. Intercept picker keys after higher-priority modals are handled but before global `Esc`, `Enter`, `Tab`, and scroll handling:
+     - `Esc`: close/dismiss the picker without clearing input;
+     - `Up`/`Down`: move selected suggestion and update preview;
+     - `Tab`/`Enter`: confirm selected suggestion, clear/dismiss picker, and do not submit the prompt;
+     - if no suggestions are available, `Tab` should fall back to the existing exact `@path` attach behavior.
+  6. Track dismissal so pressing `Escape` does not immediately reopen the picker on the next render/event while the same unchanged `@` token remains. Reopen when the token changes or cursor leaves and re-enters an active `@` query.
+  7. Clear picker state when a prompt is submitted, conversation input is cleared, an attachment is confirmed, or another modal overlay takes over.
+  8. Keep existing slash menu behavior intact. Since slash menu is active for leading `/` commands and attachment picker is active for current `@` tokens, they should not conflict, but modal precedence should still be explicit.
 - **Acceptance Criteria:**
-  - `cargo test -p mimo-config` passes.
-  - `cargo test --workspace` passes.
-  - `cargo fmt --check` passes.
-  - `cargo clippy --workspace -- -D warnings` passes.
+  - Typing `@` opens suggestions.
+  - Typing more characters filters suggestions.
+  - `Up`/`Down` changes selection and preview.
+  - `Tab` and `Enter` attach the selected suggestion instead of submitting while the picker is active.
+  - `Escape` closes the picker and leaves input unchanged.
+  - With the picker inactive or dismissed, existing `@path` + `Tab`, slash command completion, prompt submission, scrolling, and backspace attachment removal still behave as before.
 - **Cautionary Points (Risks & Edge Cases):**
-  - Tempdir-based tests should not depend on the real repository `AGENTS.md`.
-  - Symlink tests should be gated with `#[cfg(unix)]` unless a reliable Windows test path is added.
-  - If lossy UTF-8 conversion is used, keep truncation assertions byte-oriented for ASCII fixtures to avoid ambiguous character counts.
+  - Be careful where picker handling is inserted in `handle_terminal_event()`. Higher-priority overlays already return early and should continue to do so.
+  - `Enter` with `Alt`/newline modifiers currently inserts newlines; decide consistently that active picker confirmation wins only for plain `Enter`, unless maintainers want all Enter variants to confirm.
+  - Do not call `submit()` after confirming a suggestion.
+  - Avoid overwriting status messages unnecessarily during every filter refresh; use status mainly for attach/cancel/error outcomes.
 - **Implementation Suggestions:**
-  - Reuse the existing test module in `mimo-config`; expand its `use super::{...}` list as needed.
-  - Keep helper functions small enough that tests can exercise behavior directly without constructing a full `AppConfig`.
+  - Add a small `attachment_picker_visible()` helper analogous to `slash_menu_visible()`.
+  - Add `sync_attachment_picker()` and call it at the end of input-editing branches instead of duplicating refresh logic in every branch.
+  - Keep selected index clamped when suggestion count changes.
+- **Testing Suggestions:**
+  - Add app-level tests using `crossterm::event::Event::Key` and the existing `test_app()`/`unbounded_channel()` pattern.
+  - Test that `Escape` dismisses the picker without clearing input.
+  - Test that `Down` changes selected suggestion and updates preview state.
+  - Test that `Enter` confirms an active selected suggestion rather than submitting a prompt.
+  - Test that `Tab` still falls back to `try_attach_from_input()` when the picker is inactive.
+- **Done When:**
+  - The app owns and updates attachment picker state correctly without breaking existing key flows.
+
+### Sub-Task 6: Render the autocomplete dropdown and preview panel
+
+- **Status:** Pending
+- **Estimated Complexity:** Medium
+- **Objective:** Display suggestions and selected-suggestion preview in ratatui.
+- **Related Requirements:** R1, R2, R4, R6
+- **Dependencies and Preconditions:** Sub-Tasks 2-5 completed so state contains suggestions and preview data.
+- **In Scope for This Sub-Task:**
+  - `crates/mimo-tui/src/app.rs`
+- **Out of Scope for This Sub-Task:**
+  - A broad UI module reorganization.
+  - Mouse support.
+  - Syntax highlighting.
+- **Instructions:**
+  1. Add rendering precedence for the attachment picker in `App::render()` after higher-priority overlays and before or alongside the slash menu overlay.
+  2. Add `render_attachment_picker_overlay()` that uses `Clear`, `Block`, `Layout`, `Paragraph`, `Text`, `Line`, and `Span`, following existing overlay patterns in `app.rs`.
+  3. Render a two-column panel when space allows:
+     - left column: suggestions with selected-row highlighting, kind marker, and display path;
+     - right column: preview metadata and preview lines.
+  4. Add a compact fallback for small terminal sizes, such as suggestions first with a shortened preview below or a preview-unavailable note.
+  5. Include a concise help hint in the title or footer, e.g. `↑/↓ move · Tab/Enter attach · Esc cancel`.
+  6. Avoid reading files or directories inside the render method. Render only cached strings/lines from state.
+  7. Suppress or carefully place the input cursor while the picker is open by updating the existing cursor-visibility conditions in `render_draft_box()` and `render_landing_prompt()`.
+- **Acceptance Criteria:**
+  - The picker is visible when the active state has suggestions or a query status to show.
+  - The selected suggestion is visibly highlighted.
+  - File/directory kind is visible.
+  - Preview panel shows metadata and preview lines for the selected entry.
+  - The UI remains usable on both the landing prompt and normal workspace screen.
+- **Cautionary Points (Risks & Edge Cases):**
+  - Existing overlay helpers use centered popups. A bottom-anchored popup may feel more like a dropdown, but keep geometry simple and robust.
+  - Do not cover approval prompts or modal pickers; those must remain highest priority.
+  - Long paths and long preview lines should wrap or truncate gracefully.
+- **Implementation Suggestions:**
+  - Start with a centered or bottom-biased popup using existing `centered_rect()`/`landing_popup_rect()` style helpers. Only add a new geometry helper if needed.
+  - Use `Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)` or a similar existing highlight style for selected entries to stay visually consistent with slash menu rendering.
+- **Testing Suggestions:**
+  - Use `ratatui::backend::TestBackend` through the existing `render_screen()` test helper.
+  - Render a seeded picker state and assert the screen contains the overlay title, selected file name, preview metadata, and keyboard hint.
+  - Render with no picker state and assert normal prompt rendering still works.
+- **Done When:**
+  - The autocomplete and preview UI renders from state with no render-time I/O and no regressions in existing overlays.
+
+### Sub-Task 7: Add regression tests and run workspace validation
+
+- **Status:** Pending
+- **Estimated Complexity:** Medium
+- **Objective:** Cover the new attachment picker behavior and verify the full workspace remains healthy.
+- **Related Requirements:** R1, R2, R3, R4, R5, R6
+- **Dependencies and Preconditions:** Sub-Tasks 1-6 completed.
+- **In Scope for This Sub-Task:**
+  - Unit tests in `crates/mimo-tui/src/attachments.rs`.
+  - App/event/render tests in `crates/mimo-tui/src/app.rs`.
+  - Optional `crates/mimo-tui/Cargo.toml` dev-dependency for temp-file fixtures.
+- **Out of Scope for This Sub-Task:**
+  - Tests requiring a live MiMo API key.
+  - End-to-end terminal automation outside the existing Rust test suite.
+- **Instructions:**
+  1. Add attachment-module tests for:
+     - active `@` query detection;
+     - file and directory suggestion discovery;
+     - fuzzy ranking/order;
+     - preview line cap and metadata;
+     - exact `@path` attach regression;
+     - selected-suggestion attach and duplicate behavior.
+  2. Add app-level event tests for:
+     - typing `@` opens or prepares picker state;
+     - typing more characters refreshes/filter suggestions;
+     - `Up`/`Down` navigation changes selection;
+     - `Escape` dismisses without mutating input;
+     - `Tab`/`Enter` confirms selection without submitting prompt.
+  3. Add render tests for the picker overlay and preview panel using `TestBackend`.
+  4. Avoid global current-directory mutations in tests where possible by making suggestion helpers accept an explicit base directory.
+  5. Run targeted tests before workspace-wide validation.
+- **Acceptance Criteria:**
+  - New unit tests cover happy paths and key edge cases.
+  - Existing app tests still pass.
+  - Root workspace commands pass.
+- **Cautionary Points (Risks & Edge Cases):**
+  - Tests that depend on directory listing order must assert post-sort behavior, not OS `read_dir()` order.
+  - If tests must change `current_dir`, isolate them carefully and restore it, but prefer explicit path parameters instead.
+  - Keep test fixtures small and platform-neutral.
+- **Implementation Suggestions:**
+  - Use `tempfile` for file trees if added as a `mimo-tui` dev-dependency.
+  - Reuse the existing app test helpers around `test_app()`, `render_screen()`, and `unbounded_channel()`.
 - **Testing Suggestions:**
   - Run, in order:
-    1. `cargo test -p mimo-config`
-    2. `cargo fmt --check`
-    3. `cargo check`
-    4. `cargo clippy --workspace -- -D warnings`
-    5. `cargo test --workspace`
-  - Manual smoke test: `cargo run -- doctor` from `/mnt/Data/Dev/rust/MiMo-TUI` should show `System prompt` with source `workspace instructions`.
+    1. `cargo test -p mimo-tui attachments`
+    2. `cargo test -p mimo-tui app`
+    3. `cargo fmt --check`
+    4. `cargo check`
+    5. `cargo clippy --workspace -- -D warnings`
+    6. `cargo test --workspace`
 - **Done When:**
-  - Automated tests and manual doctor smoke test validate the requested behavior.
+  - Automated tests and validation commands confirm the autocomplete and preview features without regressions.
 
 ## Final Integration & Verification
 
 - **System-Wide Test:**
-  1. Create or use a workspace containing `AGENTS.md`; run `cargo run -- doctor` and verify `System prompt` reports `workspace instructions`.
-  2. Temporarily test a workspace with only `CLAUDE.md`, then only `README.md`, and verify fallback behavior.
-  3. Temporarily test a workspace with no supported files and verify the source remains `default` or `config file`.
-  4. Confirm `cargo run -- ask "test prompt"` still builds a request successfully when credentials are configured; no live API assertion is required without an API key.
+  1. Launch the TUI with `cargo run`.
+  2. Type `@` in an empty prompt and verify file/directory suggestions appear.
+  3. Type a partial nested path such as `@crates/mimo` and verify suggestions filter with fuzzy matching.
+  4. Use `Up`/`Down` and verify the highlighted suggestion and preview panel update together.
+  5. Select a text file and verify preview shows size/type and approximately the first 50 lines.
+  6. Select a directory and verify it can be attached and previewed.
+  7. Press `Escape` and verify the picker closes without deleting input.
+  8. Press `Tab` or `Enter` on a selected suggestion and verify the attachment appears in the existing attached-context UI.
+  9. Type an exact `@path` and press `Tab` with the picker inactive/dismissed to verify legacy behavior still works.
+  10. Submit a prompt with an attachment and verify attached context is still injected through `attachment_messages()`.
 - **Completion Checklist:**
-  - [ ] `ConfigValueSource::WorkspaceInstructions` exists and displays clearly.
-  - [ ] Discovery searches only the workspace root and uses the required priority order.
-  - [ ] Symlinked candidates are rejected and not followed.
-  - [ ] Instruction content is capped at 32 KiB.
-  - [ ] Effective prompt appends instructions after the base prompt with a clear separator.
-  - [ ] Doctor displays the new source when workspace instructions are appended.
-  - [ ] No changes violate Edition 2024, workspace layout, reqwest rustls-only, or base URL normalization constraints.
+  - [ ] `@` attachment picker opens and refreshes as the current token changes.
+  - [ ] Suggestions include files and directories.
+  - [ ] Fuzzy matching is deterministic and tested.
+  - [ ] `Up`/`Down`, `Tab`/`Enter`, and `Escape` work only when the picker is active.
+  - [ ] Preview shows metadata and first ~50 file lines, with graceful handling for directories/errors/binary content.
+  - [ ] Existing `@path` + `Tab`, duplicate detection, attachment removal, and system-message injection still work.
+  - [ ] Rendering uses ratatui state only and does not perform file I/O inside `render()`.
+  - [ ] No broad architecture or workspace-layout changes were introduced.
   - [ ] `cargo fmt --check`, `cargo check`, `cargo clippy --workspace -- -D warnings`, and `cargo test --workspace` pass.
 
 ## Open Questions
 
-- None blocking. If maintainers prefer symlink candidates to fail startup instead of being skipped, update Sub-Task 2 tests and behavior consistently before implementation.
+- None blocking. If maintainers prefer `Enter` on a directory to drill into that directory instead of attaching it, update Sub-Tasks 4-6 consistently before implementation.
