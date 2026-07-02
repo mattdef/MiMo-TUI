@@ -171,13 +171,13 @@ pub const COMMANDS: &[CommandInfo] = &[
         name: "model",
         aliases: &[],
         usage: "/model [id|auto]",
-        description: "Show or switch the active MiMo model.",
+        description: "Show or switch the current mode's MiMo model.",
     },
     CommandInfo {
         name: "models",
         aliases: &[],
         usage: "/models",
-        description: "Open the MiMo model picker and refresh it from the API when possible.",
+        description: "Open the MiMo model picker for the current mode and refresh it from the API when possible.",
     },
     CommandInfo {
         name: "save",
@@ -207,7 +207,7 @@ pub const COMMANDS: &[CommandInfo] = &[
         name: "config",
         aliases: &[],
         usage: "/config [show|api-key <key>|clear-api-key|base-url <url>|model <id>|temperature <value>]",
-        description: "Show or update local MiMo-TUI configuration.",
+        description: "Show or update local MiMo-TUI configuration, including the current mode's model.",
     },
     CommandInfo {
         name: "status",

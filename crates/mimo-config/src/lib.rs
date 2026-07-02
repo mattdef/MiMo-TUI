@@ -1,18 +1,21 @@
 use std::{
+    collections::HashMap,
     env, fmt, fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 const DEFAULT_BASE_URL: &str = "https://api.xiaomimimo.com/v1";
-const DEFAULT_MODEL: &str = "mimo-v2-flash";
+pub const DEFAULT_PLAN_MODEL: &str = "mimo-v2.5";
+pub const DEFAULT_AGENT_MODEL: &str = "mimo-v2.5-pro";
+const DEFAULT_MODEL: &str = DEFAULT_AGENT_MODEL;
 const DEFAULT_TEMPERATURE: f32 = 0.2;
 pub const AUTO_MODEL: &str = "auto";
-const KNOWN_MIMO_MODELS: &[&str] = &["mimo-v2-flash", "mimo-v2.5", "mimo-v2.5-pro"];
+const KNOWN_MIMO_MODELS: &[&str] = &["mimo-v2-flash", DEFAULT_PLAN_MODEL, DEFAULT_AGENT_MODEL];
 const DEFAULT_PERMISSION_POLICY: PermissionPolicy = PermissionPolicy::Prompt;
 const DEFAULT_SYSTEM_PROMPT: &str = r#"You are MiMo TUI, a terminal assistant specialised for Xiaomi MiMo models.
 Answer concisely, preserve technical accuracy, and adapt to developer workflows.
@@ -20,11 +23,43 @@ When the user asks for code, prefer small, practical changes and explain tradeof
 const WORKSPACE_INSTRUCTIONS_MAX_BYTES: usize = 32 * 1024;
 const WORKSPACE_INSTRUCTION_FILENAMES: [&str; 3] = ["AGENTS.md", "CLAUDE.md", "README.md"];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AppMode {
+    Plan,
+    #[default]
+    Agent,
+}
+
+impl fmt::Display for AppMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Plan => formatter.write_str("plan"),
+            Self::Agent => formatter.write_str("agent"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AppMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.to_ascii_lowercase().as_str() {
+            "plan" => Self::Plan,
+            "agent" | "chat" => Self::Agent,
+            _ => Self::Agent,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ConfigOverrides {
     pub api_key: Option<String>,
     pub base_url: Option<String>,
     pub model: Option<String>,
+    pub mode_models: Option<HashMap<AppMode, String>>,
     pub temperature: Option<f32>,
     pub permissions: Option<PermissionPolicy>,
 }
@@ -75,6 +110,7 @@ pub struct AppConfig {
     pub api_key: Option<String>,
     pub base_url: String,
     pub model: String,
+    pub mode_models: HashMap<AppMode, String>,
     pub temperature: f32,
     pub permissions: PermissionPolicy,
     pub system_prompt: String,
@@ -95,6 +131,8 @@ struct FileConfig {
     base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode_models: Option<HashMap<AppMode, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -112,43 +150,60 @@ struct DiscoveredInstructions {
 
 impl AppConfig {
     pub fn load(overrides: ConfigOverrides) -> Result<Self> {
-        let config_path = config_path();
-        let file_config = read_file_config(&config_path)?;
+        Self::load_with_path(config_path(), overrides)
+    }
+
+    fn load_with_path(config_path: PathBuf, overrides: ConfigOverrides) -> Result<Self> {
+        let FileConfig {
+            api_key: file_api_key,
+            base_url: file_base_url,
+            model: file_model,
+            mode_models: file_mode_models,
+            temperature: file_temperature,
+            permissions: file_permissions,
+            system_prompt: file_system_prompt,
+        } = read_file_config(&config_path)?;
 
         let (api_key, api_key_source) = pick_string([
             (ConfigValueSource::Cli, overrides.api_key),
             (ConfigValueSource::Env, env::var("MIMO_API_KEY").ok()),
-            (ConfigValueSource::File, file_config.api_key),
+            (ConfigValueSource::File, file_api_key),
         ]);
 
         let (base_url, base_url_source) = pick_string([
             (ConfigValueSource::Cli, overrides.base_url),
             (ConfigValueSource::Env, env::var("MIMO_BASE_URL").ok()),
-            (ConfigValueSource::File, file_config.base_url),
+            (ConfigValueSource::File, file_base_url),
         ]);
         let base_url = base_url
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
             .trim_end_matches('/')
             .to_string();
 
-        let (model, model_source) = pick_string([
-            (ConfigValueSource::Cli, overrides.model),
-            (ConfigValueSource::Env, env::var("MIMO_MODEL").ok()),
-            (ConfigValueSource::File, file_config.model),
-        ]);
-        let model = model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let env_model = env::var("MIMO_MODEL").ok();
+        let (mode_models, model_source) = resolve_mode_models(
+            file_model,
+            file_mode_models,
+            overrides.model,
+            env_model,
+            overrides.mode_models,
+        );
+        let model = mode_models
+            .get(&AppMode::Agent)
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
 
         let (temperature, temperature_source) = pick_temperature([
             (ConfigValueSource::Cli, overrides.temperature),
             (ConfigValueSource::Env, env_f32("MIMO_TEMPERATURE")?),
-            (ConfigValueSource::File, file_config.temperature),
+            (ConfigValueSource::File, file_temperature),
         ]);
         let temperature = temperature.unwrap_or(DEFAULT_TEMPERATURE);
 
         let (permissions, permissions_source) = {
             let (permissions, permissions_source) = pick_permission([
                 (ConfigValueSource::Cli, overrides.permissions),
-                (ConfigValueSource::File, file_config.permissions),
+                (ConfigValueSource::File, file_permissions),
             ]);
             match permissions {
                 Some(permissions) => (permissions, permissions_source),
@@ -157,7 +212,7 @@ impl AppConfig {
         };
 
         let (base_system_prompt, base_system_prompt_source) =
-            pick_string([(ConfigValueSource::File, file_config.system_prompt)]);
+            pick_string([(ConfigValueSource::File, file_system_prompt)]);
         let workspace_root = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let (system_prompt, system_prompt_source) = resolve_system_prompt(
             base_system_prompt,
@@ -169,6 +224,7 @@ impl AppConfig {
             api_key,
             base_url,
             model,
+            mode_models,
             temperature,
             permissions,
             system_prompt,
@@ -180,6 +236,24 @@ impl AppConfig {
             permissions_source,
             system_prompt_source,
         })
+    }
+
+    pub fn default_mode_models() -> HashMap<AppMode, String> {
+        HashMap::from([
+            (AppMode::Plan, DEFAULT_PLAN_MODEL.to_string()),
+            (AppMode::Agent, DEFAULT_AGENT_MODEL.to_string()),
+        ])
+    }
+
+    pub fn model_for_mode(&self, mode: AppMode) -> &str {
+        self.mode_models
+            .get(&mode)
+            .map(String::as_str)
+            .unwrap_or_else(|| default_model_for_mode(mode))
+    }
+
+    pub fn sync_model_for_mode(&mut self, mode: AppMode) {
+        self.model = self.model_for_mode(mode).to_string();
     }
 
     pub fn masked_api_key(&self) -> &'static str {
@@ -207,10 +281,37 @@ impl AppConfig {
         Ok(())
     }
 
-    pub fn set_model(&mut self, model: String) -> Result<()> {
+    pub fn set_model_for_mode(&mut self, mode: AppMode, model: String) -> Result<()> {
+        let Some(model) = normalize_model_value(model) else {
+            bail!("model cannot be empty");
+        };
+        // Read-modify-write the file's own mode_models so only the target mode changes on disk.
+        // This prevents session-loaded in-memory mode_models from leaking into the config file.
         update_file_config(&self.config_path, |file_config| {
-            file_config.model = Some(model.clone());
+            let mut file_mode_models = match file_config.mode_models.take() {
+                Some(mm) => mm,
+                None => match file_config
+                    .model
+                    .as_ref()
+                    .and_then(|m| normalize_model_value(m.clone()))
+                {
+                    Some(legacy) => {
+                        HashMap::from([(AppMode::Plan, legacy.clone()), (AppMode::Agent, legacy)])
+                    }
+                    None => Self::default_mode_models(),
+                },
+            };
+            for m in [AppMode::Plan, AppMode::Agent] {
+                file_mode_models
+                    .entry(m)
+                    .or_insert_with(|| default_model_for_mode(m).to_string());
+            }
+            file_mode_models.insert(mode, model.clone());
+            file_config.mode_models = Some(file_mode_models);
+            file_config.model = None;
         })?;
+        // Update in-memory state for the target mode only
+        self.mode_models.insert(mode, model.clone());
         self.model = model;
         Ok(())
     }
@@ -550,20 +651,119 @@ pub fn auto_route_model(messages: &[mimo_protocol::ChatMessage]) -> &'static str
             .iter()
             .any(|keyword| latest_lower.contains(keyword));
     if is_complex {
-        "mimo-v2.5-pro"
+        DEFAULT_AGENT_MODEL
     } else if latest_user.len() > 200 || transcript_chars > 1_500 {
-        "mimo-v2.5"
+        DEFAULT_PLAN_MODEL
     } else {
         "mimo-v2-flash"
     }
 }
 
+fn resolve_mode_models(
+    file_legacy_model: Option<String>,
+    file_mode_models: Option<HashMap<AppMode, String>>,
+    cli_model: Option<String>,
+    env_model: Option<String>,
+    override_mode_models: Option<HashMap<AppMode, String>>,
+) -> (HashMap<AppMode, String>, ConfigValueSource) {
+    let mut mode_models = AppConfig::default_mode_models();
+    let mut mode_model_sources = default_mode_model_sources();
+
+    if let Some(file_mode_models) = file_mode_models {
+        apply_mode_models(
+            &mut mode_models,
+            &mut mode_model_sources,
+            file_mode_models,
+            ConfigValueSource::File,
+        );
+    } else if let Some(legacy_model) = pick_string([(ConfigValueSource::File, file_legacy_model)]).0
+    {
+        apply_global_mode_model(
+            &mut mode_models,
+            &mut mode_model_sources,
+            legacy_model,
+            ConfigValueSource::File,
+        );
+    }
+
+    let (model, source) = pick_string([
+        (ConfigValueSource::Cli, cli_model),
+        (ConfigValueSource::Env, env_model),
+    ]);
+    if let Some(model) = model {
+        apply_global_mode_model(&mut mode_models, &mut mode_model_sources, model, source);
+    }
+
+    if let Some(override_mode_models) = override_mode_models {
+        apply_mode_models(
+            &mut mode_models,
+            &mut mode_model_sources,
+            override_mode_models,
+            ConfigValueSource::Cli,
+        );
+    }
+
+    let model_source = mode_model_sources
+        .get(&AppMode::Agent)
+        .copied()
+        .unwrap_or(ConfigValueSource::Default);
+    (mode_models, model_source)
+}
+
+fn default_mode_model_sources() -> HashMap<AppMode, ConfigValueSource> {
+    HashMap::from([
+        (AppMode::Plan, ConfigValueSource::Default),
+        (AppMode::Agent, ConfigValueSource::Default),
+    ])
+}
+
+fn apply_mode_models(
+    mode_models: &mut HashMap<AppMode, String>,
+    sources: &mut HashMap<AppMode, ConfigValueSource>,
+    incoming: HashMap<AppMode, String>,
+    source: ConfigValueSource,
+) {
+    for (mode, model) in incoming {
+        if let Some(model) = normalize_model_value(model) {
+            mode_models.insert(mode, model);
+            sources.insert(mode, source);
+        }
+    }
+}
+
+fn apply_global_mode_model(
+    mode_models: &mut HashMap<AppMode, String>,
+    sources: &mut HashMap<AppMode, ConfigValueSource>,
+    model: String,
+    source: ConfigValueSource,
+) {
+    if let Some(model) = normalize_model_value(model) {
+        for mode in [AppMode::Plan, AppMode::Agent] {
+            mode_models.insert(mode, model.clone());
+            sources.insert(mode, source);
+        }
+    }
+}
+
+fn normalize_model_value(model: String) -> Option<String> {
+    let trimmed = model.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn default_model_for_mode(mode: AppMode) -> &'static str {
+    match mode {
+        AppMode::Plan => DEFAULT_PLAN_MODEL,
+        AppMode::Agent => DEFAULT_AGENT_MODEL,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{collections::HashMap, fs};
 
     use super::{
-        ConfigValueSource, DEFAULT_SYSTEM_PROMPT, PermissionPolicy,
+        AppConfig, AppMode, ConfigOverrides, ConfigValueSource, DEFAULT_AGENT_MODEL,
+        DEFAULT_PLAN_MODEL, DEFAULT_SYSTEM_PROMPT, PermissionPolicy,
         WORKSPACE_INSTRUCTIONS_MAX_BYTES, discover_workspace_instructions, known_mimo_models,
         normalize_base_url, normalize_model_name, resolve_permissions, resolve_system_prompt,
     };
@@ -574,6 +774,145 @@ mod tests {
         assert!(models.iter().any(|model| model == "auto"));
         assert!(models.iter().any(|model| model == "mimo-v2.5"));
         assert!(models.iter().any(|model| model == "mimo-v2.5-pro"));
+    }
+
+    #[test]
+    fn load_defaults_to_per_mode_models() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config =
+            AppConfig::load_with_path(dir.path().join("config.toml"), ConfigOverrides::default())
+                .expect("load config");
+
+        assert_eq!(
+            config.mode_models.get(&AppMode::Plan).map(String::as_str),
+            Some(DEFAULT_PLAN_MODEL)
+        );
+        assert_eq!(
+            config.mode_models.get(&AppMode::Agent).map(String::as_str),
+            Some(DEFAULT_AGENT_MODEL)
+        );
+        assert_eq!(config.model, DEFAULT_AGENT_MODEL);
+        assert_eq!(config.model_source, ConfigValueSource::Default);
+    }
+
+    #[test]
+    fn load_legacy_model_populates_both_modes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        fs::write(&config_path, "model = \"mimo-v2-flash\"\n").expect("write config");
+
+        let config = AppConfig::load_with_path(config_path, ConfigOverrides::default())
+            .expect("load config");
+
+        assert_eq!(
+            config.mode_models.get(&AppMode::Plan).map(String::as_str),
+            Some("mimo-v2-flash")
+        );
+        assert_eq!(
+            config.mode_models.get(&AppMode::Agent).map(String::as_str),
+            Some("mimo-v2-flash")
+        );
+        assert_eq!(config.model, "mimo-v2-flash");
+        assert_eq!(config.model_source, ConfigValueSource::File);
+    }
+
+    #[test]
+    fn load_mode_models_fill_missing_entries_and_cli_overrides_win() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        fs::write(&config_path, "[mode_models]\nplan = \"mimo-v2-flash\"\n").expect("write config");
+
+        let config = AppConfig::load_with_path(
+            config_path,
+            ConfigOverrides {
+                model: Some("mimo-v2.5-pro".to_string()),
+                ..ConfigOverrides::default()
+            },
+        )
+        .expect("load config");
+
+        assert_eq!(
+            config.mode_models.get(&AppMode::Plan).map(String::as_str),
+            Some("mimo-v2.5-pro")
+        );
+        assert_eq!(
+            config.mode_models.get(&AppMode::Agent).map(String::as_str),
+            Some("mimo-v2.5-pro")
+        );
+        assert_eq!(config.model, "mimo-v2.5-pro");
+        assert_eq!(config.model_source, ConfigValueSource::Cli);
+    }
+
+    #[test]
+    fn explicit_mode_model_overrides_apply_last() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            "[mode_models]\nplan = \"mimo-v2-flash\"\nagent = \"mimo-v2.5-pro\"\n",
+        )
+        .expect("write config");
+
+        let config = AppConfig::load_with_path(
+            config_path,
+            ConfigOverrides {
+                mode_models: Some(HashMap::from([(
+                    AppMode::Plan,
+                    DEFAULT_PLAN_MODEL.to_string(),
+                )])),
+                ..ConfigOverrides::default()
+            },
+        )
+        .expect("load config");
+
+        assert_eq!(
+            config.mode_models.get(&AppMode::Plan).map(String::as_str),
+            Some(DEFAULT_PLAN_MODEL)
+        );
+        assert_eq!(
+            config.mode_models.get(&AppMode::Agent).map(String::as_str),
+            Some(DEFAULT_AGENT_MODEL)
+        );
+        assert_eq!(config.model, DEFAULT_AGENT_MODEL);
+    }
+
+    #[test]
+    fn set_model_for_mode_updates_only_target_mode_and_persists_mode_models() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let mut config = AppConfig::load_with_path(config_path, ConfigOverrides::default())
+            .expect("load config");
+
+        config
+            .set_model_for_mode(AppMode::Agent, "mimo-v2-flash".to_string())
+            .expect("save model");
+
+        assert_eq!(
+            config.mode_models.get(&AppMode::Plan).map(String::as_str),
+            Some(DEFAULT_PLAN_MODEL)
+        );
+        assert_eq!(
+            config.mode_models.get(&AppMode::Agent).map(String::as_str),
+            Some("mimo-v2-flash")
+        );
+        assert_eq!(config.model, "mimo-v2-flash");
+
+        let contents = fs::read_to_string(&config.config_path).expect("read config file");
+        assert!(contents.contains("[mode_models]"));
+        assert!(contents.contains("plan = \"mimo-v2.5\""));
+        assert!(contents.contains("agent = \"mimo-v2-flash\""));
+
+        let file_config: super::FileConfig = toml::from_str(&contents).expect("parse config file");
+        assert_eq!(file_config.model, None);
+        let saved_mode_models = file_config.mode_models.expect("mode models saved");
+        assert_eq!(
+            saved_mode_models.get(&AppMode::Plan).map(String::as_str),
+            Some(DEFAULT_PLAN_MODEL)
+        );
+        assert_eq!(
+            saved_mode_models.get(&AppMode::Agent).map(String::as_str),
+            Some("mimo-v2-flash")
+        );
     }
 
     #[test]

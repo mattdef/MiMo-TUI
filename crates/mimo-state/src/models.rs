@@ -1,37 +1,6 @@
-use std::fmt;
-
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum AppMode {
-    Plan,
-    #[default]
-    Agent,
-}
-
-impl fmt::Display for AppMode {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Plan => formatter.write_str("plan"),
-            Self::Agent => formatter.write_str("agent"),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for AppMode {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Ok(match value.to_ascii_lowercase().as_str() {
-            "plan" => Self::Plan,
-            "agent" | "chat" => Self::Agent,
-            _ => Self::Agent,
-        })
-    }
-}
+pub use mimo_config::AppMode;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanItem {

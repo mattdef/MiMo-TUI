@@ -127,7 +127,8 @@ mod tests {
         AppConfig {
             api_key: None,
             base_url: "https://example.test/v1".to_string(),
-            model: "mimo-v2-flash".to_string(),
+            model: mimo_config::DEFAULT_AGENT_MODEL.to_string(),
+            mode_models: AppConfig::default_mode_models(),
             temperature: 0.2,
             permissions: mimo_config::PermissionPolicy::Prompt,
             system_prompt: "test".to_string(),

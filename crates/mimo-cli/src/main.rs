@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use mimo_agent::{AgentStatus, run_agent_turn};
 use mimo_client::MimoClient;
-use mimo_config::{AppConfig, ConfigOverrides, PermissionPolicy, known_mimo_models};
+use mimo_config::{AppConfig, AppMode, ConfigOverrides, PermissionPolicy, known_mimo_models};
 use mimo_protocol::ChatMessage;
 use mimo_state::session_store;
 use mimo_tools::{ApprovalRequirement, ToolContext, ToolRegistryBuilder, default_workspace_root};
@@ -57,6 +57,7 @@ async fn main() -> Result<()> {
         api_key: cli.api_key,
         base_url: cli.base_url,
         model: cli.model,
+        mode_models: None,
         temperature: cli.temperature,
         permissions: None,
     })?;
@@ -129,6 +130,14 @@ async fn doctor(config: &AppConfig) -> Result<()> {
         config.model, config.model_source
     );
     println!(
+        "Plan model       : {}",
+        config.model_for_mode(AppMode::Plan)
+    );
+    println!(
+        "Agent model      : {}",
+        config.model_for_mode(AppMode::Agent)
+    );
+    println!(
         "Temperature      : {} ({})",
         config.temperature, config.temperature_source
     );
@@ -175,27 +184,30 @@ async fn doctor(config: &AppConfig) -> Result<()> {
 }
 
 async fn list_models(config: &AppConfig) -> Result<()> {
+    let local_models = local_model_suggestions(config);
     match MimoClient::new(config) {
         Ok(client) => match client.list_models().await {
             Ok(models) if !models.is_empty() => {
+                let mut models = models;
+                merge_unique_models(&mut models, local_models);
                 for model in models {
                     println!("{model}");
                 }
             }
             Ok(_) => {
-                for model in known_mimo_models(&config.model) {
+                for model in local_models {
                     println!("{model}");
                 }
             }
             Err(error) => {
                 eprintln!("warning: failed to load models from MiMo API: {error}");
-                for model in known_mimo_models(&config.model) {
+                for model in local_models {
                     println!("{model}");
                 }
             }
         },
         Err(_) => {
-            for model in known_mimo_models(&config.model) {
+            for model in local_models {
                 println!("{model}");
             }
         }
@@ -230,6 +242,26 @@ fn should_auto_approve_non_interactive_cli(
     match requirement {
         ApprovalRequirement::Auto => true,
         ApprovalRequirement::Prompt => matches!(permissions, PermissionPolicy::Auto),
+    }
+}
+
+fn local_model_suggestions(config: &AppConfig) -> Vec<String> {
+    let mut models = known_mimo_models(&config.model);
+    for model in config.mode_models.values() {
+        let model = model.trim();
+        if !model.is_empty() && !models.iter().any(|existing| existing == model) {
+            models.push(model.to_string());
+        }
+    }
+    models
+}
+
+fn merge_unique_models(target: &mut Vec<String>, models: Vec<String>) {
+    for model in models {
+        let model = model.trim();
+        if !model.is_empty() && !target.iter().any(|existing| existing == model) {
+            target.push(model.to_string());
+        }
     }
 }
 

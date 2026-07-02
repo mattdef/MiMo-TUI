@@ -3,7 +3,12 @@ use super::*;
 impl App {
     pub(crate) fn handle_model_command(&mut self, model: Option<String>) -> Result<()> {
         let Some(model) = model else {
-            self.status = format!("Current model: {}", self.config.model);
+            self.status = format!(
+                "Current {} model: {} (other mode: {})",
+                self.mode,
+                self.config.model_for_mode(self.mode),
+                self.config.model_for_mode(next_mode(self.mode))
+            );
             return Ok(());
         };
         let Some(model) = normalize_model_name(&model) else {
@@ -12,8 +17,8 @@ impl App {
                     .to_string();
             return Ok(());
         };
-        self.config.set_model(model.clone())?;
-        self.status = format!("Model switched to {model}");
+        self.config.set_model_for_mode(self.mode, model.clone())?;
+        self.status = format!("{} model switched to {model}", self.mode);
         Ok(())
     }
 
@@ -46,8 +51,8 @@ impl App {
                             .to_string();
                     return Ok(());
                 };
-                self.config.set_model(model.clone())?;
-                self.status = format!("Model saved as {model}");
+                self.config.set_model_for_mode(self.mode, model.clone())?;
+                self.status = format!("{} model saved as {model}", self.mode);
             }
             ConfigCommand::SetTemperature(value) => match value.parse::<f32>() {
                 Ok(temperature) => {

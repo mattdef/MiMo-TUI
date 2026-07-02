@@ -240,9 +240,11 @@ pub struct App {
 
 impl App {
     pub fn new(config: AppConfig) -> Self {
+        let mut config = config;
         let tool_context = ToolContext::new(default_workspace_root());
         let tool_registry = ToolRegistryBuilder::new().build_all();
         let mode = AppMode::Agent;
+        config.sync_model_for_mode(mode);
         let permissions = config.permissions;
         let tasks = task_store::load_tasks(&config).unwrap_or_default();
         let diagnostics = diagnostics_store::load_snapshot(&config).unwrap_or_default();
@@ -1225,13 +1227,14 @@ impl App {
         frame.render_widget(Clear, popup);
         frame.render_widget(
             Block::default()
-                .title("MiMo models")
+                .title(format!("MiMo models ({})", self.mode))
                 .borders(Borders::ALL)
                 .border_style(panel_border_style()),
             popup,
         );
 
         let body_height = inner[0].height.saturating_sub(2).max(1) as usize;
+        let current_model = self.current_mode_model().to_string();
         self.model_picker.scroll = adjust_selection_scroll(
             self.model_picker.selected,
             self.model_picker.scroll,
@@ -1248,7 +1251,7 @@ impl App {
                 } else {
                     "  "
                 };
-                let style = if model == &self.config.model {
+                let style = if model == &current_model {
                     Style::default().fg(Color::Green)
                 } else {
                     Style::default()
@@ -1261,7 +1264,7 @@ impl App {
             Paragraph::new(Text::from(lines))
                 .block(
                     Block::default()
-                        .title("Select a model")
+                        .title(format!("Select a model for {} mode", self.mode))
                         .borders(Borders::ALL)
                         .border_style(panel_border_style()),
                 )
@@ -2245,6 +2248,7 @@ impl App {
     }
 
     fn send_prompt(&mut self, prompt: String, event_tx: UnboundedSender<AppEvent>) -> Result<()> {
+        self.config.sync_model_for_mode(self.mode);
         let client = match MimoClient::new(&self.config) {
             Ok(client) => client,
             Err(error) => {
@@ -2432,7 +2436,7 @@ impl App {
             SlashCommand::Save { path } => {
                 let saved_path = session_store::save_session(
                     &self.config,
-                    &self.config.model,
+                    self.current_mode_model(),
                     self.mode,
                     &self.active_skills,
                     self.diagnostics_auto_run,
@@ -2462,7 +2466,7 @@ impl App {
             SlashCommand::Export { path } => {
                 let export_path = session_store::export_markdown(
                     &self.config,
-                    &self.config.model,
+                    self.current_mode_model(),
                     self.mode,
                     &self.active_skills,
                     self.diagnostics_auto_run,
@@ -2517,9 +2521,17 @@ impl App {
             SlashCommand::Mode { mode } => {
                 if let Some(mode) = mode {
                     self.set_mode(app_mode_for(mode));
-                    self.status = format!("Mode switched to {}", self.mode);
+                    self.status = format!(
+                        "Mode switched to {} (model: {})",
+                        self.mode,
+                        self.current_mode_model()
+                    );
                 } else {
-                    self.status = format!("Current mode: {}", self.mode);
+                    self.status = format!(
+                        "Current mode: {} (model: {})",
+                        self.mode,
+                        self.current_mode_model()
+                    );
                 }
                 Ok(false)
             }
@@ -3167,7 +3179,7 @@ impl App {
         let task = task_store::SavedTask {
             id: id.clone(),
             prompt: prompt.clone(),
-            model: self.config.model.clone(),
+            model: self.current_mode_model().to_string(),
             routed_model: None,
             mode: self.mode,
             status: task_store::TaskStatus::Queued,
@@ -3235,7 +3247,8 @@ impl App {
     ) -> Result<()> {
         let mode = self.mode;
         let permissions = self.tool_runtime.permissions;
-        let config = self.config.clone();
+        let mut config = self.config.clone();
+        config.sync_model_for_mode(mode);
         let request_messages = self.task_request_messages(prompt.clone(), mode)?;
         let tool_context = self.tool_context.child_operation();
         let tool_registry = self.tool_registry.clone();
@@ -3495,12 +3508,24 @@ impl App {
             KeyCode::Char('r' | 'R') => {
                 self.set_mode(AppMode::Plan);
                 if let Some(request) = self.tool_runtime.approve_pending(false) {
-                    self.status = format!("Denied and switched to plan mode: {}", request.summary);
+                    self.status = format!(
+                        "Denied and switched to plan mode (model: {}): {}",
+                        self.current_mode_model(),
+                        request.summary
+                    );
+                } else {
+                    self.status = format!(
+                        "Mode switched to plan (model: {})",
+                        self.current_mode_model()
+                    );
                 }
             }
             KeyCode::Char('p' | 'P') => {
                 self.set_mode(AppMode::Agent);
-                self.status = "Mode switched to agent".to_string();
+                self.status = format!(
+                    "Mode switched to agent (model: {})",
+                    self.current_mode_model()
+                );
             }
             _ => {}
         }
@@ -3509,6 +3534,11 @@ impl App {
 
     fn set_mode(&mut self, mode: AppMode) {
         self.mode = mode;
+        self.config.sync_model_for_mode(mode);
+    }
+
+    fn current_mode_model(&self) -> &str {
+        self.config.model_for_mode(self.mode)
     }
 
     fn open_help(&mut self, topic: Option<&str>) {
@@ -3520,7 +3550,11 @@ impl App {
 
     fn toggle_mode(&mut self) {
         self.set_mode(next_mode(self.mode));
-        self.status = format!("Mode switched to {}", self.mode);
+        self.status = format!(
+            "Mode switched to {} (model: {})",
+            self.mode,
+            self.current_mode_model()
+        );
     }
 
     fn open_model_picker(&mut self, event_tx: UnboundedSender<AppEvent>) {
@@ -3644,9 +3678,9 @@ impl App {
             self.close_model_picker();
             return Ok(());
         };
-        self.config.set_model(model.clone())?;
+        self.config.set_model_for_mode(self.mode, model.clone())?;
         self.model_picker = ModelPickerState::default();
-        self.status = format!("Model switched to {model}");
+        self.status = format!("{} model switched to {model}", self.mode);
         Ok(())
     }
 
@@ -3676,9 +3710,10 @@ impl App {
         self.stream_context = None;
         self.streaming = false;
 
+        let mode_models = session_store::resolved_mode_models(&session);
+
         let session_store::SavedSession {
             mode,
-            model,
             active_skills,
             lsp_auto_run,
             plan_items,
@@ -3709,8 +3744,8 @@ impl App {
             String::new()
         };
 
+        self.config.mode_models = mode_models;
         self.set_mode(mode);
-        self.config.model = model;
         self.active_skills = active_skills;
         self.diagnostics_auto_run = lsp_auto_run;
         self.plan_items = plan_items;
@@ -3827,7 +3862,11 @@ impl App {
             }
             command_palette::PaletteAction::SwitchMode(mode) => {
                 self.set_mode(mode);
-                self.status = format!("Mode switched to {}", self.mode);
+                self.status = format!(
+                    "Mode switched to {} (model: {})",
+                    self.mode,
+                    self.current_mode_model()
+                );
             }
         }
         Ok(())
@@ -3839,7 +3878,15 @@ impl App {
             .models
             .get(self.model_picker.selected)
             .cloned();
-        self.model_picker.models = model_catalog(&self.config.model, &self.discovered_models);
+        let configured_models = self
+            .config
+            .mode_models
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let current_model = self.current_mode_model().to_string();
+        self.model_picker.models =
+            model_catalog(&current_model, &self.discovered_models, &configured_models);
         self.model_picker.selected = selected_model
             .as_deref()
             .and_then(|model| {
@@ -3852,7 +3899,7 @@ impl App {
                 self.model_picker
                     .models
                     .iter()
-                    .position(|model| model == &self.config.model)
+                    .position(|model| model == &current_model)
             })
             .unwrap_or_default();
     }
@@ -3985,11 +4032,15 @@ impl App {
             .as_ref()
             .map(|snapshot| snapshot.status.to_string())
             .unwrap_or_else(|| "none".to_string());
+        let plan_model = self.config.model_for_mode(AppMode::Plan);
+        let agent_model = self.config.model_for_mode(AppMode::Agent);
         format!(
-            "Configuration\n\nConfig file      : {}\nBase URL         : {}\nModel            : {}\nTemperature      : {}\nAPI key          : {}\nMode             : {}\nPermissions      : {} ({})\nAttachments      : {}\nPlan items       : {}\nMemory notes     : {}\nSkills dir       : {}\nSkills active    : {}\nSkills installed : {}\nMCP file         : {}\nMCP enabled      : {}\nMCP servers      : {}\nDiagnostics file : {}\nDiagnostics auto : {}\nDiagnostics state: {}\nTasks file       : {}\nTasks saved      : {}",
+            "Configuration\n\nConfig file      : {}\nBase URL         : {}\nModel            : {}\nPlan model       : {}\nAgent model      : {}\nTemperature      : {}\nAPI key          : {}\nMode             : {}\nPermissions      : {} ({})\nAttachments      : {}\nPlan items       : {}\nMemory notes     : {}\nSkills dir       : {}\nSkills active    : {}\nSkills installed : {}\nMCP file         : {}\nMCP enabled      : {}\nMCP servers      : {}\nDiagnostics file : {}\nDiagnostics auto : {}\nDiagnostics state: {}\nTasks file       : {}\nTasks saved      : {}",
             self.config.config_path.display(),
             self.config.base_url,
-            self.config.model,
+            self.current_mode_model(),
+            plan_model,
+            agent_model,
             self.config.temperature,
             self.config.masked_api_key(),
             self.mode,
@@ -4032,13 +4083,17 @@ impl App {
             .iter()
             .map(|message| message.content.chars().count())
             .sum::<usize>();
+        let plan_model = self.config.model_for_mode(AppMode::Plan);
+        let agent_model = self.config.model_for_mode(AppMode::Agent);
         Ok(format!(
-            "Status\n\nWorkspace         : {}\nMode              : {}\nPermissions       : {} ({})\nModel             : {}\nStreaming         : {}\nMessages          : {}\nActive branch     : {}\nBranches          : {}\nSaved files       : {}\nAPI key           : {}\nAttachments       : {}\nDraft stash       : {}\nPlan items        : {}\nMemory notes      : {}\nSkills active     : {}\nSkills installed  : {}\nMCP enabled       : {}\nMCP servers       : {}\nDiagnostics auto  : {}\nDiagnostics state : {}\nRequest chars     : {}\nShell jobs        : {}\nTasks             : {}\nTools             : {}",
+            "Status\n\nWorkspace         : {}\nMode              : {}\nPermissions       : {} ({})\nModel             : {}\nPlan model        : {}\nAgent model       : {}\nStreaming         : {}\nMessages          : {}\nActive branch     : {}\nBranches          : {}\nSaved files       : {}\nAPI key           : {}\nAttachments       : {}\nDraft stash       : {}\nPlan items        : {}\nMemory notes      : {}\nSkills active     : {}\nSkills installed  : {}\nMCP enabled       : {}\nMCP servers       : {}\nDiagnostics auto  : {}\nDiagnostics state : {}\nRequest chars     : {}\nShell jobs        : {}\nTasks             : {}\nTools             : {}",
             self.tool_context.workspace_root.display(),
             self.mode,
             self.tool_runtime.permissions,
             self.tool_runtime.permissions_source,
-            self.config.model,
+            self.current_mode_model(),
+            plan_model,
+            agent_model,
             if self.streaming { "yes" } else { "no" },
             self.messages.len(),
             self.conversation_tree.current_branch_id(),
@@ -4358,7 +4413,11 @@ fn is_quit_key(key: KeyEvent, input_is_empty: bool) -> bool {
             ))
 }
 
-fn model_catalog(current_model: &str, discovered_models: &[String]) -> Vec<String> {
+fn model_catalog(
+    current_model: &str,
+    discovered_models: &[String],
+    configured_models: &[String],
+) -> Vec<String> {
     let base = if discovered_models.is_empty() {
         known_mimo_models(current_model)
     } else {
@@ -4366,7 +4425,11 @@ fn model_catalog(current_model: &str, discovered_models: &[String]) -> Vec<Strin
     };
 
     let mut models = Vec::new();
-    for model in base.into_iter().chain(known_mimo_models(current_model)) {
+    for model in base
+        .into_iter()
+        .chain(known_mimo_models(current_model))
+        .chain(configured_models.iter().cloned())
+    {
         let model = model.trim();
         if !model.is_empty() && !models.iter().any(|existing| existing == model) {
             models.push(model.to_string());
@@ -4757,7 +4820,7 @@ fn should_refresh_diagnostics(request: &ToolRequest) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{collections::HashMap, fs, path::PathBuf};
 
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use dirs::home_dir;
@@ -4773,7 +4836,8 @@ mod tests {
         App::new(AppConfig {
             api_key: None,
             base_url: "https://example.test/v1".to_string(),
-            model: "mimo-v2-flash".to_string(),
+            model: mimo_config::DEFAULT_AGENT_MODEL.to_string(),
+            mode_models: AppConfig::default_mode_models(),
             temperature: 0.2,
             permissions: PermissionPolicy::Prompt,
             system_prompt: "test".to_string(),
@@ -4875,6 +4939,10 @@ mod tests {
         assert!(summary.contains("Permissions"));
         assert!(summary.contains("prompt"));
         assert!(summary.contains("default"));
+        assert!(summary.contains("Plan model"));
+        assert!(summary.contains("Agent model"));
+        assert!(summary.contains(mimo_config::DEFAULT_PLAN_MODEL));
+        assert!(summary.contains(mimo_config::DEFAULT_AGENT_MODEL));
     }
 
     #[test]
@@ -5155,7 +5223,11 @@ mod tests {
 
     #[test]
     fn model_picker_applies_selected_model() {
+        let tempdir = tempdir().expect("tempdir should be created");
+        let config_path = tempdir.path().join("config.toml");
         let mut app = test_app();
+        app.config.config_path = config_path;
+        let plan_model = app.config.model_for_mode(AppMode::Plan).to_string();
         let (event_tx, _event_rx) = unbounded_channel();
         app.attachment_picker = attachments::AttachmentPickerState {
             query: Some(attachments::AttachmentQuery {
@@ -5182,8 +5254,28 @@ mod tests {
         app.apply_selected_model().expect("model should apply");
 
         assert_eq!(app.config.model, "mimo-v2.5");
+        assert_eq!(app.config.model_for_mode(AppMode::Plan), plan_model);
+        assert!(app.status.contains("agent model switched to mimo-v2.5"));
         assert!(!app.model_picker.open);
         assert!(!app.attachment_picker.is_visible());
+    }
+
+    #[test]
+    fn model_command_updates_current_mode_only() {
+        let tempdir = tempdir().expect("tempdir should be created");
+        let config_path = tempdir.path().join("config.toml");
+        let mut app = test_app();
+        app.config.config_path = config_path;
+        app.set_mode(AppMode::Plan);
+        let agent_model = app.config.model_for_mode(AppMode::Agent).to_string();
+
+        app.handle_model_command(Some("mimo-v2-flash".to_string()))
+            .expect("model command should update the current mode");
+
+        assert_eq!(app.mode, AppMode::Plan);
+        assert_eq!(app.config.model, "mimo-v2-flash");
+        assert_eq!(app.config.model_for_mode(AppMode::Agent), agent_model);
+        assert!(app.status.contains("plan model switched to mimo-v2-flash"));
     }
 
     #[test]
@@ -5618,7 +5710,8 @@ mod tests {
             session_store::SavedSession {
                 saved_at_epoch: 1,
                 title: "hello".to_string(),
-                model: "mimo-v2-flash".to_string(),
+                model: mimo_config::DEFAULT_AGENT_MODEL.to_string(),
+                mode_models: AppConfig::default_mode_models(),
                 mode: AppMode::Agent,
                 active_skills: Vec::new(),
                 lsp_auto_run: false,
@@ -5632,6 +5725,8 @@ mod tests {
 
         assert_eq!(app.conversation_tree.branch_count(), 2);
         assert_eq!(app.conversation_tree.current_branch_id(), "branch-2");
+        assert_eq!(app.mode, AppMode::Agent);
+        assert_eq!(app.config.model, mimo_config::DEFAULT_AGENT_MODEL);
         assert!(!app.attachment_picker.is_visible());
         assert_eq!(
             app.messages.last().map(|message| message.content.as_str()),
@@ -5647,6 +5742,7 @@ mod tests {
                 saved_at_epoch: 1,
                 title: "legacy".to_string(),
                 model: "mimo-v2-flash".to_string(),
+                mode_models: HashMap::new(),
                 mode: AppMode::Agent,
                 active_skills: Vec::new(),
                 lsp_auto_run: false,
@@ -5664,6 +5760,8 @@ mod tests {
         assert_eq!(app.conversation_tree.branch_count(), 1);
         assert_eq!(app.messages.len(), 2);
         assert_eq!(app.conversation_tree.current_branch_id(), "branch-1");
+        assert_eq!(app.config.model, "mimo-v2-flash");
+        assert_eq!(app.config.model_for_mode(AppMode::Plan), "mimo-v2.5");
     }
 
     #[test]
@@ -5717,6 +5815,7 @@ mod tests {
         )
         .expect("ctrl+tab should toggle mode");
         assert_eq!(app.mode, AppMode::Plan);
+        assert_eq!(app.config.model, "mimo-v2.5");
 
         app.handle_terminal_event(
             Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL)),
@@ -5724,6 +5823,7 @@ mod tests {
         )
         .expect("ctrl+tab should cycle back to agent");
         assert_eq!(app.mode, AppMode::Agent);
+        assert_eq!(app.config.model, mimo_config::DEFAULT_AGENT_MODEL);
 
         app.handle_terminal_event(
             Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL)),
@@ -5731,6 +5831,7 @@ mod tests {
         )
         .expect("ctrl+tab should cycle back to plan");
         assert_eq!(app.mode, AppMode::Plan);
+        assert_eq!(app.config.model, "mimo-v2.5");
     }
 
     #[test]
@@ -5741,14 +5842,17 @@ mod tests {
         app.handle_terminal_event(Event::Key(KeyEvent::from(KeyCode::F(2))), event_tx.clone())
             .expect("f2 should toggle mode");
         assert_eq!(app.mode, AppMode::Plan);
+        assert_eq!(app.config.model, "mimo-v2.5");
 
         app.handle_terminal_event(Event::Key(KeyEvent::from(KeyCode::F(2))), event_tx.clone())
             .expect("f2 should cycle back to agent");
         assert_eq!(app.mode, AppMode::Agent);
+        assert_eq!(app.config.model, mimo_config::DEFAULT_AGENT_MODEL);
 
         app.handle_terminal_event(Event::Key(KeyEvent::from(KeyCode::F(2))), event_tx)
             .expect("f2 should cycle back to plan");
         assert_eq!(app.mode, AppMode::Plan);
+        assert_eq!(app.config.model, "mimo-v2.5");
     }
 
     #[test]

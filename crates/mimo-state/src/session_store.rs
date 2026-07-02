@@ -1,5 +1,6 @@
 use std::{
     cmp::Reverse,
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -19,6 +20,8 @@ pub struct SavedSession {
     #[serde(default)]
     pub title: String,
     pub model: String,
+    #[serde(default)]
+    pub mode_models: HashMap<AppMode, String>,
     pub mode: AppMode,
     #[serde(default)]
     pub active_skills: Vec<String>,
@@ -69,6 +72,7 @@ pub fn save_session(
             .as_secs(),
         title: derive_title(messages),
         model: model.to_string(),
+        mode_models: config.mode_models.clone(),
         mode,
         active_skills: active_skills.to_vec(),
         lsp_auto_run,
@@ -92,6 +96,23 @@ pub fn load_session(config: &AppConfig, path: Option<&str>) -> Result<(SavedSess
     let session = serde_json::from_str::<SavedSession>(&contents)
         .with_context(|| format!("failed to parse {}", path.display()))?;
     Ok((session, path))
+}
+
+pub fn resolved_mode_models(session: &SavedSession) -> HashMap<AppMode, String> {
+    let mut mode_models = AppConfig::default_mode_models();
+    if session.mode_models.is_empty() {
+        if let Some(model) = normalize_model_value(&session.model) {
+            mode_models.insert(session.mode, model);
+        }
+        return mode_models;
+    }
+
+    for (mode, model) in &session.mode_models {
+        if let Some(model) = normalize_model_value(model) {
+            mode_models.insert(*mode, model);
+        }
+    }
+    mode_models
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -177,7 +198,15 @@ pub fn list_sessions(config: &AppConfig) -> Result<Vec<SessionEntry>> {
                 } else {
                     session.title
                 },
-                model: session.model,
+                model: if session.model.trim().is_empty() {
+                    session
+                        .mode_models
+                        .get(&session.mode)
+                        .cloned()
+                        .unwrap_or_default()
+                } else {
+                    session.model
+                },
                 mode: session.mode,
                 message_count: session.messages.len(),
                 branch_count: session
@@ -240,19 +269,25 @@ fn derive_title(messages: &[ChatMessage]) -> String {
     title
 }
 
+fn normalize_model_value(model: &str) -> Option<String> {
+    let trimmed = model.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use crate::branch::ConversationTree;
     use mimo_config::{AppConfig, ConfigValueSource};
     use mimo_protocol::ChatMessage;
 
-    use super::{export_markdown, list_sessions, load_session, save_session};
+    use super::{SavedSession, export_markdown, list_sessions, load_session, save_session};
 
     fn test_config(dir: &tempfile::TempDir) -> AppConfig {
         AppConfig {
             api_key: None,
             base_url: "https://example.test/v1".to_string(),
-            model: "mimo-v2-flash".to_string(),
+            model: mimo_config::DEFAULT_AGENT_MODEL.to_string(),
+            mode_models: AppConfig::default_mode_models(),
             temperature: 0.2,
             permissions: mimo_config::PermissionPolicy::Prompt,
             system_prompt: "test".to_string(),
@@ -293,6 +328,25 @@ mod tests {
         assert_eq!(loaded.messages.len(), 2);
         assert!(loaded.conversation_tree.is_none());
 
+        let saved_contents = std::fs::read_to_string(&path).expect("read saved session");
+        let saved_session: SavedSession =
+            serde_json::from_str(&saved_contents).expect("parse saved session");
+        assert_eq!(
+            saved_session
+                .mode_models
+                .get(&crate::AppMode::Agent)
+                .map(String::as_str),
+            Some(mimo_config::DEFAULT_AGENT_MODEL)
+        );
+        assert_eq!(
+            saved_session
+                .mode_models
+                .get(&crate::AppMode::Plan)
+                .map(String::as_str),
+            Some(mimo_config::DEFAULT_PLAN_MODEL)
+        );
+        assert_eq!(saved_session.model, "mimo-v2-flash");
+
         let export_path = dir.path().join("conversation.md");
         export_markdown(
             &config,
@@ -310,6 +364,23 @@ mod tests {
         let exported = std::fs::read_to_string(export_path).expect("read export");
         assert!(exported.contains("## You"));
         assert!(exported.contains("## MiMo"));
+    }
+
+    #[test]
+    fn legacy_sessions_deserialize_without_mode_models() {
+        let legacy_session = serde_json::json!({
+            "saved_at_epoch": 1,
+            "title": "legacy",
+            "model": "mimo-v2-flash",
+            "mode": "agent",
+            "messages": []
+        });
+
+        let session: SavedSession =
+            serde_json::from_value(legacy_session).expect("parse legacy session");
+        assert!(session.mode_models.is_empty());
+        assert_eq!(session.mode, crate::AppMode::Agent);
+        assert_eq!(session.model, "mimo-v2-flash");
     }
 
     #[test]
